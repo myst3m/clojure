@@ -14,3 +14,15 @@ Change: clojure.main
 ```
 to avoid changing of nrepl 0.6.0+
 
+## Install
+```sh
+$ git clone https://github.com/myst3m/clojure
+$ cd clojure
+$ mvn install -Dmaven.test.skip=true
+```
+
+Then, you can add the following in your dependencies of Leiningen/Boot project file.
+```sh
+[theorems/clojure "1.8.0"]
+```
+
