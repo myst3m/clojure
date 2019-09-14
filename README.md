@@ -8,8 +8,8 @@ Main changes are
 ```sh
 Added:  clojure.lang.DalvikDynamicClassLoader
 Change: clojure.lang.DynamicClassLoader -> clojure.lang.AbstractDynamicClassLoader
-Change: clojure.lang.RT
 Added:  clojure.lang.DynamicClassLoader
+Change: clojure.lang.RT
 Change: clojure.core
 Change: clojure.main
 ```
@@ -26,4 +26,4 @@ Then, you can add the following in your dependencies of Leiningen/Boot project f
 ```sh
 [theorems/clojure "1.8.0"]
 ```
-
+Notes: Make sure you are on clojure-1.8.0-android branch on operations.
