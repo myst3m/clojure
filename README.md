@@ -8,6 +8,7 @@ Main changes are
 ```sh
 Added:  clojure.lang.DalvikDynamicClassLoader
 Change: clojure.lang.DynamicClassLoader -> clojure.lang.AbstractDynamicClassLoader
+Change: clojure.lang.RT
 Added:  clojure.lang.DynamicClassLoader
 Change: clojure.core
 Change: clojure.main
