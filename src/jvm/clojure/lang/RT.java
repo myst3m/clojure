@@ -2189,17 +2189,12 @@ static public ClassLoader makeClassLoader(){
                         throw new RuntimeException("Unable to load Dalvik dynamic classloader.",e);
                     }
                 } else {
-			return new JvmDynamicClassLoader(baseLoader());
+			return new DynamicClassLoader(baseLoader());
                 }
 
             }
-		
-//             Var.pushThreadBindings(RT.map(USE_CONTEXT_CLASSLOADER, RT.T));
-// //			getRootClassLoader();
-// 			return new JvmDynamicClassLoader(baseLoader());
-//             }
-                finally{
-            Var.popThreadBindings();
+	    finally{
+		Var.popThreadBindings();
             }
 		}
 	});
