@@ -1,4 +1,4 @@
-/* Copyright © 2019 Tsutomu Miyashita
+/* Copyright © 2011 Sattvik Software & Technology Resources, Ltd. Co.
  * All rights reserved.
  *
  * The use and distribution terms for this software are covered by the Eclipse
@@ -9,8 +9,16 @@
  * this software.
  */
 
+// Changed file name from JvmDynamicClassLoader.java to DynamicClassLoader, by myst3m, 2019
 
 package clojure.lang;
+
+/**
+ * A dynamic class loader for a standard Java VM.
+ *
+ * @since 1.2
+ * @author Daniel Solano Gómez
+ */
 
 public class DynamicClassLoader extends AbstractDynamicClassLoader {
     public DynamicClassLoader() {
