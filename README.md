@@ -6,12 +6,12 @@ should be modified, and make use of the code.
 
 Main changes are 
 ```sh
-Added:  clojure.lang.DalvikDynamicClassLoader
-Change: clojure.lang.DynamicClassLoader -> clojure.lang.AbstractDynamicClassLoader
-Added:  clojure.lang.DynamicClassLoader
-Change: clojure.lang.RT
-Change: clojure.core
-Change: clojure.main
+Added:   clojure.lang.DalvikDynamicClassLoader
+Changed: clojure.lang.DynamicClassLoader -> clojure.lang.AbstractDynamicClassLoader
+Added:   clojure.lang.DynamicClassLoader
+Changed: clojure.lang.RT
+Changed: clojure.core
+Changed: clojure.main
 ```
 to avoid changing of nrepl 0.6.0+
 
