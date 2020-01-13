@@ -415,7 +415,7 @@ by default when a new command-line REPL is started."} repl-requires
                               (let [cl-class (Class/forName "clojure.lang.DalvikDynamicClassLoader")
                                     cl-constructor (.getConstructor cl-class (into-array [ClassLoader]))]
                                 (.newInstance cl-constructor (to-array [cl])))
-                              (clojure.lang.JvmDynamicClassLoader. cl))))
+                              (clojure.lang.DynamicClassLoader. cl))))
   (let [{:keys [init need-prompt prompt flush read eval print caught]
          :or {init        #()
               need-prompt (if (instance? LineNumberingPushbackReader *in*)

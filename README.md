@@ -19,6 +19,7 @@ to avoid changing of nrepl 0.6.0+
 ```sh
 $ git clone https://github.com/myst3m/clojure
 $ cd clojure
+$ git submodule update	
 $ mvn install -Dmaven.test.skip=true
 ```
 
