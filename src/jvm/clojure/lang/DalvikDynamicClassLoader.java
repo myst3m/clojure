@@ -84,8 +84,8 @@ public class DalvikDynamicClassLoader extends DynamicClassLoader {
         final com.android.dx.dex.file.DexFile outDexFile =
                 new com.android.dx.dex.file.DexFile(DEX_OPTIONS);
         final DirectClassFile cf = new DirectClassFile(bytes, asFilePath(name), false);
-	Log.d(TAG, "defineMissingClass 1");
-	// DxContext context = new DxContext();
+				Log.d(TAG, "defineMissingClass 1");
+				// DxContext context = new DxContext();
 
         cf.setAttributeFactory(StdAttributeFactory.THE_ONE);
         // outDexFile.add(CfTranslator.translate(context, cf, bytes, OPTIONS, DEX_OPTIONS, outDexFile));
