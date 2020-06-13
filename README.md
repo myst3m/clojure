@@ -21,9 +21,9 @@ $ git clone https://github.com/myst3m/clojure
 $ cd clojure
 $ git submodule update
 $ cd android/platform/dalvik
-$ git checkout refs/tags/android-4.0.3_r1
+$ git checkout refs/tags/android-8.0.0_r1
 $ cd android/platform/libcore
-$ git checkout refs/tags/android-4.0.3_r1 
+$ git checkout refs/tags/android-8.0.0_r1 
 $ cd ../../../; mvn install -Dmaven.test.skip=true
 ```
 
@@ -35,4 +35,4 @@ Then, you can add the following in your dependencies of Leiningen/Boot project f
 
 Notes:
  - Make sure you are on clojure-1.8.0-android branch on operations.
- - Using android 4.0.3 source
+ - Using android 8.0.0 source
