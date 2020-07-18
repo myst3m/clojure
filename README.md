@@ -1,5 +1,7 @@
 # Clojure 1.8.0 for Android
 
+[![Clojars Project](https://img.shields.io/clojars/v/theorems/clojure.svg)](https://clojars.org/theorems/clojure)
+
 This is Clojure 1.8.0 modified for Android.
 Many thanks to [Clojure/Android](https://github.com/clojure-android) project, I could find what files
 should be modified, and make use of the code.
@@ -29,7 +31,7 @@ $ cd ../../../; mvn install -Dmaven.test.skip=true
 
 Then, you can add the following in your dependencies of Leiningen/Boot project file.
 ```sh
-[theorems/clojure "1.8.0"]
+[theorems/clojure "1.8.0-a8"]
 ```
 
 
