@@ -91,7 +91,7 @@ public class DalvikDynamicClassLoader extends DynamicClassLoader {
         outDexFile.add(CfTranslator.translate(context, cf, bytes, OPTIONS, DEX_OPTIONS, outDexFile));		
 	// Android 4
         // outDexFile.add(CfTranslator.translate(asFilePath(name), bytes, OPTIONS, DEX_OPTIONS));				
-	Log.d(TAG, "defineMissingClass 2");
+	
         // get compile directory
         if (cacheDirectory == null) {
             initializeDynamicCompilation();
