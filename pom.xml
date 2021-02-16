@@ -6,7 +6,7 @@
   <name>clojure</name>
   <packaging>jar</packaging>
 
-  <version>1.11.0-master-SNAPSHOT</version>
+  <version>1.11.0-android</version>
   <url>http://clojure.org/</url>
   <description>Clojure core environment and runtime library.</description>
 
