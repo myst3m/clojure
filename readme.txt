@@ -1,4 +1,9 @@
- *   Clojure
+This is a fork of Clojure with dynamic compilation support on Android platform.
+The modifications are heavily inspired by https://github.com/clojure-android/clojure .
+
+As of Feb. 2021, Classloader for Dalvik is running on Clojure 1.11.0-master-SNAPSHOT.
+
+*   Clojure
  *   Copyright (c) Rich Hickey. All rights reserved.
  *   The use and distribution terms for this software are covered by the
  *   Eclipse Public License 1.0 (http://opensource.org/licenses/eclipse-1.0.php)
@@ -12,12 +17,7 @@ Feedback: http://groups.google.com/group/clojure
 Getting Started: https://clojure.org/guides/getting_started
 
 To build and run locally with Ant:
-
-This is a fork of Clojure with dynamic compilation support on Android platform.
-The modifications are heavily inspired by https://github.com/clojure-android/clojure .
-
 To run:  java -cp clojure-${VERSION}.jar clojure.main
-
 To build locally with Ant:  
 
 
