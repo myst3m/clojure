@@ -13,6 +13,14 @@ Getting Started: https://clojure.org/guides/getting_started
 
 To build and run locally with Ant:
 
+This is a fork of Clojure with dynamic compilation support on Android platform.
+The modifications are heavily inspired by https://github.com/clojure-android/clojure .
+
+To run:  java -cp clojure-${VERSION}.jar clojure.main
+
+To build locally with Ant:  
+
+
    One-time setup:    ./antsetup.sh
    To build:          ant local
    To run:            java -jar clojure.jar
