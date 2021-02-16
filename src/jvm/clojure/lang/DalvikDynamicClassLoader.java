@@ -37,7 +37,7 @@ public class DalvikDynamicClassLoader extends DynamicClassLoader {
     private static final CfOptions OPTIONS = new CfOptions();
     /** Reference to compile path var, used for generated jar files. */
     private static final Var COMPILE_PATH =
-	RT.var("clojure.core", "*compile-path*");
+				RT.var("clojure.core", "*compile-path*");
     /** Configure whether or not to use extended op codes. */
     private static final DexOptions DEX_OPTIONS = new DexOptions();
     /** Directory where temporary class files will go. */
@@ -78,19 +78,20 @@ public class DalvikDynamicClassLoader extends DynamicClassLoader {
      */
     // @Override
     protected Class<?> defineMissingClass(final String name, final byte[] bytes,
-            final Object srcForm) {
-	Log.d(TAG, "defineMissingClass "+ name);
+																					final Object srcForm) {
+				Log.d(TAG, "defineMissingClass "+ name);
         // create dx DexFile and add translated class into it
         final com.android.dx.dex.file.DexFile outDexFile =
-                new com.android.dx.dex.file.DexFile(DEX_OPTIONS);
+						new com.android.dx.dex.file.DexFile(DEX_OPTIONS);
         final DirectClassFile cf = new DirectClassFile(bytes, asFilePath(name), false);
 				Log.d(TAG, "defineMissingClass 1");
 				// DxContext context = new DxContext();
 
         cf.setAttributeFactory(StdAttributeFactory.THE_ONE);
-        // outDexFile.add(CfTranslator.translate(context, cf, bytes, OPTIONS, DEX_OPTIONS, outDexFile));
+        // outDexFile.add(CfTranslator.translate(cf, bytes, OPTIONS, DEX_OPTIONS, outDexFile));
+        // outDexFile.add(CfTranslator.translate(context, cf, bytes, OPTIONS, DEX_OPTIONS, outDexFile));				
         outDexFile.add(CfTranslator.translate(asFilePath(name), bytes, OPTIONS, DEX_OPTIONS));				
-	Log.d(TAG, "defineMissingClass 2");
+				Log.d(TAG, "defineMissingClass 2");
         // get compile directory
         if (cacheDirectory == null) {
             initializeDynamicCompilation();
@@ -117,7 +118,7 @@ public class DalvikDynamicClassLoader extends DynamicClassLoader {
             if (clazz == null) {
                 Log.e(TAG,"Failed to load generated class: "+name);
                 throw new RuntimeException(
-                        "Failed to load generated class " + name + ".");
+																					 "Failed to load generated class " + name + ".");
             }
             return clazz;
         } catch (IOException e) {
@@ -149,7 +150,7 @@ public class DalvikDynamicClassLoader extends DynamicClassLoader {
     }
 
     public void initializeDynamicCompilation() {
-	Log.d("clojure", "initialize");	
+				Log.d("clojure", "initialize");	
         if (applicationContext != null) {
             cacheDirectory = new File(applicationContext.getCacheDir(), "clojure_repl");
             Log.d(TAG, "CACHED DIRECTORY: " + cacheDirectory);
@@ -159,12 +160,12 @@ public class DalvikDynamicClassLoader extends DynamicClassLoader {
             System.setProperty("clojure.compile.path", path);
             COMPILE_PATH.swapRoot(path);
         } else {
-	    Log.d("clojure", "context is null");
-	}
+						Log.d("clojure", "context is null");
+				}
     }
 
     public static void setContext(Context context) {
-	Log.d("clojure", "setting context");
+				Log.d("clojure", "setting context");
         applicationContext = context;
     }
 }
