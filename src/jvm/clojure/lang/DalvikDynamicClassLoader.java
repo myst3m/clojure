@@ -11,7 +11,7 @@
 package clojure.lang;
 
 import android.content.Context;
-import com.android.dx.command.dexer.DxContext;
+// import com.android.dx.command.dexer.DxContext;
 import android.util.Log;
 import com.android.dx.cf.direct.DirectClassFile;
 import com.android.dx.cf.direct.StdAttributeFactory;
@@ -48,7 +48,7 @@ public class DalvikDynamicClassLoader extends DynamicClassLoader {
         // disable name checks
         OPTIONS.strictNameCheck = false;
         // Use DEX format ver. 0.3.5 because ART rejects later versions.
-        // DEX_OPTIONS.targetApiLevel = 13;
+        // DEX_OPTIONS.targetApiLevel = 15;
     }
 
     /** Tag used for logging. */
@@ -85,10 +85,11 @@ public class DalvikDynamicClassLoader extends DynamicClassLoader {
                 new com.android.dx.dex.file.DexFile(DEX_OPTIONS);
         final DirectClassFile cf = new DirectClassFile(bytes, asFilePath(name), false);
 	Log.d(TAG, "defineMissingClass 1");
-	DxContext context = new DxContext();
+	// DxContext context = new DxContext();
 
         cf.setAttributeFactory(StdAttributeFactory.THE_ONE);
-        outDexFile.add(CfTranslator.translate(context, cf, bytes, OPTIONS, DEX_OPTIONS, outDexFile));
+        // outDexFile.add(CfTranslator.translate(context, cf, bytes, OPTIONS, DEX_OPTIONS, outDexFile));
+        outDexFile.add(CfTranslator.translate(asFilePath(name), bytes, OPTIONS, DEX_OPTIONS));				
 	Log.d(TAG, "defineMissingClass 2");
         // get compile directory
         if (cacheDirectory == null) {
