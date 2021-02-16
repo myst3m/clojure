@@ -12,6 +12,8 @@
 
 package clojure.lang;
 
+import java.lang.reflect.Constructor;
+
 import java.net.MalformedURLException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.Callable;
@@ -200,6 +202,16 @@ final static public Var SUPPRESS_READ = Var.intern(CLOJURE_NS, Symbol.intern("*s
 final static public Var ASSERT = Var.intern(CLOJURE_NS, Symbol.intern("*assert*"), T).setDynamic();
 final static public Var MATH_CONTEXT = Var.intern(CLOJURE_NS, Symbol.intern("*math-context*"), null).setDynamic();
 static Keyword EVAL_FILE_KEY = Keyword.intern("clojure.core", "eval-file");
+
+
+static Keyword DALVIK_VM = Keyword.intern(null, "dalvik-vm");
+static Keyword JAVA_VM = Keyword.intern(null, "java-vm");
+final static public Var VM_TYPE =
+        Var.intern(CLOJURE_NS, Symbol.create("vm-type"),
+                   (System.getProperty("java.vm.name").equals("Dalvik")) ? DALVIK_VM : JAVA_VM);
+
+    
+    
 static Keyword LINE_KEY = Keyword.intern(null, "line");
 static Keyword COLUMN_KEY = Keyword.intern(null, "column");
 static Keyword FILE_KEY = Keyword.intern(null, "file");
@@ -2165,10 +2177,27 @@ static public ClassLoader makeClassLoader(){
 	return (ClassLoader) AccessController.doPrivileged(new PrivilegedAction(){
 		public Object run(){
             try{
+
             Var.pushThreadBindings(RT.map(USE_CONTEXT_CLASSLOADER, RT.T));
 //			getRootClassLoader();
-			return new DynamicClassLoader(baseLoader());
+                if(VM_TYPE.deref()==DALVIK_VM) {
+                    try {
+                        final Class<?> loaderClass=Class.forName("clojure.lang.DalvikDynamicClassLoader");
+                        final Constructor<?> constructor=loaderClass.getConstructor(ClassLoader.class);
+                        return constructor.newInstance(baseLoader());
+                    } catch(Exception e) {
+                        throw new RuntimeException("Unable to load Dalvik dynamic classloader.",e);
+                    }
+                } else {
+			return new JvmDynamicClassLoader(baseLoader());
+                }
+
             }
+		
+//             Var.pushThreadBindings(RT.map(USE_CONTEXT_CLASSLOADER, RT.T));
+// //			getRootClassLoader();
+// 			return new JvmDynamicClassLoader(baseLoader());
+//             }
                 finally{
             Var.popThreadBindings();
             }
