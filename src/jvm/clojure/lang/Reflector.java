@@ -28,7 +28,7 @@ private static final MethodHandle CAN_ACCESS_PRED;
 
 // Java 8 is oldest JDK supported
 private static boolean isJava8() {
-	return System.getProperty("java.vm.specification.version").equals("1.8");
+    return (System.getProperty("java.vm.specification.version").equals("1.8") || System.getProperty("java.vm.name").equals("Dalvik"));
 }
 
 static {
