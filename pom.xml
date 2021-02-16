@@ -7,6 +7,9 @@
   <packaging>jar</packaging>
   <version>1.11.0-master-SNAPSHOT</version>
 
+
+
+  
   <url>http://clojure.org/</url>
   <description>Clojure core environment and runtime library.</description>
 
@@ -37,11 +40,20 @@
     <directlinking>true</directlinking>
   </properties>
 
+
+  <repositories>
+    <repository>
+      <id>local</id>
+      <url>file:///home/myst/.m2/repository</url>
+    </repository>
+  </repositories>
+
+  
   <dependencies>
     <dependency>
       <groupId>org.clojure</groupId>
       <artifactId>spec.alpha</artifactId>
-       <version>0.2.194</version>
+      <version>0.2.194</version>
     </dependency>
     <dependency>
       <groupId>org.clojure</groupId>
@@ -72,24 +84,80 @@
         </exclusion>
       </exclusions>
     </dependency>
-<<<<<<< HEAD
     <dependency>
       <groupId>javax.xml.ws</groupId>
       <artifactId>jaxws-api</artifactId>
       <version>2.3.0</version>
       <scope>test</scope>
     </dependency>
-=======
-
- <dependency>
-      <groupId>com.google.android</groupId>
+    <dependency>
+      <groupId>android</groupId>
       <artifactId>android</artifactId>
-      <version>4.0.1.2</version>
+      <!-- <version>4.0.1.2</version> -->
+      <version>5.1.1_r2</version>
       <scope>provided</scope>
     </dependency>
 
 
->>>>>>> 485a7df5f (Update for android)
+    <dependency>
+      <groupId>com.google.guava</groupId>
+      <artifactId>guava</artifactId>
+      <version>23.0</version>
+    </dependency>
+
+    <dependency>
+      <groupId>com.google.code.gson</groupId>
+      <artifactId>gson</artifactId>
+      <version>2.7</version>
+    </dependency>
+    
+    <dependency>
+      <groupId>org.ow2.asm</groupId>
+      <artifactId>asm</artifactId>
+      <version>7.1</version>
+    </dependency>
+
+    <dependency>
+      <groupId>org.ow2.asm</groupId>
+      <artifactId>asm-commons</artifactId>
+      <version>7.1</version>
+    </dependency>
+
+    <dependency>
+      <groupId>org.ow2.asm</groupId>
+      <artifactId>asm-tree</artifactId>
+      <version>7.1</version>
+    </dependency>
+
+    <dependency>
+      <groupId>org.ow2.asm</groupId>
+      <artifactId>asm-analysis</artifactId>
+      <version>7.1</version>
+    </dependency>
+
+    <dependency>
+      <groupId>org.ow2.asm</groupId>
+      <artifactId>asm-util</artifactId>
+      <version>7.1</version>
+    </dependency>
+
+    <dependency>
+      <groupId>net.sf.jopt-simple</groupId>
+      <artifactId>jopt-simple</artifactId>
+      <version>4.6</version>
+    </dependency>
+    
+    <dependency>
+      <groupId>it.unimi.dsi</groupId>
+      <artifactId>fastutil</artifactId>
+      <version>7.2.0</version>
+    </dependency>
+
+    <dependency>
+      <groupId>org.jetbrains.kotlinx</groupId>
+      <artifactId>kotlinx-metadata-jvm</artifactId>
+      <version>0.1.0</version>
+    </dependency>
   </dependencies>
 
   <distributionManagement>
@@ -170,6 +238,7 @@
 		<source>src/jvm</source>
 		<source>android/platform/dalvik/dx/src</source>
 		<source>android/platform/libcore/dex/src/main/java</source>
+		<source>android/platform/r8/src/main/java</source>								
               </sources>
             </configuration>
           </execution>
@@ -178,6 +247,7 @@
       <plugin>
 	<artifactId>maven-assembly-plugin</artifactId>
         <version>2.2</version>
+	<<<<<<< HEAD
 	<executions>
 	  <execution>
 	    <id>clojure-slim-jar</id>
@@ -196,6 +266,38 @@
       <plugin>
 	<artifactId>maven-jar-plugin</artifactId>
 	<version>2.3.1</version>
+	=======
+	<executions>
+	  <execution>
+	    <id>clojure-slim-jar</id>
+	    <phase>package</phase>
+	    <goals>
+	      <goal>single</goal>
+	    </goals>
+	    <configuration>
+	      <descriptors>
+		<descriptor>src/assembly/slim.xml</descriptor>
+	      </descriptors>
+	      <archive>
+		<manifest>
+		  <mainClass>clojure.main</mainClass>
+		</manifest>
+	      </archive>
+	    </configuration>
+	  </execution>
+	</executions>
+      </plugin>
+      <plugin>
+	<artifactId>maven-jar-plugin</artifactId>
+	<version>2.3.1</version>
+	<configuration>
+	  <archive>
+	    <manifest>
+	      <mainClass>clojure.main</mainClass>
+	    </manifest>
+	  </archive>
+	</configuration>
+	>>>>>>> 34748da0a (Update)
       </plugin>
       <plugin>
 	<artifactId>maven-source-plugin</artifactId>
