@@ -4,3 +4,6 @@
 [submodule "android/platform/libcore"]
 	path = android/platform/libcore
 	url = https://android.googlesource.com/platform/libcore
+[submodule "r8"]
+	path = r8
+	url = https://r8.googlesource.com/r8
