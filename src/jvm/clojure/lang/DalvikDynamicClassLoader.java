@@ -25,6 +25,8 @@ import java.io.InputStream;
 import java.io.IOException;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
+import dalvik.system.DexClassLoader;
+import dalvik.system.PathClassLoader;
 
 // import com.android.tools.r8.D8;
 // import com.android.tools.r8.D8Command;
@@ -33,7 +35,7 @@ import java.util.zip.ZipOutputStream;
 // import java.nio.file.Path;
 // import java.nio.file.Paths;
 // import com.android.tools.r8.OutputMode;
-// import dalvik.system.DexClassLoader;
+
 // import com.android.tools.r8.CompilationFailedException;
 // import android.content.pm.ApplicationInfo;
 
@@ -167,19 +169,45 @@ public class DalvikDynamicClassLoader extends DynamicClassLoader {
             outDexFile.writeTo(fos, null, false);
             fos.close();
 
-            final File optDexFile =
-                new File(compileDir, tmpDexFile.getName().replace("repl-", "repl-opt-"));
-            final DexFile inDexFile =
-                DexFile.loadDex(tmpDexFile.getAbsolutePath(), optDexFile.getAbsolutePath(), 0);
+            // final File optDexFile =
+            //     new File(compileDir, tmpDexFile.getName().replace("repl-", "repl-opt-"));
 
-            // load the class
-            Class<?> clazz = inDexFile.loadClass(name.replace(".", "/"), this);
-            if (clazz == null) {
-                Log.e(TAG,"Failed to load generated class: "+name);
-                throw new RuntimeException(
-					   "Failed to load generated class " + name + ".");
-            }
+	    
+	    
+	    String dexPath = tmpDexFile.getAbsolutePath();
+
+	    String codePath = applicationContext.getPackageCodePath();
+
+	    String optDirName = tmpDexFile.getParent();
+
+	    // Log.d(TAG, "dexPath: " + dexPath);
+	    // Log.d(TAG, "optDirName: " + optDirName);
+	    // Log.d(TAG, "Class: " + name);
+	    
+	    // PathClassLoader parentClassLoader = new PathClassLoader(".:" + codePath , this.getClass().getClassLoader());
+	    // Log.d(TAG, "ClassLoader: " + parentClassLoader);
+	    
+	    // If I assign PathClassLoader, this.getClass().getClassLoader() and so on, it doesn't work.
+	    // Only the good one is this (this class). It seems to be due to skip many checkes in loading
+	    
+	    DexClassLoader dexcl = new DexClassLoader(dexPath, optDirName, null, this);
+	    Class<?> clazz = dexcl.loadClass(name);
+	    
+	    // Load Dex
+            // final DexFile inDexFile =
+            //     DexFile.loadDex(tmpDexFile.getAbsolutePath(), optDexFile.getAbsolutePath(), 0);
+
+            // // load the class
+            // Class<?> clazz = inDexFile.loadClass(name.replace(".", "/"), this);
+            // if (clazz == null) {
+            //     Log.e(TAG,"Failed to load generated class: "+name);
+            //     throw new RuntimeException(
+	    // 				   "Failed to load generated class " + name + ".");
+            // }
             return clazz;
+	} catch (ClassNotFoundException e) {
+	    Log.e(TAG,"Class not found", e);
+            throw new RuntimeException(e);
         } catch (IOException e) {
             Log.e(TAG,"Failed to define class due to I/O exception.",e);
             throw new RuntimeException(e);
