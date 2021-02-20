@@ -26,6 +26,17 @@ import java.io.IOException;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
+// import com.android.tools.r8.D8;
+// import com.android.tools.r8.D8Command;
+// import com.android.tools.r8.origin.Origin;
+// import com.android.tools.r8.origin.PathOrigin;
+// import java.nio.file.Path;
+// import java.nio.file.Paths;
+// import com.android.tools.r8.OutputMode;
+// import dalvik.system.DexClassLoader;
+// import com.android.tools.r8.CompilationFailedException;
+// import android.content.pm.ApplicationInfo;
+
 /**
  * Dynamic class loader for the Dalvik VM.
  *
@@ -58,6 +69,7 @@ public class DalvikDynamicClassLoader extends DynamicClassLoader {
         super();
     }
 
+
     public DalvikDynamicClassLoader(final ClassLoader parent) {
         super(parent);
     }
@@ -79,6 +91,53 @@ public class DalvikDynamicClassLoader extends DynamicClassLoader {
     // @Override
     protected Class<?> defineMissingClass(final String name, final byte[] bytes,
 					  final Object srcForm) {
+
+
+        // if (cacheDirectory == null) {
+        //     initializeDynamicCompilation();
+        //     if (cacheDirectory == null) {
+        //         String compilePath = (String)COMPILE_PATH.deref();
+        //         cacheDirectory = new File(compilePath);
+        //     }
+
+        // }
+
+	// Class<?> clazz = null;
+	
+	// try {	
+	//     final File compileDir = cacheDirectory;
+	
+	//     Path outputPath = Paths.get(compileDir.getPath() + "/output.jar");
+
+
+	//     D8.run(D8Command.builder()
+	// 	   .addClassProgramData(bytes, new PathOrigin(Paths.get(applicationContext.getPackageCodePath())))
+	// 	   .setOutput(outputPath, OutputMode.DexIndexed)
+	// 	   .build());	
+
+	//     for (File f : compileDir.listFiles()) {
+	// 	Log.d(TAG, f.getPath());
+        //     }
+
+	//     String dexPath = compileDir.getAbsolutePath() + "/" + "output" + ".jar";
+	//     dexPath += ":" + applicationContext.getPackageCodePath();
+	    
+	//     final String optDirName = cacheDirectory.getAbsolutePath() + "/opt";
+	//     File optDirFile = new File(optDirName);
+	//     optDirFile.mkdir();
+	    
+	//     DexClassLoader cl = new DexClassLoader(dexPath, optDirName, null, getSystemClassLoader());
+
+	//     clazz = cl.loadClass(name);
+
+	// } catch (CompilationFailedException e) {
+	//     Log.e(TAG,"Compilation Failure", e);
+	// } catch (ClassNotFoundException e) {
+	//     Log.e(TAG, "Class not found", e);
+	// } 
+	
+	// return clazz;
+	
 	// create dx DexFile and add translated class into it
         final com.android.dx.dex.file.DexFile outDexFile =
 	    new com.android.dx.dex.file.DexFile(DEX_OPTIONS);

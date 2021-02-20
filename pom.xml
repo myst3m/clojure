@@ -43,15 +43,29 @@
       <id>local</id>
       <url>file:///home/myst/.m2/repository</url>
     </repository>
+    <repository>
+      <id>Google</id>
+      <url>https://maven.google.com/</url>
+    </repository>    
+    
   </repositories>
 
   
   <dependencies>
+    
+    <!-- <dependency> -->
+    <!--   <groupId>com.android.tools</groupId> -->
+    <!--   <artifactId>r8</artifactId> -->
+    <!--   <version>2.1.75</version> -->
+    <!-- </dependency> -->
+
+    
     <dependency>
       <groupId>org.clojure</groupId>
       <artifactId>spec.alpha</artifactId>
       <version>0.2.194</version>
     </dependency>
+    
     <dependency>
       <groupId>org.clojure</groupId>
       <artifactId>core.specs.alpha</artifactId>
@@ -87,6 +101,7 @@
       <version>2.3.0</version>
       <scope>test</scope>
     </dependency>
+
     <dependency>
       <groupId>android</groupId>
       <artifactId>android</artifactId>
@@ -94,7 +109,6 @@
       <version>5.1.1_r2</version>
       <scope>provided</scope>
     </dependency>
-
 
     <dependency>
       <groupId>com.google.guava</groupId>
@@ -155,6 +169,15 @@
       <artifactId>kotlinx-metadata-jvm</artifactId>
       <version>0.1.0</version>
     </dependency>
+
+
+    <!-- https://mvnrepository.com/artifact/org.ow2.asm/asm -->
+    <dependency>
+      <groupId>org.ow2.asm</groupId>
+      <artifactId>asm</artifactId>
+      <version>9.1</version>
+    </dependency>
+    
   </dependencies>
 
   <distributionManagement>
@@ -235,7 +258,7 @@
 		<source>src/jvm</source>
 		<source>android/platform/dalvik/dx/src</source>
 		<source>android/platform/libcore/dex/src/main/java</source>
-		<source>android/platform/r8/src/main/java</source>								
+		<!-- <source>r8/src/main/java</source>						 -->
               </sources>
             </configuration>
           </execution>
