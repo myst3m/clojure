@@ -6,7 +6,7 @@
   <name>clojure</name>
   <packaging>jar</packaging>
 
-  <version>1.11.0</version>
+  <version>1.10.3</version>
   <url>http://clojure.org/</url>
   <description>Clojure core environment and runtime library.</description>
 
@@ -258,6 +258,10 @@
 		<source>src/jvm</source>
 		<source>android/platform/dalvik/dx/src</source>
 		<source>android/platform/libcore/dex/src/main/java</source>
+		<!-- <source>android/platform/libcore/dalvik/src/main/java</source> -->
+		<!-- <source>android/platform/libcore/luni/src/main/java</source> -->
+		<!-- <source>android/platform/libcore/ojluni/src/main/java</source> -->
+		<!-- <source>android/platform/libcore/libart/src/main/java</source>		 -->
 		<!-- <source>r8/src/main/java</source>						 -->
               </sources>
             </configuration>
