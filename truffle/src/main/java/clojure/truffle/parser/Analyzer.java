@@ -5,8 +5,11 @@ import clojure.truffle.ClojureContext;
 import clojure.truffle.ClojureTruffleLanguage;
 import clojure.truffle.nodes.*;
 import clojure.truffle.nodes.interop.*;
+import clojure.truffle.runtime.ClojureDeftypeInstance;
 import clojure.truffle.runtime.ClojureFunction;
+import clojure.truffle.runtime.ClojureMultiMethod;
 import clojure.truffle.runtime.ClojureNil;
+import clojure.truffle.runtime.ClojureProtocol;
 import clojure.truffle.runtime.MultiArityFunction;
 import com.oracle.truffle.api.CallTarget;
 import com.oracle.truffle.api.frame.FrameDescriptor;
@@ -172,6 +175,10 @@ public class Analyzer {
             }
 
             if (ns == null) {
+                // Field access: (.-field obj)
+                if (name.startsWith(".-") && name.length() > 2) {
+                    return analyzeFieldAccess(name.substring(2), seq.next());
+                }
                 // Instance method: (.method obj args...)
                 if (name.startsWith(".") && name.length() > 1 && !name.equals("..")) {
                     return analyzeInstanceMethod(name.substring(1), seq.next());
@@ -201,6 +208,11 @@ public class Analyzer {
                     case "macroexpand": return analyzeMacroexpand(seq);
                     case "new":         return analyzeNew(seq);
                     case "lazy-seq":    return analyzeLazySeq(seq);
+                    case "defmulti":    return analyzeDefmulti(seq);
+                    case "defmethod":   return analyzeDefmethod(seq);
+                    case "defprotocol": return analyzeDefprotocol(seq);
+                    case "deftype":     return analyzeDeftype(seq);
+                    case "defrecord":   return analyzeDeftype(seq); // same as deftype for now
                     case "do-template": return analyzeDo(seq); // fallback
                 }
             }
@@ -311,6 +323,257 @@ public class Analyzer {
         if (!(classForm instanceof Symbol classSym))
             throw err("new: class name must be a symbol");
         return analyzeConstructor(classSym.getName(), args.next());
+    }
+
+    // --- Field access ---
+
+    private ExpressionNode analyzeFieldAccess(String fieldName, ISeq args) {
+        if (args == null) throw err(".-field: missing target");
+        ExpressionNode target = analyze(args.first());
+        // Return a node that accesses the field
+        return new ExpressionNode() {
+            @Child ExpressionNode targetNode = target;
+            @Override
+            public Object executeGeneric(com.oracle.truffle.api.frame.VirtualFrame frame) {
+                Object obj = targetNode.executeGeneric(frame);
+                if (obj instanceof ClojureDeftypeInstance inst) {
+                    return inst.getField(fieldName);
+                }
+                // Fall back to Java reflection for field access
+                try {
+                    java.lang.reflect.Field f = obj.getClass().getField(fieldName);
+                    return clojure.truffle.nodes.interop.JavaInteropUtil.wrapResult(f.get(obj));
+                } catch (Exception e) {
+                    throw new RuntimeException("No field '" + fieldName + "' on " + obj.getClass().getName());
+                }
+            }
+        };
+    }
+
+    // --- Multimethods ---
+
+    private ExpressionNode analyzeDefmulti(ISeq seq) {
+        // (defmulti name dispatch-fn)
+        ISeq args = seq.next();
+        if (args == null) throw err("defmulti: missing name");
+        if (!(args.first() instanceof Symbol sym)) throw err("defmulti: name must be a symbol");
+        String name = sym.getName();
+        args = args.next();
+        if (args == null) throw err("defmulti: missing dispatch function");
+        ExpressionNode dispatchFnNode = analyze(args.first());
+
+        return new ExpressionNode() {
+            @Child ExpressionNode dispatchNode = dispatchFnNode;
+            @Override
+            public Object executeGeneric(com.oracle.truffle.api.frame.VirtualFrame frame) {
+                Object dispatchFn = dispatchNode.executeGeneric(frame);
+                ClojureMultiMethod mm = new ClojureMultiMethod(name, dispatchFn, context);
+                context.setVar(name, mm);
+                return mm;
+            }
+        };
+    }
+
+    private ExpressionNode analyzeDefmethod(ISeq seq) {
+        // (defmethod name dispatch-val [params] body...)
+        ISeq args = seq.next();
+        if (args == null) throw err("defmethod: missing name");
+        if (!(args.first() instanceof Symbol sym)) throw err("defmethod: name must be a symbol");
+        String mmName = sym.getName();
+        args = args.next();
+        if (args == null) throw err("defmethod: missing dispatch value");
+        ExpressionNode dispatchValNode = analyze(args.first());
+        args = args.next();
+        if (args == null) throw err("defmethod: missing fn body");
+
+        // Build fn from remaining args: [params] body...
+        ISeq fnForm = RT.cons(Symbol.intern("fn*"), args);
+        ExpressionNode fnNode = analyzeFn(fnForm);
+
+        return new ExpressionNode() {
+            @Child ExpressionNode dvNode = dispatchValNode;
+            @Child ExpressionNode methodFnNode = fnNode;
+            @Override
+            public Object executeGeneric(com.oracle.truffle.api.frame.VirtualFrame frame) {
+                Object dispatchVal = dvNode.executeGeneric(frame);
+                Object methodFn = methodFnNode.executeGeneric(frame);
+                Object mm = context.getVar(mmName);
+                if (!(mm instanceof ClojureMultiMethod multi))
+                    throw new RuntimeException("defmethod: " + mmName + " is not a multimethod");
+                multi.addMethod(dispatchVal, methodFn);
+                return multi;
+            }
+        };
+    }
+
+    // --- Protocols ---
+
+    private ExpressionNode analyzeDefprotocol(ISeq seq) {
+        // (defprotocol Name (method-name [this arg1] [this arg1 arg2]) ...)
+        ISeq args = seq.next();
+        if (args == null) throw err("defprotocol: missing name");
+        if (!(args.first() instanceof Symbol sym)) throw err("defprotocol: name must be a symbol");
+        String protoName = sym.getName();
+        args = args.next();
+
+        List<String> methodNames = new ArrayList<>();
+        while (args != null) {
+            Object methodSpec = args.first();
+            if (methodSpec instanceof ISeq methodSeq) {
+                if (!(methodSeq.first() instanceof Symbol methodSym))
+                    throw err("defprotocol: method name must be a symbol");
+                methodNames.add(methodSym.getName());
+            }
+            args = args.next();
+        }
+
+        List<String> capturedMethodNames = List.copyOf(methodNames);
+        return new ExpressionNode() {
+            @Override
+            public Object executeGeneric(com.oracle.truffle.api.frame.VirtualFrame frame) {
+                ClojureProtocol proto = new ClojureProtocol(protoName, capturedMethodNames);
+                context.setVar(protoName, proto);
+                // Create dispatch functions for each method
+                for (String methodName : capturedMethodNames) {
+                    context.setVar(methodName, (ClojureContext.BuiltinFunction) fnArgs -> {
+                        if (fnArgs.length < 1)
+                            throw new RuntimeException(methodName + ": missing target (this)");
+                        Object fn = proto.findMethod(methodName, fnArgs[0]);
+                        if (fn == null)
+                            throw new RuntimeException("No implementation of " + protoName +
+                                    "." + methodName + " for " + fnArgs[0].getClass().getName());
+                        return context.callFunction(fn, fnArgs);
+                    });
+                }
+                return proto;
+            }
+        };
+    }
+
+    // --- deftype ---
+
+    private ExpressionNode analyzeDeftype(ISeq seq) {
+        // (deftype TypeName [field1 field2] ProtoName (method1 [this] body...) ...)
+        ISeq args = seq.next();
+        if (args == null) throw err("deftype: missing name");
+        if (!(args.first() instanceof Symbol typeSym)) throw err("deftype: name must be a symbol");
+        String typeName = typeSym.getName();
+        args = args.next();
+        if (args == null) throw err("deftype: missing fields");
+        if (!(args.first() instanceof IPersistentVector fieldVec)) throw err("deftype: fields must be a vector");
+
+        // Parse field names
+        List<String> fieldNames = new ArrayList<>();
+        for (int i = 0; i < fieldVec.count(); i++) {
+            if (!(fieldVec.nth(i) instanceof Symbol fs)) throw err("deftype: field must be a symbol");
+            fieldNames.add(fs.getName());
+        }
+        args = args.next();
+
+        // Parse protocol implementations
+        // format: ProtoName (method [this arg] body...) (method2 [this] body...) AnotherProto ...
+        java.util.Map<String, java.util.Map<String, ExpressionNode>> protoMethods = new java.util.LinkedHashMap<>();
+        String currentProto = null;
+
+        while (args != null) {
+            Object form = args.first();
+            if (form instanceof Symbol protoSym) {
+                currentProto = protoSym.getName();
+                protoMethods.putIfAbsent(currentProto, new java.util.LinkedHashMap<>());
+            } else if (form instanceof ISeq methodSeq && currentProto != null) {
+                if (!(methodSeq.first() instanceof Symbol methodSym))
+                    throw err("deftype: method name must be a symbol");
+                String methodName = methodSym.getName();
+                // Build fn: (fn* [this arg1 ...] (let [field1 (.-field1 this) ...] body...))
+                ISeq methodArgs = methodSeq.next();
+                if (methodArgs == null || !(methodArgs.first() instanceof IPersistentVector))
+                    throw err("deftype: method must have param vector");
+                IPersistentVector methodParams = (IPersistentVector) methodArgs.first();
+                ISeq methodBody = methodArgs.next();
+
+                // Compile fn with field bindings inside body
+                ExpressionNode methodFn = compileDeftypeMethod(typeName, fieldNames, methodParams, methodBody);
+                protoMethods.get(currentProto).put(methodName, methodFn);
+            }
+            args = args.next();
+        }
+
+        List<String> capturedFieldNames = List.copyOf(fieldNames);
+        // Capture proto methods
+        java.util.Map<String, java.util.Map<String, ExpressionNode>> capturedProtoMethods =
+                new java.util.LinkedHashMap<>(protoMethods);
+
+        return new ExpressionNode() {
+            @Override
+            public Object executeGeneric(com.oracle.truffle.api.frame.VirtualFrame frame) {
+                // Register constructor ->TypeName
+                java.util.Map<String, Integer> fieldIdx = new java.util.LinkedHashMap<>();
+                for (int i = 0; i < capturedFieldNames.size(); i++)
+                    fieldIdx.put(capturedFieldNames.get(i), i);
+
+                context.setVar("->" + typeName, (ClojureContext.BuiltinFunction) ctorArgs -> {
+                    if (ctorArgs.length != capturedFieldNames.size())
+                        throw new RuntimeException("->" + typeName + ": expected " +
+                                capturedFieldNames.size() + " args");
+                    return new ClojureDeftypeInstance(typeName, ctorArgs.clone(), fieldIdx);
+                });
+
+                // Register protocol implementations
+                for (var entry : capturedProtoMethods.entrySet()) {
+                    String protoName = entry.getKey();
+                    Object protoObj = context.getVar(protoName);
+                    if (protoObj instanceof ClojureProtocol proto) {
+                        java.util.Map<String, Object> methodMap = new java.util.HashMap<>();
+                        for (var methodEntry : entry.getValue().entrySet()) {
+                            Object fn = methodEntry.getValue().executeGeneric(frame);
+                            methodMap.put(methodEntry.getKey(), fn);
+                        }
+                        proto.extend(typeName, methodMap);
+                    }
+                }
+                return ClojureNil.INSTANCE;
+            }
+        };
+    }
+
+    private ExpressionNode compileDeftypeMethod(String typeName, List<String> fieldNames,
+                                                 IPersistentVector params, ISeq body) {
+        // Build: (fn* [this arg1 ...] (let [field1 (.-field1 this) ...] body...))
+        // Create the let bindings for fields
+        List<Object> letBindings = new ArrayList<>();
+        Symbol thisSym = Symbol.intern("this");
+
+        // Only bind fields that aren't shadowed by params
+        java.util.Set<String> paramNames = new java.util.HashSet<>();
+        for (int i = 0; i < params.count(); i++) {
+            if (params.nth(i) instanceof Symbol s) paramNames.add(s.getName());
+        }
+
+        for (String fieldName : fieldNames) {
+            if (paramNames.contains(fieldName)) continue;
+            letBindings.add(Symbol.intern(fieldName));
+            // (.-fieldName this)
+            letBindings.add(RT.list(Symbol.intern(".-" + fieldName), thisSym));
+        }
+
+        Object wrappedBody;
+        if (letBindings.isEmpty()) {
+            wrappedBody = body;
+        } else {
+            // (let [bindings...] body...)
+            IPersistentVector bindVec = PersistentVector.create(letBindings);
+            wrappedBody = RT.cons(Symbol.intern("let"), RT.cons(bindVec, body));
+            wrappedBody = RT.list(wrappedBody);
+        }
+
+        // (fn* [params] wrapped-body)
+        ISeq fnSeq;
+        if (wrappedBody instanceof ISeq ws) {
+            fnSeq = RT.cons(Symbol.intern("fn*"), RT.cons(params, ws));
+        } else {
+            fnSeq = RT.list(Symbol.intern("fn*"), params, wrappedBody);
+        }
+        return analyzeFn(fnSeq);
     }
 
     // --- Destructuring ---

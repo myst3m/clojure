@@ -4,6 +4,7 @@ import com.oracle.truffle.api.frame.VirtualFrame;
 import com.oracle.truffle.api.nodes.IndirectCallNode;
 import clojure.truffle.ClojureContext;
 import clojure.truffle.runtime.ClojureFunction;
+import clojure.truffle.runtime.ClojureMultiMethod;
 import clojure.truffle.runtime.MultiArityFunction;
 
 public class InvokeNode extends ExpressionNode {
@@ -40,6 +41,8 @@ public class InvokeNode extends ExpressionNode {
             return callNode.call(fn.getCallTarget(), callArgs);
         } else if (function instanceof ClojureContext.BuiltinFunction builtin) {
             return builtin.execute(argValues);
+        } else if (function instanceof ClojureMultiMethod mm) {
+            return mm.invoke(argValues);
         } else if (function instanceof clojure.lang.Keyword kw) {
             // Keywords as functions: (:key map) → (get map :key)
             if (argValues.length < 1 || argValues.length > 2)

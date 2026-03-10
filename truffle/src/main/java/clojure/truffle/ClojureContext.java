@@ -7,6 +7,9 @@ import clojure.truffle.parser.Analyzer;
 import clojure.truffle.runtime.ClojureAtom;
 import clojure.truffle.runtime.ClojureFunction;
 import clojure.truffle.runtime.ClojureNil;
+import clojure.truffle.runtime.ClojureDeftypeInstance;
+import clojure.truffle.runtime.ClojureMultiMethod;
+import clojure.truffle.runtime.ClojureProtocol;
 import clojure.truffle.runtime.LazySeq;
 import clojure.truffle.runtime.MultiArityFunction;
 
@@ -842,6 +845,61 @@ public class ClojureContext {
             if (args[0] instanceof ClojureNil) return ClojureNil.INSTANCE;
             return args[0].getClass();
         });
+
+        // --- Metadata ---
+
+        globalVars.put("meta", (BuiltinFunction) args -> {
+            checkArity(args, 1, "meta");
+            if (args[0] instanceof clojure.lang.IMeta m) {
+                clojure.lang.IPersistentMap meta = m.meta();
+                return meta == null ? ClojureNil.INSTANCE : meta;
+            }
+            return ClojureNil.INSTANCE;
+        });
+
+        globalVars.put("with-meta", (BuiltinFunction) args -> {
+            checkArity(args, 2, "with-meta");
+            if (!(args[0] instanceof clojure.lang.IObj obj))
+                throw new RuntimeException("with-meta: object does not support metadata");
+            if (args[1] instanceof ClojureNil)
+                return obj.withMeta(null);
+            if (!(args[1] instanceof clojure.lang.IPersistentMap meta))
+                throw new RuntimeException("with-meta: metadata must be a map");
+            return obj.withMeta(meta);
+        });
+
+        globalVars.put("vary-meta", (BuiltinFunction) args -> {
+            if (args.length < 2) throw new RuntimeException("vary-meta: expected at least 2 args");
+            if (!(args[0] instanceof clojure.lang.IObj obj))
+                throw new RuntimeException("vary-meta: object does not support metadata");
+            Object fn = args[1];
+            clojure.lang.IPersistentMap currentMeta = (args[0] instanceof clojure.lang.IMeta m) ?
+                    m.meta() : null;
+            if (currentMeta == null) currentMeta = clojure.lang.PersistentHashMap.EMPTY;
+            Object[] fnArgs = new Object[1 + args.length - 2];
+            fnArgs[0] = currentMeta;
+            System.arraycopy(args, 2, fnArgs, 1, args.length - 2);
+            Object newMeta = callFunction(fn, fnArgs);
+            return obj.withMeta((clojure.lang.IPersistentMap) newMeta);
+        });
+
+        // --- Satisfies? ---
+
+        globalVars.put("satisfies?", (BuiltinFunction) args -> {
+            checkArity(args, 2, "satisfies?");
+            if (!(args[0] instanceof ClojureProtocol proto))
+                throw new RuntimeException("satisfies?: first arg must be a protocol");
+            return proto.hasImplementation(args[1]);
+        });
+
+        // --- Type name ---
+
+        globalVars.put("type", (BuiltinFunction) args -> {
+            checkArity(args, 1, "type");
+            if (args[0] instanceof ClojureNil) return ClojureNil.INSTANCE;
+            if (args[0] instanceof ClojureDeftypeInstance inst) return inst.getTypeName();
+            return args[0].getClass();
+        });
     }
 
     // --- Function calling helper ---
@@ -860,6 +918,19 @@ public class ClojureContext {
             return clf.getCallTarget().call(callArgs);
         } else if (fn instanceof BuiltinFunction builtin) {
             return builtin.execute(args);
+        } else if (fn instanceof ClojureMultiMethod mm) {
+            return mm.invoke(args);
+        } else if (fn instanceof clojure.lang.Keyword kw) {
+            // Keyword as function: (:key map) → (get map :key)
+            if (args.length < 1 || args.length > 2)
+                throw new RuntimeException("Keyword lookup expects 1 or 2 args");
+            Object map = args[0];
+            if (map instanceof clojure.lang.ILookup lookup) {
+                Object notFound = args.length == 2 ? args[1] : ClojureNil.INSTANCE;
+                Object val = lookup.valAt(kw, notFound);
+                return val == null ? ClojureNil.INSTANCE : val;
+            }
+            return args.length == 2 ? args[1] : ClojureNil.INSTANCE;
         }
         throw new RuntimeException("Not a function: " + fn);
     }
