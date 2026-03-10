@@ -58,6 +58,29 @@ public class InvokeNode extends ExpressionNode {
                     clojure.truffle.runtime.ClojureNil.INSTANCE;
         }
 
+        // Maps as functions: ({:a 1} :a) → 1
+        if (function instanceof clojure.lang.IPersistentMap m) {
+            if (argValues.length < 1 || argValues.length > 2)
+                throw new RuntimeException("Map lookup expects 1 or 2 args");
+            Object val = m.valAt(argValues[0],
+                    argValues.length == 2 ? argValues[1] : clojure.truffle.runtime.ClojureNil.INSTANCE);
+            return val == null ? clojure.truffle.runtime.ClojureNil.INSTANCE : val;
+        }
+        // Vectors as functions: ([1 2 3] 1) → 2
+        if (function instanceof clojure.lang.IPersistentVector v) {
+            if (argValues.length != 1)
+                throw new RuntimeException("Vector lookup expects 1 arg");
+            int idx = ((Number) argValues[0]).intValue();
+            return v.nth(idx);
+        }
+        // Sets as functions: (#{1 2 3} 2) → 2
+        if (function instanceof clojure.lang.IPersistentSet s) {
+            if (argValues.length != 1)
+                throw new RuntimeException("Set lookup expects 1 arg");
+            Object val = s.get(argValues[0]);
+            return val == null ? clojure.truffle.runtime.ClojureNil.INSTANCE : val;
+        }
+
         throw new RuntimeException("Cannot invoke: " + function + " (type: " +
                 (function == null ? "null" : function.getClass().getName()) + ")");
     }

@@ -164,6 +164,14 @@ public class ClojureContext {
             registerSetNamespace();
             return;
         }
+        if (nsName.equals("clojure.walk")) {
+            registerWalkNamespace();
+            return;
+        }
+        if (nsName.equals("clojure.edn")) {
+            registerEdnNamespace();
+            return;
+        }
         if (!loadingNamespaces.add(nsName))
             throw new RuntimeException("Circular require detected: " + nsName);
         try {
@@ -3556,6 +3564,260 @@ public class ClojureContext {
             return sb.toString();
         });
 
+        // --- Phase 11: read-string ---
+        globalVars.put("read-string", (BuiltinFunction) args -> {
+            checkArity(args, 1, "read-string");
+            String s = args[0].toString();
+            try {
+                java.io.PushbackReader rdr = new java.io.PushbackReader(new java.io.StringReader(s));
+                Object form = clojure.lang.LispReader.read(rdr, true, null, false, null);
+                return form == null ? ClojureNil.INSTANCE : form;
+            } catch (Exception e) {
+                throw new RuntimeException("read-string: " + e.getMessage());
+            }
+        });
+
+        // --- Phase 11: walk functions ---
+        globalVars.put("walk", (BuiltinFunction) args -> {
+            checkArity(args, 3, "walk");
+            Object inner = args[0];
+            Object outer = args[1];
+            Object form = args[2];
+            Object walked;
+            if (form instanceof clojure.lang.IMapEntry me) {
+                walked = clojure.lang.MapEntry.create(
+                        callFunction(inner, new Object[]{me.key()}),
+                        callFunction(inner, new Object[]{me.val()}));
+            } else if (form instanceof clojure.lang.IPersistentList) {
+                java.util.List<Object> result = new ArrayList<>();
+                for (clojure.lang.ISeq seq = clojure.lang.RT.seq(form); seq != null; seq = seq.next()) {
+                    result.add(callFunction(inner, new Object[]{seq.first()}));
+                }
+                walked = clojure.lang.PersistentList.create(result);
+            } else if (form instanceof clojure.lang.IPersistentVector v) {
+                java.util.List<Object> result = new ArrayList<>();
+                for (int i = 0; i < v.count(); i++) {
+                    result.add(callFunction(inner, new Object[]{v.nth(i)}));
+                }
+                walked = clojure.lang.PersistentVector.create(result);
+            } else if (form instanceof clojure.lang.IPersistentMap m) {
+                clojure.lang.IPersistentMap result = clojure.lang.PersistentArrayMap.EMPTY;
+                for (clojure.lang.ISeq seq = m.seq(); seq != null; seq = seq.next()) {
+                    Object entry = callFunction(inner, new Object[]{seq.first()});
+                    if (entry instanceof clojure.lang.IMapEntry me2) {
+                        result = result.assoc(me2.key(), me2.val());
+                    } else if (entry instanceof clojure.lang.IPersistentVector ev && ev.count() == 2) {
+                        result = result.assoc(ev.nth(0), ev.nth(1));
+                    }
+                }
+                walked = result;
+            } else if (form instanceof clojure.lang.ISeq) {
+                java.util.List<Object> result = new ArrayList<>();
+                for (clojure.lang.ISeq seq = (clojure.lang.ISeq) form; seq != null; seq = seq.next()) {
+                    result.add(callFunction(inner, new Object[]{seq.first()}));
+                }
+                walked = clojure.lang.PersistentList.create(result);
+            } else {
+                walked = form;
+            }
+            return callFunction(outer, new Object[]{walked});
+        });
+
+        globalVars.put("postwalk", (BuiltinFunction) args -> {
+            checkArity(args, 2, "postwalk");
+            return postwalk(args[0], args[1]);
+        });
+
+        globalVars.put("prewalk", (BuiltinFunction) args -> {
+            checkArity(args, 2, "prewalk");
+            return prewalk(args[0], args[1]);
+        });
+
+        globalVars.put("postwalk-replace", (BuiltinFunction) args -> {
+            checkArity(args, 2, "postwalk-replace");
+            Object smap = args[0];
+            return postwalk((BuiltinFunction) a -> {
+                if (a[0] instanceof ClojureNil) return a[0];
+                if (smap instanceof clojure.lang.IPersistentMap m) {
+                    Object replacement = m.valAt(a[0]);
+                    return replacement != null ? replacement : a[0];
+                }
+                return a[0];
+            }, args[1]);
+        });
+
+        globalVars.put("prewalk-replace", (BuiltinFunction) args -> {
+            checkArity(args, 2, "prewalk-replace");
+            Object smap = args[0];
+            return prewalk((BuiltinFunction) a -> {
+                if (a[0] instanceof ClojureNil) return a[0];
+                if (smap instanceof clojure.lang.IPersistentMap m) {
+                    Object replacement = m.valAt(a[0]);
+                    return replacement != null ? replacement : a[0];
+                }
+                return a[0];
+            }, args[1]);
+        });
+
+        // --- Phase 11: update-keys, update-vals (Clojure 1.11+) ---
+        globalVars.put("update-keys", (BuiltinFunction) args -> {
+            checkArity(args, 2, "update-keys");
+            clojure.lang.IPersistentMap m = (clojure.lang.IPersistentMap) args[0];
+            Object f = args[1];
+            clojure.lang.IPersistentMap result = clojure.lang.PersistentArrayMap.EMPTY;
+            for (clojure.lang.ISeq seq = m.seq(); seq != null; seq = seq.next()) {
+                clojure.lang.MapEntry entry = (clojure.lang.MapEntry) seq.first();
+                Object newKey = callFunction(f, new Object[]{entry.key()});
+                result = result.assoc(newKey, entry.val());
+            }
+            return result;
+        });
+
+        globalVars.put("update-vals", (BuiltinFunction) args -> {
+            checkArity(args, 2, "update-vals");
+            clojure.lang.IPersistentMap m = (clojure.lang.IPersistentMap) args[0];
+            Object f = args[1];
+            clojure.lang.IPersistentMap result = clojure.lang.PersistentArrayMap.EMPTY;
+            for (clojure.lang.ISeq seq = m.seq(); seq != null; seq = seq.next()) {
+                clojure.lang.MapEntry entry = (clojure.lang.MapEntry) seq.first();
+                Object newVal = callFunction(f, new Object[]{entry.val()});
+                result = result.assoc(entry.key(), newVal);
+            }
+            return result;
+        });
+
+        // --- Phase 11: Misc missing ---
+        globalVars.put("map-entry", (BuiltinFunction) args -> {
+            checkArity(args, 2, "map-entry");
+            return clojure.lang.MapEntry.create(args[0], args[1]);
+        });
+
+        globalVars.put("key", (BuiltinFunction) args -> {
+            checkArity(args, 1, "key");
+            return ((clojure.lang.IMapEntry) args[0]).key();
+        });
+
+        globalVars.put("val", (BuiltinFunction) args -> {
+            checkArity(args, 1, "val");
+            return ((clojure.lang.IMapEntry) args[0]).val();
+        });
+
+        globalVars.put("find", (BuiltinFunction) args -> {
+            checkArity(args, 2, "find");
+            if (args[0] instanceof clojure.lang.IPersistentMap m) {
+                clojure.lang.IMapEntry entry = m.entryAt(args[1]);
+                return entry == null ? ClojureNil.INSTANCE : entry;
+            }
+            return ClojureNil.INSTANCE;
+        });
+
+        globalVars.put("map-entry?", (BuiltinFunction) args -> {
+            checkArity(args, 1, "map-entry?");
+            return args[0] instanceof clojure.lang.IMapEntry;
+        });
+
+        globalVars.put("not", (BuiltinFunction) args -> {
+            checkArity(args, 1, "not");
+            return !isTruthy(args[0]);
+        });
+
+        globalVars.put("mod", (BuiltinFunction) args -> {
+            checkArity(args, 2, "mod");
+            if (args[0] instanceof Long a && args[1] instanceof Long b) {
+                return Math.floorMod(a, b);
+            }
+            double a = ((Number) args[0]).doubleValue();
+            double b = ((Number) args[1]).doubleValue();
+            return a - b * Math.floor(a / b);
+        });
+
+        globalVars.put("rem", (BuiltinFunction) args -> {
+            checkArity(args, 2, "rem");
+            if (args[0] instanceof Long a && args[1] instanceof Long b) return a % b;
+            return ((Number) args[0]).doubleValue() % ((Number) args[1]).doubleValue();
+        });
+
+        globalVars.put("quot", (BuiltinFunction) args -> {
+            checkArity(args, 2, "quot");
+            if (args[0] instanceof Long a && args[1] instanceof Long b) return a / b;
+            return (long) (((Number) args[0]).doubleValue() / ((Number) args[1]).doubleValue());
+        });
+
+        globalVars.put("bit-and", (BuiltinFunction) args -> {
+            checkArity(args, 2, "bit-and");
+            return ((Number) args[0]).longValue() & ((Number) args[1]).longValue();
+        });
+
+        globalVars.put("bit-or", (BuiltinFunction) args -> {
+            checkArity(args, 2, "bit-or");
+            return ((Number) args[0]).longValue() | ((Number) args[1]).longValue();
+        });
+
+        globalVars.put("bit-xor", (BuiltinFunction) args -> {
+            checkArity(args, 2, "bit-xor");
+            return ((Number) args[0]).longValue() ^ ((Number) args[1]).longValue();
+        });
+
+        globalVars.put("bit-not", (BuiltinFunction) args -> {
+            checkArity(args, 1, "bit-not");
+            return ~((Number) args[0]).longValue();
+        });
+
+        globalVars.put("bit-shift-left", (BuiltinFunction) args -> {
+            checkArity(args, 2, "bit-shift-left");
+            return ((Number) args[0]).longValue() << ((Number) args[1]).intValue();
+        });
+
+        globalVars.put("bit-shift-right", (BuiltinFunction) args -> {
+            checkArity(args, 2, "bit-shift-right");
+            return ((Number) args[0]).longValue() >> ((Number) args[1]).intValue();
+        });
+
+        globalVars.put("unsigned-bit-shift-right", (BuiltinFunction) args -> {
+            checkArity(args, 2, "unsigned-bit-shift-right");
+            return ((Number) args[0]).longValue() >>> ((Number) args[1]).intValue();
+        });
+
+        globalVars.put("long", (BuiltinFunction) args -> {
+            checkArity(args, 1, "long");
+            if (args[0] instanceof Long l) return l;
+            return ((Number) args[0]).longValue();
+        });
+
+        globalVars.put("double", (BuiltinFunction) args -> {
+            checkArity(args, 1, "double");
+            if (args[0] instanceof Double d) return d;
+            return ((Number) args[0]).doubleValue();
+        });
+
+        globalVars.put("boolean", (BuiltinFunction) args -> {
+            checkArity(args, 1, "boolean");
+            return isTruthy(args[0]);
+        });
+
+        globalVars.put("bigint", (BuiltinFunction) args -> {
+            checkArity(args, 1, "bigint");
+            if (args[0] instanceof java.math.BigInteger bi) return bi;
+            return java.math.BigInteger.valueOf(((Number) args[0]).longValue());
+        });
+
+        globalVars.put("bigdec", (BuiltinFunction) args -> {
+            checkArity(args, 1, "bigdec");
+            if (args[0] instanceof java.math.BigDecimal bd) return bd;
+            return java.math.BigDecimal.valueOf(((Number) args[0]).doubleValue());
+        });
+
+        // with-redefs support via dynamic binding
+        globalVars.put("alter-var-root", (BuiltinFunction) args -> {
+            checkArity(args, 2, "alter-var-root");
+            String varName = args[0].toString();
+            Object f = args[1];
+            Object oldVal = getVar(varName);
+            Object newVal = callFunction(f, new Object[]{oldVal == null ? ClojureNil.INSTANCE : oldVal});
+            setVar(varName, newVal);
+            return newVal;
+        });
+
         // Copy all builtins into clojure.core namespace
         ClojureNamespace core = namespaces.get("clojure.core");
         if (core != null) {
@@ -3995,6 +4257,21 @@ public class ClojureContext {
         });
     }
 
+    private void registerWalkNamespace() {
+        ClojureNamespace ns = getOrCreateNamespace("clojure.walk");
+        String[] fns = {"walk", "postwalk", "prewalk", "postwalk-replace", "prewalk-replace"};
+        for (String fn : fns) {
+            Object val = globalVars.get(fn);
+            if (val != null) ns.intern(fn, val);
+        }
+    }
+
+    private void registerEdnNamespace() {
+        ClojureNamespace ns = getOrCreateNamespace("clojure.edn");
+        Object readStr = globalVars.get("read-string");
+        if (readStr != null) ns.intern("read-string", readStr);
+    }
+
     private static java.util.Set<Class<?>> clojure_allInterfaces(Class<?> clazz) {
         java.util.Set<Class<?>> result = new java.util.HashSet<>();
         java.util.Queue<Class<?>> queue = new java.util.LinkedList<>();
@@ -4028,6 +4305,66 @@ public class ClojureContext {
         }
 
         public abstract Object step(Object acc, Object input);
+    }
+
+    private Object postwalk(Object f, Object form) {
+        Object walked;
+        if (form instanceof clojure.lang.IPersistentVector v) {
+            java.util.List<Object> result = new ArrayList<>();
+            for (int i = 0; i < v.count(); i++) result.add(postwalk(f, v.nth(i)));
+            walked = clojure.lang.PersistentVector.create(result);
+        } else if (form instanceof clojure.lang.IPersistentMap m) {
+            clojure.lang.IPersistentMap result = clojure.lang.PersistentArrayMap.EMPTY;
+            for (clojure.lang.ISeq seq = m.seq(); seq != null; seq = seq.next()) {
+                clojure.lang.MapEntry entry = (clojure.lang.MapEntry) seq.first();
+                result = result.assoc(postwalk(f, entry.key()), postwalk(f, entry.val()));
+            }
+            walked = result;
+        } else if (form instanceof clojure.lang.IPersistentList || form instanceof clojure.lang.ISeq) {
+            java.util.List<Object> result = new ArrayList<>();
+            for (clojure.lang.ISeq seq = clojure.lang.RT.seq(form); seq != null; seq = seq.next()) {
+                result.add(postwalk(f, seq.first()));
+            }
+            walked = result.isEmpty() ? clojure.lang.PersistentList.EMPTY : clojure.lang.PersistentList.create(result);
+        } else if (form instanceof clojure.lang.IPersistentSet s) {
+            java.util.List<Object> result = new ArrayList<>();
+            for (clojure.lang.ISeq seq = s.seq(); seq != null; seq = seq.next()) {
+                result.add(postwalk(f, seq.first()));
+            }
+            walked = clojure.lang.PersistentHashSet.create(result);
+        } else {
+            walked = form;
+        }
+        return callFunction(f, new Object[]{walked});
+    }
+
+    private Object prewalk(Object f, Object form) {
+        Object prewalked = callFunction(f, new Object[]{form});
+        if (prewalked instanceof clojure.lang.IPersistentVector v) {
+            java.util.List<Object> result = new ArrayList<>();
+            for (int i = 0; i < v.count(); i++) result.add(prewalk(f, v.nth(i)));
+            return clojure.lang.PersistentVector.create(result);
+        } else if (prewalked instanceof clojure.lang.IPersistentMap m) {
+            clojure.lang.IPersistentMap result = clojure.lang.PersistentArrayMap.EMPTY;
+            for (clojure.lang.ISeq seq = m.seq(); seq != null; seq = seq.next()) {
+                clojure.lang.MapEntry entry = (clojure.lang.MapEntry) seq.first();
+                result = result.assoc(prewalk(f, entry.key()), prewalk(f, entry.val()));
+            }
+            return result;
+        } else if (prewalked instanceof clojure.lang.IPersistentList || prewalked instanceof clojure.lang.ISeq) {
+            java.util.List<Object> result = new ArrayList<>();
+            for (clojure.lang.ISeq seq = clojure.lang.RT.seq(prewalked); seq != null; seq = seq.next()) {
+                result.add(prewalk(f, seq.first()));
+            }
+            return result.isEmpty() ? clojure.lang.PersistentList.EMPTY : clojure.lang.PersistentList.create(result);
+        } else if (prewalked instanceof clojure.lang.IPersistentSet s) {
+            java.util.List<Object> result = new ArrayList<>();
+            for (clojure.lang.ISeq seq = s.seq(); seq != null; seq = seq.next()) {
+                result.add(prewalk(f, seq.first()));
+            }
+            return clojure.lang.PersistentHashSet.create(result);
+        }
+        return prewalked;
     }
 
     private Object lazyCycle(java.util.List<Object> items, int idx) {

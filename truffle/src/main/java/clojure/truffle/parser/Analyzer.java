@@ -263,6 +263,9 @@ public class Analyzer {
                     case "comment":     return new NilNode();
                     case "declare":     return analyzeDeclare(seq);
                     case "defonce":     return analyzeDefonce(seq);
+                    case "with-open":   return analyzeWithOpen(seq);
+                    case "reify":       return analyzeReify(seq);
+                    case "proxy":       return analyzeReify(seq); // similar handling
                 }
             }
             // Static method call: (Class/method args...)
@@ -1181,6 +1184,13 @@ public class Analyzer {
     }
 
     private void processRequireSpec(Object spec) {
+        // Unwrap quote: (quote foo) -> foo
+        if (spec instanceof ISeq qs) {
+            Object first = qs.first();
+            if (first instanceof Symbol s && s.getName().equals("quote")) {
+                spec = qs.next().first();
+            }
+        }
         if (spec instanceof Symbol sym) {
             // Simple require: (require 'some.ns)
             context.loadNamespace(sym.getName());
@@ -1940,6 +1950,75 @@ public class Analyzer {
         }
         if (nodes.isEmpty()) return new NilNode();
         return new DoNode(nodes.toArray(new ExpressionNode[0]));
+    }
+
+    private ExpressionNode analyzeWithOpen(ISeq seq) {
+        // (with-open [r (resource)] body...) => (let [r (resource)] (try body... (finally (.close r))))
+        ISeq args = seq.next();
+        if (args == null) throw err("with-open: missing bindings");
+        IPersistentVector bindings = (IPersistentVector) args.first();
+        args = args.next();
+        // Collect body forms
+        List<Object> body = new ArrayList<>();
+        while (args != null) { body.add(args.first()); args = args.next(); }
+        // Build finally clause that closes all resources
+        List<Object> finallyBody = new ArrayList<>();
+        for (int i = 0; i < bindings.count(); i += 2) {
+            Symbol sym = (Symbol) bindings.nth(i);
+            finallyBody.add(RT.list(Symbol.intern(".close"), sym));
+        }
+        // Build: (let [bindings] (try body... (finally close-forms...)))
+        List<Object> tryForm = new ArrayList<>();
+        tryForm.add(Symbol.intern("try"));
+        tryForm.addAll(body);
+        List<Object> finallyForm = new ArrayList<>();
+        finallyForm.add(Symbol.intern("finally"));
+        finallyForm.addAll(finallyBody);
+        tryForm.add(PersistentList.create(finallyForm));
+
+        return analyze(RT.list(Symbol.intern("let"), bindings, PersistentList.create(tryForm)));
+    }
+
+    private ExpressionNode analyzeReify(ISeq seq) {
+        // (reify Protocol/Interface (method [args] body)...)
+        // For now, create a map-based dispatch object
+        ISeq args = seq.next();
+        if (args == null) return new NilNode();
+
+        // Collect interface/protocol names and methods
+        List<Object> interfaces = new ArrayList<>();
+        java.util.Map<String, Object> methods = new java.util.LinkedHashMap<>();
+
+        while (args != null) {
+            Object item = args.first();
+            if (item instanceof Symbol) {
+                interfaces.add(item);
+            } else if (item instanceof ISeq methodDef) {
+                // (method-name [this args...] body...)
+                String methodName = ((Symbol) methodDef.first()).getName();
+                ISeq rest = methodDef.next();
+                // Build as fn form
+                List<Object> fnForm = new ArrayList<>();
+                fnForm.add(Symbol.intern("fn"));
+                while (rest != null) { fnForm.add(rest.first()); rest = rest.next(); }
+                methods.put(methodName, PersistentList.create(fnForm));
+            }
+            args = args.next();
+        }
+
+        // Create a deftype-like instance with method functions
+        // Analyze each method as a fn and store in a map
+        List<ExpressionNode> nodes = new ArrayList<>();
+        List<String> methodNames = new ArrayList<>();
+        for (var entry : methods.entrySet()) {
+            methodNames.add(entry.getKey());
+            nodes.add(analyze(entry.getValue()));
+        }
+
+        // Return a ReifyNode that creates an object with these methods
+        return new clojure.truffle.nodes.ReifyNode(context,
+                methodNames.toArray(new String[0]),
+                nodes.toArray(new ExpressionNode[0]));
     }
 
     private ExpressionNode analyzeDefonce(ISeq seq) {
