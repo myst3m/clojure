@@ -7,12 +7,15 @@ import com.oracle.truffle.api.library.ExportMessage;
 import com.oracle.truffle.api.TruffleLanguage;
 import clojure.truffle.ClojureTruffleLanguage;
 
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicReference;
 
 @ExportLibrary(InteropLibrary.class)
 public class ClojureAtom implements TruffleObject {
 
     private final AtomicReference<Object> value;
+    private volatile Object validator;
+    private final ConcurrentHashMap<Object, Object> watches = new ConcurrentHashMap<>();
 
     public ClojureAtom(Object initialValue) {
         this.value = new AtomicReference<>(initialValue);
@@ -29,6 +32,26 @@ public class ClojureAtom implements TruffleObject {
 
     public boolean compareAndSet(Object oldVal, Object newVal) {
         return value.compareAndSet(oldVal, newVal);
+    }
+
+    public void setValidator(Object validatorFn) {
+        this.validator = validatorFn;
+    }
+
+    public Object getValidator() {
+        return validator;
+    }
+
+    public void addWatch(Object key, Object fn) {
+        watches.put(key, fn);
+    }
+
+    public void removeWatch(Object key) {
+        watches.remove(key);
+    }
+
+    public ConcurrentHashMap<Object, Object> getWatches() {
+        return watches;
     }
 
     @ExportMessage

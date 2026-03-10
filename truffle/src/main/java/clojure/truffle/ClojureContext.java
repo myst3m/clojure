@@ -11,6 +11,8 @@ import clojure.truffle.runtime.ClojureDeftypeInstance;
 import clojure.truffle.runtime.ClojureMultiMethod;
 import clojure.truffle.runtime.ClojureNamespace;
 import clojure.truffle.runtime.ClojureProtocol;
+import clojure.truffle.runtime.ClojurePromise;
+import clojure.truffle.runtime.ClojureVolatile;
 import clojure.truffle.runtime.LazySeq;
 import clojure.truffle.runtime.MultiArityFunction;
 
@@ -2588,6 +2590,538 @@ public class ClojureContext {
             return clojure.lang.PersistentVector.create(result);
         });
 
+        // --- Phase 9: Volatile ---
+        globalVars.put("volatile!", (BuiltinFunction) args -> {
+            checkArity(args, 1, "volatile!");
+            return new ClojureVolatile(args[0]);
+        });
+
+        globalVars.put("vreset!", (BuiltinFunction) args -> {
+            checkArity(args, 2, "vreset!");
+            return ((ClojureVolatile) args[0]).reset(args[1]);
+        });
+
+        globalVars.put("vswap!", (BuiltinFunction) args -> {
+            if (args.length < 2) throw new RuntimeException("vswap!: expected at least 2 args");
+            ClojureVolatile vol = (ClojureVolatile) args[0];
+            Object f = args[1];
+            Object[] fArgs = new Object[args.length - 1];
+            fArgs[0] = vol.deref();
+            System.arraycopy(args, 2, fArgs, 1, args.length - 2);
+            Object newVal = callFunction(f, fArgs);
+            return vol.reset(newVal);
+        });
+
+        globalVars.put("volatile?", (BuiltinFunction) args -> {
+            checkArity(args, 1, "volatile?");
+            return args[0] instanceof ClojureVolatile;
+        });
+
+        // --- Phase 9: Promise/Deliver ---
+        globalVars.put("promise", (BuiltinFunction) args -> new ClojurePromise());
+
+        globalVars.put("deliver", (BuiltinFunction) args -> {
+            checkArity(args, 2, "deliver");
+            ClojurePromise p = (ClojurePromise) args[0];
+            p.deliver(args[1]);
+            return p;
+        });
+
+        globalVars.put("realized?", (BuiltinFunction) args -> {
+            checkArity(args, 1, "realized?");
+            if (args[0] instanceof ClojurePromise p) return p.isRealized();
+            if (args[0] instanceof LazySeq ls) return ls.isRealized();
+            return false;
+        });
+
+        // Update deref to handle promises and volatiles
+        globalVars.put("deref", (BuiltinFunction) args -> {
+            if (args.length < 1) throw new RuntimeException("deref: expected 1-3 args");
+            Object ref = args[0];
+            if (ref instanceof ClojureAtom atom) return atom.deref();
+            if (ref instanceof ClojureVolatile vol) return vol.deref();
+            if (ref instanceof ClojurePromise p) {
+                if (args.length == 3) {
+                    long timeout = ((Number) args[1]).longValue();
+                    return p.deref(timeout, args[2]);
+                }
+                return p.deref();
+            }
+            if (ref instanceof java.util.concurrent.Future<?> fut) {
+                try {
+                    if (args.length == 3) {
+                        long timeout = ((Number) args[1]).longValue();
+                        return fut.get(timeout, java.util.concurrent.TimeUnit.MILLISECONDS);
+                    }
+                    return fut.get();
+                } catch (Exception e) {
+                    throw new RuntimeException("deref: " + e.getMessage());
+                }
+            }
+            throw new RuntimeException("deref: not a derefable: " + ref);
+        });
+
+        // --- Phase 9: Atom watchers & validators ---
+        globalVars.put("add-watch", (BuiltinFunction) args -> {
+            checkArity(args, 3, "add-watch");
+            ClojureAtom atom = (ClojureAtom) args[0];
+            atom.addWatch(args[1], args[2]);
+            return atom;
+        });
+
+        globalVars.put("remove-watch", (BuiltinFunction) args -> {
+            checkArity(args, 2, "remove-watch");
+            ClojureAtom atom = (ClojureAtom) args[0];
+            atom.removeWatch(args[1]);
+            return atom;
+        });
+
+        globalVars.put("set-validator!", (BuiltinFunction) args -> {
+            checkArity(args, 2, "set-validator!");
+            ClojureAtom atom = (ClojureAtom) args[0];
+            atom.setValidator(args[1]);
+            return ClojureNil.INSTANCE;
+        });
+
+        globalVars.put("get-validator", (BuiltinFunction) args -> {
+            checkArity(args, 1, "get-validator");
+            ClojureAtom atom = (ClojureAtom) args[0];
+            Object v = atom.getValidator();
+            return v == null ? ClojureNil.INSTANCE : v;
+        });
+
+        // Override swap! to support watchers
+        globalVars.put("swap!", (BuiltinFunction) args -> {
+            if (args.length < 2) throw new RuntimeException("swap!: expected at least 2 args");
+            ClojureAtom atom = (ClojureAtom) args[0];
+            Object f = args[1];
+            while (true) {
+                Object oldVal = atom.deref();
+                Object[] fArgs = new Object[args.length - 1];
+                fArgs[0] = oldVal;
+                System.arraycopy(args, 2, fArgs, 1, args.length - 2);
+                Object newVal = callFunction(f, fArgs);
+                // Validate
+                Object validator = atom.getValidator();
+                if (validator != null) {
+                    if (!isTruthy(callFunction(validator, new Object[]{newVal}))) {
+                        throw new RuntimeException("Invalid reference state");
+                    }
+                }
+                if (atom.compareAndSet(oldVal, newVal)) {
+                    // Notify watches
+                    atom.getWatches().forEach((key, watchFn) -> {
+                        callFunction(watchFn, new Object[]{key, atom, oldVal, newVal});
+                    });
+                    return newVal;
+                }
+            }
+        });
+
+        // Override reset! to support watchers
+        globalVars.put("reset!", (BuiltinFunction) args -> {
+            checkArity(args, 2, "reset!");
+            ClojureAtom atom = (ClojureAtom) args[0];
+            Object newVal = args[1];
+            Object validator = atom.getValidator();
+            if (validator != null) {
+                if (!isTruthy(callFunction(validator, new Object[]{newVal}))) {
+                    throw new RuntimeException("Invalid reference state");
+                }
+            }
+            Object oldVal = atom.deref();
+            atom.reset(newVal);
+            atom.getWatches().forEach((key, watchFn) -> {
+                callFunction(watchFn, new Object[]{key, atom, oldVal, newVal});
+            });
+            return newVal;
+        });
+
+        // --- Phase 9: Transducers ---
+        globalVars.put("transduce", (BuiltinFunction) args -> {
+            if (args.length < 3 || args.length > 4)
+                throw new RuntimeException("transduce: expected 3-4 args");
+            Object xform = args[0];
+            Object f = args[1];
+            Object init;
+            Object coll;
+            if (args.length == 4) {
+                init = args[2];
+                coll = args[3];
+            } else {
+                // Call f with no args for init
+                init = callFunction(f, new Object[0]);
+                coll = args[2];
+            }
+            // Apply xform to f to get the reducing function
+            Object xf = callFunction(xform, new Object[]{f});
+            Object acc = init;
+            for (clojure.lang.ISeq seq = clojure.lang.RT.seq(coll); seq != null; seq = seq.next()) {
+                acc = callFunction(xf, new Object[]{acc, seq.first()});
+                // Check for reduced
+                if (acc instanceof Reduced r) {
+                    acc = r.value;
+                    break;
+                }
+            }
+            // Completion step
+            return callFunction(xf, new Object[]{acc});
+        });
+
+        // map as transducer (1-arity)
+        // We modify 'map' to return a transducer when called with 1 arg
+        Object origMap = globalVars.get("map");
+        globalVars.put("map", (BuiltinFunction) args -> {
+            if (args.length == 1) {
+                // Return a transducer
+                Object f = args[0];
+                return (BuiltinFunction) xfArgs -> {
+                    checkArity(xfArgs, 1, "map-transducer");
+                    Object rf = xfArgs[0];
+                    return new TransducerRf(rf) {
+                        @Override public Object step(Object acc, Object input) {
+                            return callFunction(rf, new Object[]{acc, callFunction(f, new Object[]{input})});
+                        }
+                    };
+                };
+            }
+            // Original map behavior
+            return ((BuiltinFunction) origMap).execute(args);
+        });
+
+        // filter as transducer
+        Object origFilter = globalVars.get("filter");
+        globalVars.put("filter", (BuiltinFunction) args -> {
+            if (args.length == 1) {
+                Object pred = args[0];
+                return (BuiltinFunction) xfArgs -> {
+                    checkArity(xfArgs, 1, "filter-transducer");
+                    Object rf = xfArgs[0];
+                    return new TransducerRf(rf) {
+                        @Override public Object step(Object acc, Object input) {
+                            if (isTruthy(callFunction(pred, new Object[]{input}))) {
+                                return callFunction(rf, new Object[]{acc, input});
+                            }
+                            return acc;
+                        }
+                    };
+                };
+            }
+            return ((BuiltinFunction) origFilter).execute(args);
+        });
+
+        // take as transducer
+        Object origTake = globalVars.get("take");
+        globalVars.put("take", (BuiltinFunction) args -> {
+            if (args.length == 1 && args[0] instanceof Number) {
+                int n = ((Number) args[0]).intValue();
+                return (BuiltinFunction) xfArgs -> {
+                    checkArity(xfArgs, 1, "take-transducer");
+                    Object rf = xfArgs[0];
+                    int[] count = {0};
+                    return new TransducerRf(rf) {
+                        @Override public Object step(Object acc, Object input) {
+                            if (count[0]++ < n) {
+                                return callFunction(rf, new Object[]{acc, input});
+                            }
+                            return new Reduced(acc);
+                        }
+                    };
+                };
+            }
+            return ((BuiltinFunction) origTake).execute(args);
+        });
+
+        globalVars.put("reduced", (BuiltinFunction) args -> {
+            checkArity(args, 1, "reduced");
+            return new Reduced(args[0]);
+        });
+
+        globalVars.put("reduced?", (BuiltinFunction) args -> {
+            checkArity(args, 1, "reduced?");
+            return args[0] instanceof Reduced;
+        });
+
+        globalVars.put("unreduced", (BuiltinFunction) args -> {
+            checkArity(args, 1, "unreduced");
+            if (args[0] instanceof Reduced r) return r.value;
+            return args[0];
+        });
+
+        // comp for function/transducer composition
+        globalVars.put("comp", (BuiltinFunction) args -> {
+            if (args.length == 0) return (BuiltinFunction) a -> a[0];
+            if (args.length == 1) return args[0];
+            Object[] fns = args.clone();
+            return (BuiltinFunction) innerArgs -> {
+                // Apply last function first
+                Object result = callFunction(fns[fns.length - 1], innerArgs);
+                for (int i = fns.length - 2; i >= 0; i--) {
+                    result = callFunction(fns[i], new Object[]{result});
+                }
+                return result;
+            };
+        });
+
+        // partial
+        globalVars.put("partial", (BuiltinFunction) args -> {
+            if (args.length < 1) throw new RuntimeException("partial: expected at least 1 arg");
+            Object f = args[0];
+            Object[] partialArgs = Arrays.copyOfRange(args, 1, args.length);
+            return (BuiltinFunction) moreArgs -> {
+                Object[] allArgs = new Object[partialArgs.length + moreArgs.length];
+                System.arraycopy(partialArgs, 0, allArgs, 0, partialArgs.length);
+                System.arraycopy(moreArgs, 0, allArgs, partialArgs.length, moreArgs.length);
+                return callFunction(f, allArgs);
+            };
+        });
+
+        // --- Phase 9: Hierarchy for multimethods ---
+        globalVars.put("make-hierarchy", (BuiltinFunction) args ->
+                clojure.lang.PersistentArrayMap.EMPTY
+                        .assoc(clojure.lang.Keyword.intern("parents"),
+                                clojure.lang.PersistentArrayMap.EMPTY)
+                        .assoc(clojure.lang.Keyword.intern("ancestors"),
+                                clojure.lang.PersistentArrayMap.EMPTY)
+                        .assoc(clojure.lang.Keyword.intern("descendants"),
+                                clojure.lang.PersistentArrayMap.EMPTY));
+
+        // Global hierarchy
+        globalVars.put("*hierarchy*", ((BuiltinFunction) globalVars.get("make-hierarchy")).execute(new Object[0]));
+
+        globalVars.put("derive", (BuiltinFunction) args -> {
+            if (args.length != 2) throw new RuntimeException("derive: expected 2 args (tag parent)");
+            Object tag = args[0];
+            Object parent = args[1];
+            // Modify global hierarchy
+            Object hier = globalVars.get("*hierarchy*");
+            clojure.lang.IPersistentMap h = (clojure.lang.IPersistentMap) hier;
+            clojure.lang.Keyword kParents = clojure.lang.Keyword.intern("parents");
+            clojure.lang.Keyword kAncestors = clojure.lang.Keyword.intern("ancestors");
+            clojure.lang.Keyword kDescendants = clojure.lang.Keyword.intern("descendants");
+
+            // Update parents
+            clojure.lang.IPersistentMap parents = (clojure.lang.IPersistentMap) h.valAt(kParents);
+            Object tagParents = parents.valAt(tag);
+            clojure.lang.IPersistentSet newTagParents;
+            if (tagParents instanceof clojure.lang.IPersistentSet s) {
+                newTagParents = (clojure.lang.IPersistentSet) s.cons(parent);
+            } else {
+                newTagParents = clojure.lang.PersistentHashSet.create(java.util.List.of(parent));
+            }
+            h = h.assoc(kParents, parents.assoc(tag, newTagParents));
+
+            // Update ancestors (tag -> all ancestors including parent's ancestors)
+            clojure.lang.IPersistentMap ancestors = (clojure.lang.IPersistentMap) h.valAt(kAncestors);
+            java.util.Set<Object> tagAnc = new java.util.HashSet<>();
+            tagAnc.add(parent);
+            Object parentAnc = ancestors.valAt(parent);
+            if (parentAnc instanceof clojure.lang.IPersistentSet ps) {
+                for (clojure.lang.ISeq s = ps.seq(); s != null; s = s.next()) tagAnc.add(s.first());
+            }
+            h = h.assoc(kAncestors, ancestors.assoc(tag,
+                    clojure.lang.PersistentHashSet.create(new ArrayList<>(tagAnc))));
+
+            // Update descendants (parent and all ancestors of parent get tag as descendant)
+            clojure.lang.IPersistentMap descs = (clojure.lang.IPersistentMap) h.valAt(kDescendants);
+            // Collect all nodes that should get tag as descendant: parent + parent's ancestors
+            java.util.Set<Object> toUpdate = new java.util.HashSet<>();
+            toUpdate.add(parent);
+            toUpdate.addAll(tagAnc); // tagAnc includes parent and all parent's ancestors
+            for (Object ancestor : toUpdate) {
+                Object ancDescs = descs.valAt(ancestor);
+                clojure.lang.IPersistentSet newDescs;
+                if (ancDescs instanceof clojure.lang.IPersistentSet s) {
+                    newDescs = (clojure.lang.IPersistentSet) s.cons(tag);
+                } else {
+                    newDescs = clojure.lang.PersistentHashSet.create(java.util.List.of(tag));
+                }
+                descs = descs.assoc(ancestor, newDescs);
+            }
+            h = h.assoc(kDescendants, descs);
+
+            globalVars.put("*hierarchy*", h);
+            return ClojureNil.INSTANCE;
+        });
+
+        globalVars.put("isa?", (BuiltinFunction) args -> {
+            checkArity(args, 2, "isa?");
+            Object child = args[0];
+            Object parent = args[1];
+            if (child.equals(parent)) return true;
+            // Check hierarchy
+            Object hier = globalVars.get("*hierarchy*");
+            if (hier instanceof clojure.lang.IPersistentMap h) {
+                Object ancestors = ((clojure.lang.IPersistentMap) h.valAt(
+                        clojure.lang.Keyword.intern("ancestors"))).valAt(child);
+                if (ancestors instanceof clojure.lang.IPersistentSet s) {
+                    return s.contains(parent);
+                }
+            }
+            // Java class hierarchy
+            if (child instanceof Class<?> cc && parent instanceof Class<?> pc) {
+                return pc.isAssignableFrom(cc);
+            }
+            return false;
+        });
+
+        globalVars.put("parents", (BuiltinFunction) args -> {
+            checkArity(args, 1, "parents");
+            Object hier = globalVars.get("*hierarchy*");
+            if (hier instanceof clojure.lang.IPersistentMap h) {
+                Object p = ((clojure.lang.IPersistentMap) h.valAt(
+                        clojure.lang.Keyword.intern("parents"))).valAt(args[0]);
+                return p == null ? ClojureNil.INSTANCE : p;
+            }
+            return ClojureNil.INSTANCE;
+        });
+
+        globalVars.put("ancestors", (BuiltinFunction) args -> {
+            checkArity(args, 1, "ancestors");
+            Object hier = globalVars.get("*hierarchy*");
+            if (hier instanceof clojure.lang.IPersistentMap h) {
+                Object a = ((clojure.lang.IPersistentMap) h.valAt(
+                        clojure.lang.Keyword.intern("ancestors"))).valAt(args[0]);
+                return a == null ? ClojureNil.INSTANCE : a;
+            }
+            return ClojureNil.INSTANCE;
+        });
+
+        globalVars.put("descendants", (BuiltinFunction) args -> {
+            checkArity(args, 1, "descendants");
+            Object hier = globalVars.get("*hierarchy*");
+            if (hier instanceof clojure.lang.IPersistentMap h) {
+                Object d = ((clojure.lang.IPersistentMap) h.valAt(
+                        clojure.lang.Keyword.intern("descendants"))).valAt(args[0]);
+                return d == null ? ClojureNil.INSTANCE : d;
+            }
+            return ClojureNil.INSTANCE;
+        });
+
+        // --- Phase 9: Misc utilities ---
+        globalVars.put("tree-seq", (BuiltinFunction) args -> {
+            checkArity(args, 3, "tree-seq");
+            Object branch = args[0];
+            Object children = args[1];
+            Object root = args[2];
+            java.util.List<Object> result = new ArrayList<>();
+            java.util.Queue<Object> queue = new java.util.LinkedList<>();
+            queue.add(root);
+            while (!queue.isEmpty()) {
+                Object node = queue.poll();
+                result.add(node);
+                if (isTruthy(callFunction(branch, new Object[]{node}))) {
+                    Object kids = callFunction(children, new Object[]{node});
+                    if (kids != null && !(kids instanceof ClojureNil)) {
+                        // Add children at front for depth-first
+                        java.util.List<Object> childList = new ArrayList<>();
+                        for (clojure.lang.ISeq seq = clojure.lang.RT.seq(kids); seq != null; seq = seq.next()) {
+                            childList.add(seq.first());
+                        }
+                        // Use a stack approach by adding at beginning
+                        java.util.List<Object> remaining = new ArrayList<>(queue);
+                        queue.clear();
+                        queue.addAll(childList);
+                        queue.addAll(remaining);
+                    }
+                }
+            }
+            return clojure.lang.PersistentList.create(result);
+        });
+
+        globalVars.put("iterate", (BuiltinFunction) args -> {
+            checkArity(args, 2, "iterate");
+            Object f = args[0];
+            Object x = args[1];
+            return new LazySeq(() -> lazyIterate(f, x));
+        });
+
+        globalVars.put("cycle", (BuiltinFunction) args -> {
+            checkArity(args, 1, "cycle");
+            java.util.List<Object> items = new ArrayList<>();
+            for (clojure.lang.ISeq seq = clojure.lang.RT.seq(args[0]); seq != null; seq = seq.next()) {
+                items.add(seq.first());
+            }
+            if (items.isEmpty()) return ClojureNil.INSTANCE;
+            return new LazySeq(() -> lazyCycle(items, 0));
+        });
+
+        globalVars.put("not=", (BuiltinFunction) args -> {
+            checkArity(args, 2, "not=");
+            return !clojure.lang.Util.equals(args[0] instanceof ClojureNil ? null : args[0],
+                    args[1] instanceof ClojureNil ? null : args[1]);
+        });
+
+        globalVars.put("empty", (BuiltinFunction) args -> {
+            checkArity(args, 1, "empty");
+            Object coll = args[0];
+            if (coll instanceof ClojureNil) return ClojureNil.INSTANCE;
+            if (coll instanceof clojure.lang.IPersistentVector) return clojure.lang.PersistentVector.EMPTY;
+            if (coll instanceof clojure.lang.IPersistentMap) return clojure.lang.PersistentArrayMap.EMPTY;
+            if (coll instanceof clojure.lang.IPersistentSet) return clojure.lang.PersistentHashSet.EMPTY;
+            if (coll instanceof clojure.lang.IPersistentList) return clojure.lang.PersistentList.EMPTY;
+            return clojure.lang.PersistentList.EMPTY;
+        });
+
+        globalVars.put("empty?", (BuiltinFunction) args -> {
+            checkArity(args, 1, "empty?");
+            Object coll = args[0];
+            if (coll instanceof ClojureNil) return true;
+            if (coll instanceof clojure.lang.Seqable s) return s.seq() == null;
+            if (coll instanceof String str) return str.isEmpty();
+            return false;
+        });
+
+        globalVars.put("not-empty", (BuiltinFunction) args -> {
+            checkArity(args, 1, "not-empty");
+            Object coll = args[0];
+            if (coll instanceof ClojureNil) return ClojureNil.INSTANCE;
+            if (coll instanceof clojure.lang.Seqable s) return s.seq() == null ? ClojureNil.INSTANCE : coll;
+            return coll;
+        });
+
+        globalVars.put("bounded-count", (BuiltinFunction) args -> {
+            checkArity(args, 2, "bounded-count");
+            int n = ((Number) args[0]).intValue();
+            if (args[1] instanceof clojure.lang.Counted c) return (long) Math.min(c.count(), n);
+            long count = 0;
+            for (clojure.lang.ISeq seq = clojure.lang.RT.seq(args[1]); seq != null && count < n; seq = seq.next()) {
+                count++;
+            }
+            return count;
+        });
+
+        globalVars.put("sequence", (BuiltinFunction) args -> {
+            if (args.length == 1) {
+                // (sequence coll) - coerce to seq
+                clojure.lang.ISeq seq = clojure.lang.RT.seq(args[0]);
+                return seq == null ? clojure.lang.PersistentList.EMPTY : seq;
+            }
+            if (args.length == 2) {
+                // (sequence xform coll) - apply transducer
+                Object xform = args[0];
+                Object coll = args[1];
+                java.util.List<Object> result = new ArrayList<>();
+                Object rf = (BuiltinFunction) rfArgs -> {
+                    if (rfArgs.length == 0) return clojure.lang.PersistentList.EMPTY;
+                    if (rfArgs.length == 1) return rfArgs[0];
+                    // step
+                    ((java.util.List<Object>) rfArgs[0]).add(rfArgs[1]);
+                    return rfArgs[0];
+                };
+                Object xf = callFunction(xform, new Object[]{rf});
+                Object acc = result;
+                for (clojure.lang.ISeq seq = clojure.lang.RT.seq(coll); seq != null; seq = seq.next()) {
+                    acc = callFunction(xf, new Object[]{acc, seq.first()});
+                    if (acc instanceof Reduced r) { acc = r.value; break; }
+                }
+                callFunction(xf, new Object[]{acc});
+                return result.isEmpty() ? clojure.lang.PersistentList.EMPTY
+                        : clojure.lang.PersistentList.create(result);
+            }
+            throw new RuntimeException("sequence: expected 1-2 args");
+        });
+
         // Copy all builtins into clojure.core namespace
         ClojureNamespace core = namespaces.get("clojure.core");
         if (core != null) {
@@ -3039,6 +3573,32 @@ public class ClojureContext {
             if (c.getSuperclass() != null) queue.add(c.getSuperclass());
         }
         return result;
+    }
+
+    // Reduced wrapper for transducers
+    public static class Reduced {
+        public final Object value;
+        public Reduced(Object value) { this.value = value; }
+    }
+
+    // Base class for transducer reducing functions
+    public abstract class TransducerRf implements BuiltinFunction {
+        protected final Object innerRf;
+        public TransducerRf(Object innerRf) { this.innerRf = innerRf; }
+
+        @Override
+        public Object execute(Object[] args) {
+            if (args.length == 0) return callFunction(innerRf, new Object[0]);
+            if (args.length == 1) return callFunction(innerRf, new Object[]{args[0]}); // completion
+            return step(args[0], args[1]);
+        }
+
+        public abstract Object step(Object acc, Object input);
+    }
+
+    private Object lazyCycle(java.util.List<Object> items, int idx) {
+        return new clojure.lang.Cons(items.get(idx),
+                new LazySeq(() -> lazyCycle(items, (idx + 1) % items.size())));
     }
 
     private static void checkArity(Object[] args, int expected, String name) {
