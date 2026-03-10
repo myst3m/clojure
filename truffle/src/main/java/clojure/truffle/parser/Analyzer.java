@@ -127,6 +127,7 @@ public class Analyzer {
         if (form instanceof String s) return new StringLiteralNode(s);
         if (form instanceof Boolean b) return new BooleanLiteralNode(b);
         if (form instanceof Keyword kw) return new KeywordLiteralNode(kw);
+        if (form instanceof java.util.regex.Pattern pat) return new QuoteNode(pat);
         if (form instanceof Symbol sym) return analyzeSymbol(sym);
         if (form instanceof ISeq seq) return analyzeList(seq);
         if (form instanceof IPersistentVector vec) return analyzeVector(vec);
@@ -154,6 +155,24 @@ public class Analyzer {
             } catch (RuntimeException ignored) {
                 // Not a Java class, fall through to var lookup
             }
+        }
+        // Try resolving as a Java class (e.g. String, Long, java.util.ArrayList)
+        if (ns == null && !name.isEmpty()) {
+            // Simple class name starting with uppercase (String, Long) or
+            // fully qualified (java.lang.Long, java.util.ArrayList)
+            if (Character.isUpperCase(name.charAt(0)) || name.contains(".")) {
+                try {
+                    Class<?> clazz = JavaInteropUtil.resolveClass(name);
+                    return new QuoteNode(clazz);
+                } catch (RuntimeException ignored) {}
+            }
+        } else if (ns != null) {
+            // Namespace-qualified: java.lang/Long → java.lang.Long
+            String fqn = ns + "." + name;
+            try {
+                Class<?> clazz = JavaInteropUtil.resolveClass(fqn);
+                return new QuoteNode(clazz);
+            } catch (RuntimeException ignored) {}
         }
         String varName = ns != null ? ns + "/" + name : name;
         return new SymbolNode(context, varName);
@@ -236,6 +255,7 @@ public class Analyzer {
                     case "dotimes":     return analyzeDotimes(seq);
                     case "letfn":       return analyzeLetfn(seq);
                     case "do-template": return analyzeDo(seq); // fallback
+                    case "binding":     return analyzeBinding(seq);
                 }
             }
             // Static method call: (Class/method args...)
@@ -1776,6 +1796,28 @@ public class Analyzer {
         while (body != null) { nodes.add(analyze(body.first())); body = body.next(); }
         if (nodes.size() == 1) return nodes.get(0);
         return new DoNode(nodes.toArray(new ExpressionNode[0]));
+    }
+
+    private ExpressionNode analyzeBinding(ISeq seq) {
+        // (binding [*var* val *var2* val2 ...] body...)
+        ISeq args = seq.next();
+        if (args == null) throw err("binding: missing bindings vector");
+        IPersistentVector bindings = (IPersistentVector) args.first();
+        if (bindings.count() % 2 != 0) throw err("binding: bindings must have even number of forms");
+        int numBindings = bindings.count() / 2;
+        String[] varNames = new String[numBindings];
+        ExpressionNode[] valueNodes = new ExpressionNode[numBindings];
+        for (int i = 0; i < numBindings; i++) {
+            Symbol sym = (Symbol) bindings.nth(i * 2);
+            varNames[i] = sym.getName();
+            context.declareDynamic(varNames[i]);
+            valueNodes[i] = analyze(bindings.nth(i * 2 + 1));
+        }
+        args = args.next();
+        List<ExpressionNode> body = new ArrayList<>();
+        while (args != null) { body.add(analyze(args.first())); args = args.next(); }
+        return new clojure.truffle.nodes.BindingNode(context, varNames, valueNodes,
+                body.toArray(new ExpressionNode[0]));
     }
 
     private ExpressionNode[] analyzeArgList(ISeq args) {

@@ -14,7 +14,7 @@ public class SymbolNode extends ExpressionNode {
 
     @Override
     public Object executeGeneric(VirtualFrame frame) {
-        Object value = context.getVar(name);
+        Object value = context.getVarWithBindings(name);
         if (value == null) {
             throw new RuntimeException("Unable to resolve symbol: " + name + " in this context");
         }
