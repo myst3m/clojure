@@ -4,6 +4,7 @@ import com.oracle.truffle.api.frame.VirtualFrame;
 import com.oracle.truffle.api.nodes.IndirectCallNode;
 import clojure.truffle.ClojureContext;
 import clojure.truffle.runtime.ClojureFunction;
+import clojure.truffle.runtime.MultiArityFunction;
 
 public class InvokeNode extends ExpressionNode {
 
@@ -27,13 +28,31 @@ public class InvokeNode extends ExpressionNode {
         }
 
         if (function instanceof ClojureFunction fn) {
-            // args[0] = function itself (for closure captured values access)
+            Object[] callArgs = new Object[argValues.length + 1];
+            callArgs[0] = fn;
+            System.arraycopy(argValues, 0, callArgs, 1, argValues.length);
+            return callNode.call(fn.getCallTarget(), callArgs);
+        } else if (function instanceof MultiArityFunction maf) {
+            ClojureFunction fn = maf.resolve(argValues.length);
             Object[] callArgs = new Object[argValues.length + 1];
             callArgs[0] = fn;
             System.arraycopy(argValues, 0, callArgs, 1, argValues.length);
             return callNode.call(fn.getCallTarget(), callArgs);
         } else if (function instanceof ClojureContext.BuiltinFunction builtin) {
             return builtin.execute(argValues);
+        } else if (function instanceof clojure.lang.Keyword kw) {
+            // Keywords as functions: (:key map) → (get map :key)
+            if (argValues.length < 1 || argValues.length > 2)
+                throw new RuntimeException("Keyword lookup expects 1 or 2 args");
+            Object map = argValues[0];
+            if (map instanceof clojure.lang.ILookup lookup) {
+                Object notFound = argValues.length == 2 ? argValues[1] :
+                        clojure.truffle.runtime.ClojureNil.INSTANCE;
+                Object val = lookup.valAt(kw, notFound);
+                return val == null ? clojure.truffle.runtime.ClojureNil.INSTANCE : val;
+            }
+            return argValues.length == 2 ? argValues[1] :
+                    clojure.truffle.runtime.ClojureNil.INSTANCE;
         }
 
         throw new RuntimeException("Cannot invoke: " + function + " (type: " +

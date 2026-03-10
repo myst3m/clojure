@@ -5,11 +5,17 @@ import org.graalvm.polyglot.Value;
 
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
+import java.nio.file.Files;
+import java.nio.file.Path;
 
 public class Main {
 
     public static void main(String[] args) throws Exception {
-        if (args.length > 0) {
+        if (args.length > 0 && args[0].endsWith(".clj")) {
+            // Evaluate file
+            String code = Files.readString(Path.of(args[0]));
+            evalAndPrint(code);
+        } else if (args.length > 0) {
             // Evaluate expression from command line
             evalAndPrint(args[0]);
         } else {
