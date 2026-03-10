@@ -185,7 +185,7 @@ public class Analyzer {
                     return analyzeInstanceMethod(name.substring(1), seq.next());
                 }
                 // Constructor: (ClassName. args...)
-                if (name.endsWith(".") && name.length() > 1) {
+                if (name.endsWith(".") && name.length() > 1 && !name.equals("..")) {
                     String className = name.substring(0, name.length() - 1);
                     return analyzeConstructor(className, seq.next());
                 }
@@ -217,6 +217,24 @@ public class Analyzer {
                     case "ns":          return analyzeNs(seq);
                     case "in-ns":       return analyzeInNs(seq);
                     case "require":     return analyzeRequire(seq);
+                    case "->":          return analyzeThreadFirst(seq);
+                    case "->>":         return analyzeThreadLast(seq);
+                    case "as->":        return analyzeAsThread(seq);
+                    case "some->":      return analyzeSomeThread(seq, true);
+                    case "some->>":     return analyzeSomeThread(seq, false);
+                    case "cond->":      return analyzeCondThread(seq, true);
+                    case "cond->>":     return analyzeCondThread(seq, false);
+                    case "doto":        return analyzeDoto(seq);
+                    case "..":          return analyzeDotDot(seq);
+                    case "if-let":      return analyzeIfLet(seq);
+                    case "when-let":    return analyzeWhenLet(seq);
+                    case "if-some":     return analyzeIfSome(seq);
+                    case "when-some":   return analyzeWhenSome(seq);
+                    case "case":        return analyzeCase(seq);
+                    case "for":         return analyzeFor(seq);
+                    case "doseq":       return analyzeDoseq(seq);
+                    case "dotimes":     return analyzeDotimes(seq);
+                    case "letfn":       return analyzeLetfn(seq);
                     case "do-template": return analyzeDo(seq); // fallback
                 }
             }
@@ -594,6 +612,466 @@ public class Analyzer {
             fnSeq = RT.list(Symbol.intern("fn*"), params, wrappedBody);
         }
         return analyzeFn(fnSeq);
+    }
+
+    // --- Threading macros ---
+
+    private ExpressionNode analyzeThreadFirst(ISeq seq) {
+        // (-> x (f a) (g b)) => (g (f x a) b)
+        ISeq args = seq.next();
+        if (args == null) return new NilNode();
+        Object form = args.first();
+        args = args.next();
+        while (args != null) {
+            Object step = args.first();
+            if (step instanceof ISeq stepSeq) {
+                // Insert form as first arg: (f a b) -> (f form a b)
+                form = RT.cons(stepSeq.first(), RT.cons(form, stepSeq.next()));
+            } else {
+                // Bare symbol: (f) -> (f form)
+                form = RT.list(step, form);
+            }
+            args = args.next();
+        }
+        return analyze(form);
+    }
+
+    private ExpressionNode analyzeThreadLast(ISeq seq) {
+        // (->> x (f a) (g b)) => (g b (f a x))
+        ISeq args = seq.next();
+        if (args == null) return new NilNode();
+        Object form = args.first();
+        args = args.next();
+        while (args != null) {
+            Object step = args.first();
+            if (step instanceof ISeq stepSeq) {
+                // Append form as last arg
+                java.util.List<Object> newList = new ArrayList<>();
+                for (ISeq s = stepSeq; s != null; s = s.next()) newList.add(s.first());
+                newList.add(form);
+                form = PersistentList.create(newList);
+            } else {
+                form = RT.list(step, form);
+            }
+            args = args.next();
+        }
+        return analyze(form);
+    }
+
+    private ExpressionNode analyzeAsThread(ISeq seq) {
+        // (as-> expr name (f name) (g name)) => (let [name expr, name (f name), name (g name)] name)
+        ISeq args = seq.next();
+        if (args == null) throw err("as->: missing expression");
+        Object expr = args.first();
+        args = args.next();
+        if (args == null) throw err("as->: missing name");
+        if (!(args.first() instanceof Symbol nameSym)) throw err("as->: name must be a symbol");
+        args = args.next();
+
+        // Build: (let [name expr name (f name) name (g name) ...] name)
+        java.util.List<Object> bindings = new ArrayList<>();
+        bindings.add(nameSym);
+        bindings.add(expr);
+        while (args != null) {
+            bindings.add(nameSym);
+            bindings.add(args.first());
+            args = args.next();
+        }
+        Object letForm = RT.list(Symbol.intern("let"),
+                PersistentVector.create(bindings), nameSym);
+        return analyze(letForm);
+    }
+
+    private ExpressionNode analyzeSomeThread(ISeq seq, boolean first) {
+        // (some-> x f g) => (let [t x, t (if (nil? t) nil (f t)), ...] t)
+        ISeq args = seq.next();
+        if (args == null) return new NilNode();
+        Object expr = args.first();
+        args = args.next();
+        Symbol tmpSym = Symbol.intern("__some_thread__");
+        java.util.List<Object> bindings = new ArrayList<>();
+        bindings.add(tmpSym);
+        bindings.add(expr);
+        while (args != null) {
+            Object step = args.first();
+            Object threadedForm;
+            if (step instanceof ISeq stepSeq) {
+                if (first) {
+                    threadedForm = RT.cons(stepSeq.first(), RT.cons(tmpSym, stepSeq.next()));
+                } else {
+                    java.util.List<Object> newList = new ArrayList<>();
+                    for (ISeq s = stepSeq; s != null; s = s.next()) newList.add(s.first());
+                    newList.add(tmpSym);
+                    threadedForm = PersistentList.create(newList);
+                }
+            } else {
+                threadedForm = RT.list(step, tmpSym);
+            }
+            // (if (nil? t) nil threadedForm)
+            bindings.add(tmpSym);
+            bindings.add(RT.list(Symbol.intern("if"),
+                    RT.list(Symbol.intern("nil?"), tmpSym),
+                    null, threadedForm));
+            args = args.next();
+        }
+        return analyze(RT.list(Symbol.intern("let"),
+                PersistentVector.create(bindings), tmpSym));
+    }
+
+    private ExpressionNode analyzeCondThread(ISeq seq, boolean first) {
+        // (cond-> x test1 (f) test2 (g)) => (let [t x, t (if test1 (f t) t), ...] t)
+        ISeq args = seq.next();
+        if (args == null) return new NilNode();
+        Object expr = args.first();
+        args = args.next();
+        Symbol tmpSym = Symbol.intern("__cond_thread__");
+        java.util.List<Object> bindings = new ArrayList<>();
+        bindings.add(tmpSym);
+        bindings.add(expr);
+        while (args != null) {
+            Object test = args.first();
+            args = args.next();
+            if (args == null) throw err("cond->: odd number of forms");
+            Object step = args.first();
+            Object threadedForm;
+            if (step instanceof ISeq stepSeq) {
+                if (first) {
+                    threadedForm = RT.cons(stepSeq.first(), RT.cons(tmpSym, stepSeq.next()));
+                } else {
+                    java.util.List<Object> newList = new ArrayList<>();
+                    for (ISeq s = stepSeq; s != null; s = s.next()) newList.add(s.first());
+                    newList.add(tmpSym);
+                    threadedForm = PersistentList.create(newList);
+                }
+            } else {
+                threadedForm = RT.list(step, tmpSym);
+            }
+            bindings.add(tmpSym);
+            bindings.add(RT.list(Symbol.intern("if"), test, threadedForm, tmpSym));
+            args = args.next();
+        }
+        return analyze(RT.list(Symbol.intern("let"),
+                PersistentVector.create(bindings), tmpSym));
+    }
+
+    private ExpressionNode analyzeDoto(ISeq seq) {
+        // (doto x (.method1 a) (.method2 b)) => (let [t x] (.method1 t a) (.method2 t b) t)
+        ISeq args = seq.next();
+        if (args == null) return new NilNode();
+        Object expr = args.first();
+        args = args.next();
+        Symbol tmpSym = Symbol.intern("__doto_tmp__");
+        java.util.List<Object> body = new ArrayList<>();
+        while (args != null) {
+            Object step = args.first();
+            if (step instanceof ISeq stepSeq) {
+                body.add(RT.cons(stepSeq.first(), RT.cons(tmpSym, stepSeq.next())));
+            } else {
+                body.add(RT.list(step, tmpSym));
+            }
+            args = args.next();
+        }
+        body.add(tmpSym);
+        java.util.List<Object> letForm = new ArrayList<>();
+        letForm.add(Symbol.intern("let"));
+        letForm.add(PersistentVector.create(java.util.List.of(tmpSym, expr)));
+        letForm.addAll(body);
+        return analyze(PersistentList.create(letForm));
+    }
+
+    private ExpressionNode analyzeDotDot(ISeq seq) {
+        // (.. x method1 (method2 a)) => (. (. x method1) method2 a)
+        ISeq args = seq.next();
+        if (args == null) return new NilNode();
+        Object form = args.first();
+        args = args.next();
+        while (args != null) {
+            Object step = args.first();
+            if (step instanceof Symbol sym) {
+                form = RT.list(Symbol.intern("." + sym.getName()), form);
+            } else if (step instanceof ISeq stepSeq) {
+                form = RT.cons(Symbol.intern("." + ((Symbol) stepSeq.first()).getName()),
+                        RT.cons(form, stepSeq.next()));
+            }
+            args = args.next();
+        }
+        return analyze(form);
+    }
+
+    // --- Control flow ---
+
+    private ExpressionNode analyzeIfLet(ISeq seq) {
+        // (if-let [x expr] then else) => (let [x expr] (if x then else))
+        ISeq args = seq.next();
+        if (args == null) throw err("if-let: missing bindings");
+        IPersistentVector bindings = (IPersistentVector) args.first();
+        if (bindings.count() != 2) throw err("if-let: binding must have exactly 2 forms");
+        args = args.next();
+        Object thenForm = args != null ? args.first() : null;
+        Object elseForm = (args != null && args.next() != null) ? args.next().first() : null;
+        return analyze(RT.list(Symbol.intern("let"), bindings,
+                RT.list(Symbol.intern("if"), bindings.nth(0), thenForm, elseForm)));
+    }
+
+    private ExpressionNode analyzeWhenLet(ISeq seq) {
+        // (when-let [x expr] body...) => (let [x expr] (when x body...))
+        ISeq args = seq.next();
+        if (args == null) throw err("when-let: missing bindings");
+        IPersistentVector bindings = (IPersistentVector) args.first();
+        ISeq body = args.next();
+        java.util.List<Object> whenForm = new ArrayList<>();
+        whenForm.add(Symbol.intern("when"));
+        whenForm.add(bindings.nth(0));
+        while (body != null) { whenForm.add(body.first()); body = body.next(); }
+        return analyze(RT.list(Symbol.intern("let"), bindings,
+                PersistentList.create(whenForm)));
+    }
+
+    private ExpressionNode analyzeIfSome(ISeq seq) {
+        // (if-some [x expr] then else) - like if-let but only nil check (not false)
+        ISeq args = seq.next();
+        if (args == null) throw err("if-some: missing bindings");
+        IPersistentVector bindings = (IPersistentVector) args.first();
+        args = args.next();
+        Object thenForm = args != null ? args.first() : null;
+        Object elseForm = (args != null && args.next() != null) ? args.next().first() : null;
+        return analyze(RT.list(Symbol.intern("let"), bindings,
+                RT.list(Symbol.intern("if"),
+                        RT.list(Symbol.intern("not"), RT.list(Symbol.intern("nil?"), bindings.nth(0))),
+                        thenForm, elseForm)));
+    }
+
+    private ExpressionNode analyzeWhenSome(ISeq seq) {
+        ISeq args = seq.next();
+        if (args == null) throw err("when-some: missing bindings");
+        IPersistentVector bindings = (IPersistentVector) args.first();
+        ISeq body = args.next();
+        java.util.List<Object> whenForm = new ArrayList<>();
+        whenForm.add(Symbol.intern("when"));
+        whenForm.add(RT.list(Symbol.intern("not"), RT.list(Symbol.intern("nil?"), bindings.nth(0))));
+        while (body != null) { whenForm.add(body.first()); body = body.next(); }
+        return analyze(RT.list(Symbol.intern("let"), bindings,
+                PersistentList.create(whenForm)));
+    }
+
+    private ExpressionNode analyzeCase(ISeq seq) {
+        // (case expr val1 result1 val2 result2 default)
+        ISeq args = seq.next();
+        if (args == null) throw err("case: missing expression");
+        ExpressionNode exprNode = analyze(args.first());
+        args = args.next();
+
+        int tmpSlot = currentScope.addLocal("__case_tmp__");
+        List<Object[]> clauses = new ArrayList<>(); // [matchVal, resultForm]
+        Object defaultForm = null;
+
+        java.util.List<Object> formList = new ArrayList<>();
+        while (args != null) {
+            formList.add(args.first());
+            args = args.next();
+        }
+        for (int i = 0; i < formList.size() - 1; i += 2) {
+            clauses.add(new Object[]{formList.get(i), formList.get(i + 1)});
+        }
+        if (formList.size() % 2 == 1) {
+            defaultForm = formList.get(formList.size() - 1);
+        }
+
+        // Build: set tmp, then chain of if (= tmp val) result ...
+        ExpressionNode chain = defaultForm != null ? analyze(defaultForm) :
+                new ExpressionNode() {
+                    @Override
+                    public Object executeGeneric(com.oracle.truffle.api.frame.VirtualFrame f) {
+                        throw new RuntimeException("No matching clause in case");
+                    }
+                };
+        for (int i = clauses.size() - 1; i >= 0; i--) {
+            Object matchVal = clauses.get(i)[0];
+            ExpressionNode resultNode = analyze(clauses.get(i)[1]);
+            ExpressionNode matchNode = analyze(matchVal);
+            ExpressionNode condNode = new InvokeNode(
+                    new SymbolNode(context, "="),
+                    new ExpressionNode[]{new ReadLocalNode(tmpSlot), matchNode});
+            chain = new IfNode(condNode, resultNode, chain);
+        }
+
+        ExpressionNode finalChain = chain;
+        return new LetNode(new int[]{tmpSlot}, new ExpressionNode[]{exprNode}, finalChain);
+    }
+
+    // --- Comprehensions ---
+
+    private ExpressionNode analyzeFor(ISeq seq) {
+        // (for [x coll :when pred :let [y expr]] body)
+        // Simple implementation: convert to nested map/filter/mapcat
+        ISeq args = seq.next();
+        if (args == null) throw err("for: missing bindings");
+        IPersistentVector bindings = (IPersistentVector) args.first();
+        ISeq body = args.next();
+        if (body == null) throw err("for: missing body");
+
+        // Build from inside out
+        // Single binding: (for [x coll] body) => (map (fn [x] body) coll)
+        return analyzeForBindings(bindings, 0, body);
+    }
+
+    private ExpressionNode analyzeForBindings(IPersistentVector bindings, int pos, ISeq body) {
+        if (pos >= bindings.count()) {
+            // All bindings consumed, analyze body
+            if (body.next() == null) return analyze(body.first());
+            return analyzeDo(RT.cons(Symbol.intern("do"), body));
+        }
+
+        Object key = bindings.nth(pos);
+
+        // :when modifier
+        if (key instanceof Keyword kw && kw.getName().equals("when")) {
+            Object pred = bindings.nth(pos + 1);
+            // Wrap remaining in (when pred ...)
+            ExpressionNode innerNode = analyzeForBindings(bindings, pos + 2, body);
+            return new IfNode(analyze(pred), innerNode, new NilNode());
+        }
+
+        // :let modifier
+        if (key instanceof Keyword kw && kw.getName().equals("let")) {
+            IPersistentVector letBindings = (IPersistentVector) bindings.nth(pos + 1);
+            // Wrap remaining in (let [...] ...)
+            Object innerForm = buildForInner(bindings, pos + 2, body);
+            return analyze(RT.list(Symbol.intern("let"), letBindings, innerForm));
+        }
+
+        // Normal binding: sym coll
+        if (!(key instanceof Symbol bindSym)) throw err("for: binding must be a symbol");
+        Object collForm = bindings.nth(pos + 1);
+
+        if (pos + 2 >= bindings.count()) {
+            // Last binding: (map (fn [sym] body) coll)
+            Object fnForm = RT.list(Symbol.intern("fn"),
+                    PersistentVector.create(java.util.List.of(bindSym)),
+                    body.first());
+            return analyze(RT.list(Symbol.intern("map"), fnForm, collForm));
+        } else {
+            // Not last: (mapcat (fn [sym] (for [rest...] body)) coll)
+            IPersistentVector restBindings = PersistentVector.EMPTY;
+            for (int i = pos + 2; i < bindings.count(); i++)
+                restBindings = restBindings.cons(bindings.nth(i));
+            Object innerFor = RT.list(Symbol.intern("for"), restBindings, body.first());
+            Object fnForm = RT.list(Symbol.intern("fn"),
+                    PersistentVector.create(java.util.List.of(bindSym)), innerFor);
+            return analyze(RT.list(Symbol.intern("mapcat"), fnForm, collForm));
+        }
+    }
+
+    private Object buildForInner(IPersistentVector bindings, int pos, ISeq body) {
+        if (pos >= bindings.count()) return body.first();
+        // Rebuild remaining as (for [rest...] body)
+        IPersistentVector restBindings = PersistentVector.EMPTY;
+        for (int i = pos; i < bindings.count(); i++)
+            restBindings = restBindings.cons(bindings.nth(i));
+        return RT.list(Symbol.intern("for"), restBindings, body.first());
+    }
+
+    private ExpressionNode analyzeDoseq(ISeq seq) {
+        // (doseq [x coll] body...) => (dorun (for [x coll] (do body...)))
+        ISeq args = seq.next();
+        if (args == null) throw err("doseq: missing bindings");
+        IPersistentVector bindings = (IPersistentVector) args.first();
+        ISeq body = args.next();
+
+        // Simple: iterate and execute for side effects
+        // (doseq [x coll] body) => (let [s (seq coll)] (loop [] (when s (let [x (first s)] body (recur (next s)))))
+        // Actually simpler: just use eager for with dorun
+        java.util.List<Object> doBody = new ArrayList<>();
+        doBody.add(Symbol.intern("do"));
+        while (body != null) { doBody.add(body.first()); body = body.next(); }
+        Object forForm = RT.list(Symbol.intern("for"), bindings, PersistentList.create(doBody));
+        return analyze(RT.list(Symbol.intern("dorun"), forForm));
+    }
+
+    private ExpressionNode analyzeDotimes(ISeq seq) {
+        // (dotimes [i n] body...) => (let [n# n] (loop [i 0] (when (< i n#) body... (recur (inc i)))))
+        ISeq args = seq.next();
+        if (args == null) throw err("dotimes: missing bindings");
+        IPersistentVector bindings = (IPersistentVector) args.first();
+        if (bindings.count() != 2) throw err("dotimes: binding must have exactly 2 forms");
+        Symbol iSym = (Symbol) bindings.nth(0);
+        Object nForm = bindings.nth(1);
+        ISeq body = args.next();
+
+        Symbol nSym = Symbol.intern("__dotimes_n__");
+        java.util.List<Object> loopBody = new ArrayList<>();
+        loopBody.add(Symbol.intern("when"));
+        loopBody.add(RT.list(Symbol.intern("<"), iSym, nSym));
+        while (body != null) { loopBody.add(body.first()); body = body.next(); }
+        loopBody.add(RT.list(Symbol.intern("recur"), RT.list(Symbol.intern("inc"), iSym)));
+
+        Object loopForm = RT.list(Symbol.intern("loop"),
+                PersistentVector.create(java.util.List.of(iSym, 0L)),
+                PersistentList.create(loopBody));
+        return analyze(RT.list(Symbol.intern("let"),
+                PersistentVector.create(java.util.List.of(nSym, nForm)), loopForm));
+    }
+
+    private ExpressionNode analyzeLetfn(ISeq seq) {
+        // (letfn [(f [x] body) (g [y] body)] expr)
+        // => (let [f nil g nil] (set! f (fn f [x] body)) (set! g (fn g [y] body)) expr)
+        // Actually simpler: use forward declarations via def
+        ISeq args = seq.next();
+        if (args == null) throw err("letfn: missing bindings");
+        IPersistentVector fnBindings = (IPersistentVector) args.first();
+        ISeq body = args.next();
+
+        // First pass: declare all names
+        List<String> names = new ArrayList<>();
+        for (int i = 0; i < fnBindings.count(); i++) {
+            ISeq fnSpec = (ISeq) fnBindings.nth(i);
+            names.add(((Symbol) fnSpec.first()).getName());
+        }
+
+        // Allocate slots and set to nil
+        List<Integer> slots = new ArrayList<>();
+        List<ExpressionNode> values = new ArrayList<>();
+        for (String name : names) {
+            slots.add(currentScope.addLocal(name));
+            values.add(new NilNode());
+        }
+
+        // Second pass: compile fns (they can reference each other via locals)
+        List<ExpressionNode> assignments = new ArrayList<>();
+        for (int i = 0; i < fnBindings.count(); i++) {
+            ISeq fnSpec = (ISeq) fnBindings.nth(i);
+            Symbol fnName = (Symbol) fnSpec.first();
+            ISeq fnArgs = fnSpec.next();
+            ISeq fnForm = RT.cons(Symbol.intern("fn"), RT.cons(fnName, fnArgs));
+            ExpressionNode fnNode = analyze(fnForm);
+            // Assignment: set the slot
+            int slot = slots.get(i);
+            assignments.add(new ExpressionNode() {
+                @Child ExpressionNode valueNode = fnNode;
+                final int s = slot;
+                @Override
+                public Object executeGeneric(com.oracle.truffle.api.frame.VirtualFrame frame) {
+                    Object val = valueNode.executeGeneric(frame);
+                    frame.setObject(s, val);
+                    return val;
+                }
+            });
+        }
+
+        ExpressionNode bodyNode = analyzeBody(body);
+
+        // Combine: let [names nil...], then assignments, then body
+        ExpressionNode[] allAssignments = assignments.toArray(new ExpressionNode[0]);
+        ExpressionNode assignAndBody = new DoNode(
+                java.util.stream.Stream.concat(
+                        java.util.Arrays.stream(allAssignments),
+                        java.util.stream.Stream.of(bodyNode)
+                ).toArray(ExpressionNode[]::new));
+
+        return new LetNode(
+                slots.stream().mapToInt(Integer::intValue).toArray(),
+                values.toArray(new ExpressionNode[0]),
+                assignAndBody);
     }
 
     // --- Namespace ---
