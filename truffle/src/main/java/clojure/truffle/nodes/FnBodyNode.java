@@ -18,10 +18,17 @@ public class FnBodyNode extends RootNode {
     private final int variadicSlot;     // -1 if not variadic
     private final int[] capturedSlots;
     private final String name;
+    private final int selfSlot;         // -1 if not a named fn
 
     public FnBodyNode(ClojureTruffleLanguage language, FrameDescriptor frameDescriptor,
                       String name, int[] paramSlots, int variadicSlot,
                       int[] capturedSlots, ExpressionNode bodyNode) {
+        this(language, frameDescriptor, name, paramSlots, variadicSlot, capturedSlots, bodyNode, -1);
+    }
+
+    public FnBodyNode(ClojureTruffleLanguage language, FrameDescriptor frameDescriptor,
+                      String name, int[] paramSlots, int variadicSlot,
+                      int[] capturedSlots, ExpressionNode bodyNode, int selfSlot) {
         super(language, frameDescriptor);
         this.name = name;
         this.paramSlots = paramSlots;
@@ -29,6 +36,7 @@ public class FnBodyNode extends RootNode {
         this.variadicSlot = variadicSlot;
         this.capturedSlots = capturedSlots;
         this.bodyNode = bodyNode;
+        this.selfSlot = selfSlot;
     }
 
     @Override
@@ -44,6 +52,11 @@ public class FnBodyNode extends RootNode {
         // Handle variadic parameter
         if (variadicSlot >= 0) {
             collectVariadic(frame, args, paramCount + 1);
+        }
+
+        // Write self-reference for named fns
+        if (selfSlot >= 0) {
+            frame.setObject(selfSlot, self);
         }
 
         // Copy captured values

@@ -264,6 +264,7 @@ public class Analyzer {
                     case "declare":     return analyzeDeclare(seq);
                     case "defonce":     return analyzeDefonce(seq);
                     case "with-open":   return analyzeWithOpen(seq);
+                    case "with-out-str": return analyzeWithOutStr(seq);
                     case "reify":       return analyzeReify(seq);
                     case "proxy":       return analyzeReify(seq); // similar handling
                     case "extend-type": return analyzeExtendType(seq);
@@ -1516,6 +1517,12 @@ public class Analyzer {
         Scope outerScope = currentScope;
         currentScope = new Scope(outerScope);
 
+        // Add self-reference slot for named fns
+        int selfSlot = -1;
+        if (fnName != null) {
+            selfSlot = currentScope.addLocal(fnName);
+        }
+
         List<Integer> destructSlots = new ArrayList<>();
         List<ExpressionNode> destructValues = new ArrayList<>();
 
@@ -1537,7 +1544,7 @@ public class Analyzer {
         FrameDescriptor fd = currentScope.buildDescriptor();
 
         FnBodyNode fnBody = new FnBodyNode(language, fd, fnName,
-                paramSlots, variadicSlot, innerCaptureSlots, bodyNode);
+                paramSlots, variadicSlot, innerCaptureSlots, bodyNode, selfSlot);
 
         currentScope = outerScope;
         return new FnNode(fnName, fnBody.getCallTarget(), outerCaptureSlots);
@@ -1561,6 +1568,12 @@ public class Analyzer {
 
             currentScope = new Scope(outerScope);
 
+            // Add self-reference slot for named fns
+            int selfSlot = -1;
+            if (fnName != null) {
+                selfSlot = currentScope.addLocal(fnName);
+            }
+
             List<Integer> dSlots = new ArrayList<>();
             List<ExpressionNode> dVals = new ArrayList<>();
             int[] result = parseParams(params, dSlots, dVals);
@@ -1579,7 +1592,7 @@ public class Analyzer {
             FrameDescriptor fd = currentScope.buildDescriptor();
 
             FnBodyNode fnBody = new FnBodyNode(language, fd, fnName,
-                    paramSlots, varSlot, innerCaptures, bodyNode);
+                    paramSlots, varSlot, innerCaptures, bodyNode, selfSlot);
             FnNode fnNode = new FnNode(fnName, fnBody.getCallTarget(), outerCaptures);
             arityFnNodes.add(fnNode);
 
@@ -2153,6 +2166,16 @@ public class Analyzer {
         tryForm.add(PersistentList.create(finallyForm));
 
         return analyze(RT.list(Symbol.intern("let"), bindings, PersistentList.create(tryForm)));
+    }
+
+    private ExpressionNode analyzeWithOutStr(ISeq seq) {
+        // (with-out-str body...) => wrap body in fn thunk, invoke with-out-str builtin
+        ISeq body = seq.next();
+        Object fnForm = RT.cons(Symbol.intern("fn"),
+                RT.cons(PersistentVector.EMPTY, body));
+        ExpressionNode thunkNode = analyze(fnForm);
+        ExpressionNode wosNode = new SymbolNode(context, "with-out-str");
+        return new InvokeNode(wosNode, new ExpressionNode[]{thunkNode});
     }
 
     private ExpressionNode analyzeReify(ISeq seq) {
