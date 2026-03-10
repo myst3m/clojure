@@ -7,6 +7,7 @@ import clojure.truffle.parser.Analyzer;
 import clojure.truffle.runtime.ClojureAtom;
 import clojure.truffle.runtime.ClojureFunction;
 import clojure.truffle.runtime.ClojureNil;
+import clojure.truffle.runtime.LazySeq;
 import clojure.truffle.runtime.MultiArityFunction;
 
 import java.io.PrintStream;
@@ -262,39 +263,15 @@ public class ClojureContext {
         globalVars.put("map", (BuiltinFunction) args -> {
             if (args.length < 2) throw new RuntimeException("map: expected at least 2 args");
             Object fn = args[0];
-            // Single collection for now
             Object coll = args[1];
-            clojure.lang.IPersistentCollection result = clojure.lang.PersistentList.EMPTY;
-            java.util.List<Object> items = new ArrayList<>();
-            if (!(coll instanceof ClojureNil)) {
-                for (clojure.lang.ISeq seq = seqOf(coll); seq != null; seq = seq.next()) {
-                    items.add(callFunction(fn, new Object[]{seq.first()}));
-                }
-            }
-            // Build list in reverse to maintain order
-            for (int i = items.size() - 1; i >= 0; i--) {
-                result = result.cons(items.get(i));
-            }
-            return result;
+            return lazyMap(fn, coll);
         });
 
         globalVars.put("filter", (BuiltinFunction) args -> {
             checkArity(args, 2, "filter");
             Object fn = args[0];
             Object coll = args[1];
-            java.util.List<Object> items = new ArrayList<>();
-            if (!(coll instanceof ClojureNil)) {
-                for (clojure.lang.ISeq seq = seqOf(coll); seq != null; seq = seq.next()) {
-                    Object item = seq.first();
-                    Object result = callFunction(fn, new Object[]{item});
-                    if (isTruthy(result)) items.add(item);
-                }
-            }
-            clojure.lang.IPersistentCollection result = clojure.lang.PersistentList.EMPTY;
-            for (int i = items.size() - 1; i >= 0; i--) {
-                result = result.cons(items.get(i));
-            }
-            return result;
+            return lazyFilter(fn, coll);
         });
 
         globalVars.put("reduce", (BuiltinFunction) args -> {
@@ -321,20 +298,15 @@ public class ClojureContext {
 
         globalVars.put("range", (BuiltinFunction) args -> {
             long start, end, step;
+            boolean infinite = false;
             switch (args.length) {
-                case 0: throw new RuntimeException("range: infinite range not yet supported");
+                case 0: start = 0; end = Long.MAX_VALUE; step = 1; infinite = true; break;
                 case 1: start = 0; end = ((Number) args[0]).longValue(); step = 1; break;
                 case 2: start = ((Number) args[0]).longValue(); end = ((Number) args[1]).longValue(); step = 1; break;
                 case 3: start = ((Number) args[0]).longValue(); end = ((Number) args[1]).longValue(); step = ((Number) args[2]).longValue(); break;
                 default: throw new RuntimeException("range: too many args");
             }
-            java.util.List<Object> items = new ArrayList<>();
-            if (step > 0) {
-                for (long i = start; i < end; i += step) items.add(i);
-            } else if (step < 0) {
-                for (long i = start; i > end; i += step) items.add(i);
-            }
-            return clojure.lang.PersistentVector.create(items);
+            return lazyRange(start, end, step);
         });
 
         // --- eval ---
@@ -787,6 +759,89 @@ public class ClojureContext {
             }
             return sb.toString();
         });
+
+        // --- Lazy sequence builtins ---
+
+        globalVars.put("iterate", (BuiltinFunction) args -> {
+            checkArity(args, 2, "iterate");
+            Object fn = args[0];
+            Object val = args[1];
+            return lazyIterate(fn, val);
+        });
+
+        globalVars.put("repeat", (BuiltinFunction) args -> {
+            if (args.length == 1) {
+                // infinite repeat
+                Object val = args[0];
+                return new LazySeq(() -> new clojure.lang.Cons(val, (clojure.lang.ISeq) callFunction(
+                        globalVars.get("repeat"), new Object[]{val})));
+            } else if (args.length == 2) {
+                long n = ((Number) args[0]).longValue();
+                Object val = args[1];
+                return lazyRepeat(n, val);
+            }
+            throw new RuntimeException("repeat: expected 1 or 2 args");
+        });
+
+        globalVars.put("take-while", (BuiltinFunction) args -> {
+            checkArity(args, 2, "take-while");
+            Object pred = args[0];
+            Object coll = args[1];
+            return lazyTakeWhile(pred, coll);
+        });
+
+        globalVars.put("drop-while", (BuiltinFunction) args -> {
+            checkArity(args, 2, "drop-while");
+            Object pred = args[0];
+            Object coll = args[1];
+            clojure.lang.ISeq s = seqOf(coll);
+            while (s != null && isTruthy(callFunction(pred, new Object[]{s.first()})))
+                s = s.next();
+            if (s == null) return clojure.lang.PersistentList.EMPTY;
+            return s;
+        });
+
+        globalVars.put("realized?", (BuiltinFunction) args -> {
+            checkArity(args, 1, "realized?");
+            if (args[0] instanceof clojure.lang.IPending p) return p.isRealized();
+            return true;
+        });
+
+        globalVars.put("doall", (BuiltinFunction) args -> {
+            if (args.length < 1 || args.length > 2)
+                throw new RuntimeException("doall: expected 1 or 2 args");
+            Object coll = args.length == 1 ? args[0] : args[1];
+            clojure.lang.ISeq s = seqOf(coll);
+            clojure.lang.ISeq head = s;
+            while (s != null) s = s.next();
+            return head == null ? clojure.lang.PersistentList.EMPTY : head;
+        });
+
+        globalVars.put("dorun", (BuiltinFunction) args -> {
+            if (args.length < 1 || args.length > 2)
+                throw new RuntimeException("dorun: expected 1 or 2 args");
+            Object coll = args.length == 1 ? args[0] : args[1];
+            clojure.lang.ISeq s = seqOf(coll);
+            while (s != null) s = s.next();
+            return ClojureNil.INSTANCE;
+        });
+
+        // --- Type checking ---
+
+        globalVars.put("instance?", (BuiltinFunction) args -> {
+            checkArity(args, 2, "instance?");
+            if (!(args[0] instanceof Class<?> c))
+                throw new RuntimeException("instance?: first arg must be a class");
+            Object val = args[1];
+            if (val instanceof ClojureNil) return false;
+            return c.isInstance(val);
+        });
+
+        globalVars.put("class", (BuiltinFunction) args -> {
+            checkArity(args, 1, "class");
+            if (args[0] instanceof ClojureNil) return ClojureNil.INSTANCE;
+            return args[0].getClass();
+        });
     }
 
     // --- Function calling helper ---
@@ -827,6 +882,86 @@ public class ClojureContext {
         if (coll instanceof clojure.lang.ISeq seq) return seq;
         if (coll instanceof clojure.lang.Seqable s) return s.seq();
         throw new RuntimeException("Not seqable: " + coll);
+    }
+
+    // --- Lazy helpers ---
+
+    private Object lazyMap(Object fn, Object coll) {
+        return new LazySeq(() -> {
+            clojure.lang.ISeq s;
+            if (coll instanceof ClojureNil) return null;
+            if (coll instanceof clojure.lang.ISeq is) s = is;
+            else if (coll instanceof clojure.lang.Seqable sq) s = sq.seq();
+            else return null;
+            if (s == null) return null;
+            Object first = callFunction(fn, new Object[]{s.first()});
+            clojure.lang.ISeq rest = s.next();
+            LazySeq lazyRest = (LazySeq) lazyMap(fn, rest == null ? (Object) ClojureNil.INSTANCE : rest);
+            return (Object) new clojure.lang.Cons(first, lazyRest);
+        });
+    }
+
+    private Object lazyFilter(Object fn, Object coll) {
+        return new LazySeq(() -> {
+            clojure.lang.ISeq s;
+            if (coll instanceof ClojureNil) return null;
+            if (coll instanceof clojure.lang.ISeq is) s = is;
+            else if (coll instanceof clojure.lang.Seqable sq) s = sq.seq();
+            else return null;
+            while (s != null) {
+                Object item = s.first();
+                if (isTruthy(callFunction(fn, new Object[]{item}))) {
+                    clojure.lang.ISeq rest = s.next();
+                    LazySeq lazyRest = (LazySeq) lazyFilter(fn,
+                            rest == null ? (Object) ClojureNil.INSTANCE : rest);
+                    return (Object) new clojure.lang.Cons(item, lazyRest);
+                }
+                s = s.next();
+            }
+            return null;
+        });
+    }
+
+    private Object lazyRange(long start, long end, long step) {
+        return new LazySeq(() -> {
+            if (step > 0 && start >= end) return null;
+            if (step < 0 && start <= end) return null;
+            if (step == 0) return null;
+            LazySeq rest = (LazySeq) lazyRange(start + step, end, step);
+            return (Object) new clojure.lang.Cons(start, rest);
+        });
+    }
+
+    private Object lazyIterate(Object fn, Object val) {
+        return new LazySeq(() -> {
+            LazySeq rest = (LazySeq) lazyIterate(fn, callFunction(fn, new Object[]{val}));
+            return (Object) new clojure.lang.Cons(val, rest);
+        });
+    }
+
+    private Object lazyRepeat(long n, Object val) {
+        return new LazySeq(() -> {
+            if (n <= 0) return null;
+            LazySeq rest = (LazySeq) lazyRepeat(n - 1, val);
+            return (Object) new clojure.lang.Cons(val, rest);
+        });
+    }
+
+    private Object lazyTakeWhile(Object pred, Object coll) {
+        return new LazySeq(() -> {
+            clojure.lang.ISeq s;
+            if (coll instanceof ClojureNil) return null;
+            if (coll instanceof clojure.lang.ISeq is) s = is;
+            else if (coll instanceof clojure.lang.Seqable sq) s = sq.seq();
+            else return null;
+            if (s == null) return null;
+            Object item = s.first();
+            if (!isTruthy(callFunction(pred, new Object[]{item}))) return null;
+            clojure.lang.ISeq rest = s.next();
+            LazySeq lazyRest = (LazySeq) lazyTakeWhile(pred,
+                    rest == null ? (Object) ClojureNil.INSTANCE : rest);
+            return (Object) new clojure.lang.Cons(item, lazyRest);
+        });
     }
 
     // --- Arithmetic helpers ---

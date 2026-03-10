@@ -4,6 +4,7 @@ import clojure.lang.*;
 import clojure.truffle.ClojureContext;
 import clojure.truffle.ClojureTruffleLanguage;
 import clojure.truffle.nodes.*;
+import clojure.truffle.nodes.interop.*;
 import clojure.truffle.runtime.ClojureFunction;
 import clojure.truffle.runtime.ClojureNil;
 import clojure.truffle.runtime.MultiArityFunction;
@@ -141,6 +142,15 @@ public class Analyzer {
         }
         Integer slot = (ns == null) ? currentScope.findLocal(name) : null;
         if (slot != null) return new ReadLocalNode(slot);
+        // Static field access: Class/FIELD (outside call position)
+        if (ns != null && isJavaClassName(ns)) {
+            try {
+                Class<?> clazz = JavaInteropUtil.resolveClass(ns);
+                return new JavaStaticFieldNode(clazz, name);
+            } catch (RuntimeException ignored) {
+                // Not a Java class, fall through to var lookup
+            }
+        }
         String varName = ns != null ? ns + "/" + name : name;
         return new SymbolNode(context, varName);
     }
@@ -162,6 +172,15 @@ public class Analyzer {
             }
 
             if (ns == null) {
+                // Instance method: (.method obj args...)
+                if (name.startsWith(".") && name.length() > 1 && !name.equals("..")) {
+                    return analyzeInstanceMethod(name.substring(1), seq.next());
+                }
+                // Constructor: (ClassName. args...)
+                if (name.endsWith(".") && name.length() > 1) {
+                    String className = name.substring(0, name.length() - 1);
+                    return analyzeConstructor(className, seq.next());
+                }
                 switch (name) {
                     case "if":          return analyzeIf(seq);
                     case "do":          return analyzeDo(seq);
@@ -180,8 +199,14 @@ public class Analyzer {
                     case "throw":       return analyzeThrow(seq);
                     case "defmacro":    return analyzeDefmacro(seq);
                     case "macroexpand": return analyzeMacroexpand(seq);
+                    case "new":         return analyzeNew(seq);
+                    case "lazy-seq":    return analyzeLazySeq(seq);
                     case "do-template": return analyzeDo(seq); // fallback
                 }
+            }
+            // Static method call: (Class/method args...)
+            if (ns != null && isJavaClassName(ns)) {
+                return analyzeStaticCall(ns, name, seq.next());
             }
         }
         return analyzeInvoke(seq);
@@ -226,6 +251,245 @@ public class Analyzer {
         return analyze(args.first());
     }
 
+    // --- Lazy Seq ---
+
+    private ExpressionNode analyzeLazySeq(ISeq seq) {
+        // (lazy-seq body...) -> wrap body in (fn* [] body...) then LazySeqNode
+        ISeq body = seq.next();
+        // Build: (fn* [] body...)
+        ISeq fnForm = RT.cons(Symbol.intern("fn*"),
+                RT.cons(PersistentVector.EMPTY, body));
+        ExpressionNode thunkNode = analyzeFn(fnForm);
+        return new LazySeqNode(thunkNode);
+    }
+
+    // --- Java Interop ---
+
+    private boolean isJavaClassName(String name) {
+        // Heuristic: starts with uppercase, or contains '.' (like java.util.List)
+        if (name.isEmpty()) return false;
+        if (name.contains(".")) return true;
+        return Character.isUpperCase(name.charAt(0));
+    }
+
+    private ExpressionNode analyzeInstanceMethod(String methodName, ISeq args) {
+        if (args == null) throw err(".method: missing target object");
+        ExpressionNode target = analyze(args.first());
+        args = args.next();
+        List<ExpressionNode> argList = new ArrayList<>();
+        while (args != null) { argList.add(analyze(args.first())); args = args.next(); }
+        return new JavaInstanceMethodNode(methodName, target, argList.toArray(new ExpressionNode[0]));
+    }
+
+    private ExpressionNode analyzeStaticCall(String className, String memberName, ISeq args) {
+        Class<?> clazz = JavaInteropUtil.resolveClass(className);
+        List<ExpressionNode> argList = new ArrayList<>();
+        while (args != null) { argList.add(analyze(args.first())); args = args.next(); }
+        if (argList.isEmpty()) {
+            // Could be static field or zero-arg method - try field first
+            try {
+                clazz.getField(memberName);
+                return new JavaStaticFieldNode(clazz, memberName);
+            } catch (NoSuchFieldException ignored) {
+                // Fall through to static method
+            }
+        }
+        return new JavaStaticMethodNode(clazz, memberName, argList.toArray(new ExpressionNode[0]));
+    }
+
+    private ExpressionNode analyzeConstructor(String className, ISeq args) {
+        Class<?> clazz = JavaInteropUtil.resolveClass(className);
+        List<ExpressionNode> argList = new ArrayList<>();
+        while (args != null) { argList.add(analyze(args.first())); args = args.next(); }
+        return new JavaConstructorNode(clazz, argList.toArray(new ExpressionNode[0]));
+    }
+
+    private ExpressionNode analyzeNew(ISeq seq) {
+        ISeq args = seq.next();
+        if (args == null) throw err("new: missing class name");
+        Object classForm = args.first();
+        if (!(classForm instanceof Symbol classSym))
+            throw err("new: class name must be a symbol");
+        return analyzeConstructor(classSym.getName(), args.next());
+    }
+
+    // --- Destructuring ---
+
+    private void expandDestructuring(Object bindingForm, int sourceSlot,
+                                     List<Integer> slots, List<ExpressionNode> values) {
+        if (bindingForm instanceof IPersistentVector vec) {
+            expandVectorDestructuring(vec, sourceSlot, slots, values);
+        } else if (bindingForm instanceof IPersistentMap map) {
+            expandMapDestructuring(map, sourceSlot, slots, values);
+        } else {
+            throw err("Unsupported destructuring form: " + bindingForm);
+        }
+    }
+
+    private void expandVectorDestructuring(IPersistentVector pattern, int sourceSlot,
+                                           List<Integer> slots, List<ExpressionNode> values) {
+        // [a b & rest :as all]
+        int positionalIndex = 0;
+        for (int i = 0; i < pattern.count(); i++) {
+            Object elem = pattern.nth(i);
+            if (elem instanceof Symbol sym && sym.getName().equals("&")) {
+                // Variadic: next element gets the rest
+                i++;
+                if (i >= pattern.count()) throw err("destructuring: missing name after &");
+                Object restForm = pattern.nth(i);
+                ExpressionNode restExpr = makeNthnextNode(sourceSlot, positionalIndex);
+                if (restForm instanceof Symbol restSym) {
+                    slots.add(currentScope.addLocal(restSym.getName()));
+                    values.add(restExpr);
+                } else {
+                    int tmpSlot = currentScope.addLocal("__rest_tmp_" + positionalIndex);
+                    slots.add(tmpSlot);
+                    values.add(restExpr);
+                    expandDestructuring(restForm, tmpSlot, slots, values);
+                }
+            } else if ((elem instanceof Keyword kw && kw.getName().equals("as")) ||
+                       (elem instanceof Symbol sym2 && sym2.getName().equals(":as"))) {
+                // :as binds the whole collection
+                i++;
+                if (i >= pattern.count()) throw err("destructuring: missing name after :as");
+                Symbol asSym = (Symbol) pattern.nth(i);
+                slots.add(currentScope.addLocal(asSym.getName()));
+                values.add(new ReadLocalNode(sourceSlot));
+            } else if (elem instanceof Symbol sym) {
+                // Simple positional binding
+                slots.add(currentScope.addLocal(sym.getName()));
+                values.add(makeNthNode(sourceSlot, positionalIndex));
+                positionalIndex++;
+            } else {
+                // Nested destructuring
+                int tmpSlot = currentScope.addLocal("__vec_tmp_" + positionalIndex);
+                slots.add(tmpSlot);
+                values.add(makeNthNode(sourceSlot, positionalIndex));
+                expandDestructuring(elem, tmpSlot, slots, values);
+                positionalIndex++;
+            }
+        }
+    }
+
+    private void expandMapDestructuring(IPersistentMap pattern, int sourceSlot,
+                                        List<Integer> slots, List<ExpressionNode> values) {
+        // {:keys [a b] :strs [c] :or {a 1} :as all}
+        // or {localName :mapKey, ...}
+        Object keysVec = pattern.valAt(Keyword.intern("keys"));
+        Object strsVec = pattern.valAt(Keyword.intern("strs"));
+        Object orMap = pattern.valAt(Keyword.intern("or"));
+        Object asName = pattern.valAt(Keyword.intern("as"));
+        IPersistentMap defaults = (orMap instanceof IPersistentMap m) ? m : null;
+
+        // :keys [a b] -> bind a to (:a source), b to (:b source)
+        if (keysVec instanceof IPersistentVector kv) {
+            for (int i = 0; i < kv.count(); i++) {
+                Symbol sym = (Symbol) kv.nth(i);
+                Keyword key = Keyword.intern(sym.getName());
+                ExpressionNode getExpr = makeGetNode(sourceSlot, key, defaults, sym);
+                slots.add(currentScope.addLocal(sym.getName()));
+                values.add(getExpr);
+            }
+        }
+
+        // :strs [a b] -> bind a to ("a" source), b to ("b" source)
+        if (strsVec instanceof IPersistentVector sv) {
+            for (int i = 0; i < sv.count(); i++) {
+                Symbol sym = (Symbol) sv.nth(i);
+                String key = sym.getName();
+                ExpressionNode getExpr = makeGetNodeStr(sourceSlot, key, defaults, sym);
+                slots.add(currentScope.addLocal(sym.getName()));
+                values.add(getExpr);
+            }
+        }
+
+        // Explicit bindings: {localName :mapKey}
+        for (ISeq s = pattern.seq(); s != null; s = s.next()) {
+            IMapEntry entry = (IMapEntry) s.first();
+            Object k = entry.key();
+            Object v = entry.val();
+            // Skip :keys, :strs, :or, :as
+            if (k instanceof Keyword kw) {
+                String kwName = kw.getName();
+                if (kwName.equals("keys") || kwName.equals("strs") || kwName.equals("syms") ||
+                        kwName.equals("or") || kwName.equals("as"))
+                    continue;
+            }
+            // {localSym :key} or {localSym "key"}
+            if (k instanceof Symbol localSym) {
+                ExpressionNode getExpr;
+                if (v instanceof Keyword kw) {
+                    getExpr = makeGetNode(sourceSlot, kw, defaults, localSym);
+                } else {
+                    getExpr = makeGetNodeObj(sourceSlot, v, defaults, localSym);
+                }
+                if (localSym.getName().equals("_")) continue; // skip _ bindings
+                slots.add(currentScope.addLocal(localSym.getName()));
+                values.add(getExpr);
+            }
+        }
+
+        // :as binds the whole map
+        if (asName instanceof Symbol asSym) {
+            slots.add(currentScope.addLocal(asSym.getName()));
+            values.add(new ReadLocalNode(sourceSlot));
+        }
+    }
+
+    // Helper: (nth source index)
+    private ExpressionNode makeNthNode(int sourceSlot, int index) {
+        return new InvokeNode(
+                new SymbolNode(context, "nth"),
+                new ExpressionNode[]{new ReadLocalNode(sourceSlot), new LongLiteralNode(index)});
+    }
+
+    // Helper: (nthnext source index) or (drop index source)
+    private ExpressionNode makeNthnextNode(int sourceSlot, int index) {
+        return new InvokeNode(
+                new SymbolNode(context, "drop"),
+                new ExpressionNode[]{new LongLiteralNode(index), new ReadLocalNode(sourceSlot)});
+    }
+
+    // Helper: (get source key) or (get source key default)
+    private ExpressionNode makeGetNode(int sourceSlot, Keyword key, IPersistentMap defaults, Symbol sym) {
+        ExpressionNode[] getArgs;
+        Object defaultVal = defaults != null ? defaults.valAt(sym) : null;
+        if (defaultVal != null) {
+            getArgs = new ExpressionNode[]{
+                    new ReadLocalNode(sourceSlot), new KeywordLiteralNode(key), analyze(defaultVal)};
+        } else {
+            getArgs = new ExpressionNode[]{
+                    new ReadLocalNode(sourceSlot), new KeywordLiteralNode(key)};
+        }
+        return new InvokeNode(new SymbolNode(context, "get"), getArgs);
+    }
+
+    private ExpressionNode makeGetNodeStr(int sourceSlot, String key, IPersistentMap defaults, Symbol sym) {
+        ExpressionNode[] getArgs;
+        Object defaultVal = defaults != null ? defaults.valAt(sym) : null;
+        if (defaultVal != null) {
+            getArgs = new ExpressionNode[]{
+                    new ReadLocalNode(sourceSlot), new StringLiteralNode(key), analyze(defaultVal)};
+        } else {
+            getArgs = new ExpressionNode[]{
+                    new ReadLocalNode(sourceSlot), new StringLiteralNode(key)};
+        }
+        return new InvokeNode(new SymbolNode(context, "get"), getArgs);
+    }
+
+    private ExpressionNode makeGetNodeObj(int sourceSlot, Object key, IPersistentMap defaults, Symbol sym) {
+        ExpressionNode[] getArgs;
+        Object defaultVal = defaults != null ? defaults.valAt(sym) : null;
+        if (defaultVal != null) {
+            getArgs = new ExpressionNode[]{
+                    new ReadLocalNode(sourceSlot), analyze(key), analyze(defaultVal)};
+        } else {
+            getArgs = new ExpressionNode[]{
+                    new ReadLocalNode(sourceSlot), analyze(key)};
+        }
+        return new InvokeNode(new SymbolNode(context, "get"), getArgs);
+    }
+
     // --- Special Forms ---
 
     private ExpressionNode analyzeIf(ISeq seq) {
@@ -267,15 +531,24 @@ public class Analyzer {
         IPersistentVector bindings = (IPersistentVector) args.first();
         if (bindings.count() % 2 != 0) throw err("let*: odd number of binding forms");
 
-        int bindingCount = bindings.count() / 2;
-        int[] slots = new int[bindingCount];
-        ExpressionNode[] values = new ExpressionNode[bindingCount];
-        for (int i = 0; i < bindingCount; i++) {
-            if (!(bindings.nth(i * 2) instanceof Symbol))
-                throw err("let*: binding name must be a symbol");
-            slots[i] = currentScope.addLocal(((Symbol) bindings.nth(i * 2)).getName());
-            values[i] = analyze(bindings.nth(i * 2 + 1));
+        List<Integer> slotList = new ArrayList<>();
+        List<ExpressionNode> valueList = new ArrayList<>();
+        for (int i = 0; i < bindings.count(); i += 2) {
+            Object bindingForm = bindings.nth(i);
+            ExpressionNode initExpr = analyze(bindings.nth(i + 1));
+            if (bindingForm instanceof Symbol sym) {
+                slotList.add(currentScope.addLocal(sym.getName()));
+                valueList.add(initExpr);
+            } else {
+                // Destructuring: store init in temp, then expand
+                int tempSlot = currentScope.addLocal("__destructure_tmp_" + i);
+                slotList.add(tempSlot);
+                valueList.add(initExpr);
+                expandDestructuring(bindingForm, tempSlot, slotList, valueList);
+            }
         }
+        int[] slots = slotList.stream().mapToInt(Integer::intValue).toArray();
+        ExpressionNode[] values = valueList.toArray(new ExpressionNode[0]);
         return new LetNode(slots, values, analyzeBody(args.next()));
     }
 
@@ -307,13 +580,21 @@ public class Analyzer {
         Scope outerScope = currentScope;
         currentScope = new Scope(outerScope);
 
-        int[] paramSlots;
-        int variadicSlot;
-        int[] result = parseParams(params);
-        paramSlots = Arrays.copyOf(result, result.length - 1);
-        variadicSlot = result[result.length - 1];
+        List<Integer> destructSlots = new ArrayList<>();
+        List<ExpressionNode> destructValues = new ArrayList<>();
+
+        int[] result = parseParams(params, destructSlots, destructValues);
+        int[] paramSlots = Arrays.copyOf(result, result.length - 1);
+        int variadicSlot = result[result.length - 1];
 
         ExpressionNode bodyNode = analyzeBody(args.next());
+
+        // Wrap body with destructuring bindings if any
+        if (!destructSlots.isEmpty()) {
+            int[] dSlots = destructSlots.stream().mapToInt(Integer::intValue).toArray();
+            ExpressionNode[] dValues = destructValues.toArray(new ExpressionNode[0]);
+            bodyNode = new LetNode(dSlots, dValues, bodyNode);
+        }
 
         int[] outerCaptureSlots = currentScope.getOuterCaptureSlots();
         int[] innerCaptureSlots = currentScope.getInnerCaptureSlots();
@@ -344,11 +625,18 @@ public class Analyzer {
 
             currentScope = new Scope(outerScope);
 
-            int[] result = parseParams(params);
+            List<Integer> dSlots = new ArrayList<>();
+            List<ExpressionNode> dVals = new ArrayList<>();
+            int[] result = parseParams(params, dSlots, dVals);
             int[] paramSlots = Arrays.copyOf(result, result.length - 1);
             int varSlot = result[result.length - 1];
 
             ExpressionNode bodyNode = analyzeBody(body);
+            if (!dSlots.isEmpty()) {
+                bodyNode = new LetNode(
+                        dSlots.stream().mapToInt(Integer::intValue).toArray(),
+                        dVals.toArray(new ExpressionNode[0]), bodyNode);
+            }
 
             int[] outerCaptures = currentScope.getOuterCaptureSlots();
             int[] innerCaptures = currentScope.getInnerCaptureSlots();
@@ -376,20 +664,43 @@ public class Analyzer {
 
     /**
      * Parse parameters, returning array where last element is variadic slot (-1 if none).
+     * destructBindings is populated with any destructuring that needs to happen.
      */
     private int[] parseParams(IPersistentVector params) {
+        return parseParams(params, null, null);
+    }
+
+    private int[] parseParams(IPersistentVector params,
+                              List<Integer> destructSlots,
+                              List<ExpressionNode> destructValues) {
         List<Integer> positional = new ArrayList<>();
         int varSlot = -1;
         for (int i = 0; i < params.count(); i++) {
-            if (!(params.nth(i) instanceof Symbol))
-                throw err("fn*: parameter must be a symbol");
-            String pName = ((Symbol) params.nth(i)).getName();
-            if ("&".equals(pName)) {
+            Object param = params.nth(i);
+            if (param instanceof Symbol sym && "&".equals(sym.getName())) {
                 i++;
                 if (i >= params.count()) throw err("fn*: missing parameter after &");
-                varSlot = currentScope.addLocal(((Symbol) params.nth(i)).getName());
+                Object varParam = params.nth(i);
+                if (varParam instanceof Symbol varSym) {
+                    varSlot = currentScope.addLocal(varSym.getName());
+                } else {
+                    // Destructured variadic param
+                    String tmpName = "__var_destructure_" + i;
+                    varSlot = currentScope.addLocal(tmpName);
+                    if (destructSlots != null) {
+                        expandDestructuring(varParam, varSlot, destructSlots, destructValues);
+                    }
+                }
+            } else if (param instanceof Symbol sym) {
+                positional.add(currentScope.addLocal(sym.getName()));
             } else {
-                positional.add(currentScope.addLocal(pName));
+                // Destructured positional param
+                String tmpName = "__param_destructure_" + i;
+                int tmpSlot = currentScope.addLocal(tmpName);
+                positional.add(tmpSlot);
+                if (destructSlots != null) {
+                    expandDestructuring(param, tmpSlot, destructSlots, destructValues);
+                }
             }
         }
         int[] result = new int[positional.size() + 1];
