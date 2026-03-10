@@ -67,6 +67,19 @@ public class ClojureMultiMethod {
         return result;
     }
 
+    public void removeMethod(Object dispatchVal) {
+        if (dispatchVal instanceof clojure.lang.Keyword kw && kw.getName().equals("default")) {
+            defaultMethod = null;
+        } else {
+            methods.remove(dispatchVal);
+        }
+    }
+
+    public void removeAllMethods() {
+        methods.clear();
+        defaultMethod = null;
+    }
+
     public String getName() { return name; }
 
     @Override

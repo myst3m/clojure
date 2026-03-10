@@ -270,6 +270,8 @@ public class Analyzer {
                     case "extend-type": return analyzeExtendType(seq);
                     case "extend-protocol": return analyzeExtendProtocol(seq);
                     case "delay":       return analyzeDelay(seq);
+                    case "future":      return analyzeFuture(seq);
+                    case "locking":     return analyzeLocking(seq);
                 }
             }
             // Static method call: (Class/method args...)
@@ -2176,6 +2178,36 @@ public class Analyzer {
         ExpressionNode thunkNode = analyze(fnForm);
         ExpressionNode wosNode = new SymbolNode(context, "with-out-str");
         return new InvokeNode(wosNode, new ExpressionNode[]{thunkNode});
+    }
+
+    private ExpressionNode analyzeFuture(ISeq seq) {
+        // (future body...) => (future-call (fn [] body...))
+        ISeq body = seq.next();
+        Object fnForm = RT.cons(Symbol.intern("fn"),
+                RT.cons(PersistentVector.EMPTY, body));
+        ExpressionNode thunkNode = analyze(fnForm);
+        ExpressionNode futureCallNode = new SymbolNode(context, "future-call");
+        return new InvokeNode(futureCallNode, new ExpressionNode[]{thunkNode});
+    }
+
+    private ExpressionNode analyzeLocking(ISeq seq) {
+        // (locking expr body...) => synchronized on expr, execute body
+        ISeq args = seq.next();
+        if (args == null) throw err("locking: missing lock expression");
+        ExpressionNode lockNode = analyze(args.first());
+        ISeq body = args.next();
+        ExpressionNode bodyNode = (body != null) ? analyzeBody(body) : new NilNode();
+        return new ExpressionNode() {
+            @Child private ExpressionNode lockExpr = lockNode;
+            @Child private ExpressionNode bodyExpr = bodyNode;
+            @Override
+            public Object executeGeneric(com.oracle.truffle.api.frame.VirtualFrame frame) {
+                Object lock = lockExpr.executeGeneric(frame);
+                synchronized (lock) {
+                    return bodyExpr.executeGeneric(frame);
+                }
+            }
+        };
     }
 
     private ExpressionNode analyzeReify(ISeq seq) {

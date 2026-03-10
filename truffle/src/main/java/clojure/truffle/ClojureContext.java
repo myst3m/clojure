@@ -4280,6 +4280,171 @@ public class ClojureContext {
             return false;
         });
 
+        // --- Phase 14 builtins ---
+
+        // identical?
+        globalVars.put("identical?", (BuiltinFunction) args -> {
+            checkArity(args, 2, "identical?");
+            return args[0] == args[1];
+        });
+
+        // transient collections
+        globalVars.put("transient", (BuiltinFunction) args -> {
+            checkArity(args, 1, "transient");
+            if (args[0] instanceof clojure.lang.IEditableCollection ec)
+                return ec.asTransient();
+            throw new RuntimeException("transient: not supported for " + args[0].getClass().getName());
+        });
+
+        globalVars.put("persistent!", (BuiltinFunction) args -> {
+            checkArity(args, 1, "persistent!");
+            if (args[0] instanceof clojure.lang.ITransientCollection tc)
+                return tc.persistent();
+            throw new RuntimeException("persistent!: not a transient collection");
+        });
+
+        globalVars.put("conj!", (BuiltinFunction) args -> {
+            checkArity(args, 2, "conj!");
+            if (args[0] instanceof clojure.lang.ITransientCollection tc)
+                return tc.conj(args[1]);
+            throw new RuntimeException("conj!: not a transient collection");
+        });
+
+        globalVars.put("assoc!", (BuiltinFunction) args -> {
+            if (args.length < 3 || args.length % 2 == 0)
+                throw new RuntimeException("assoc!: expected odd number of args >= 3");
+            Object m = args[0];
+            if (!(m instanceof clojure.lang.ITransientAssociative ta))
+                throw new RuntimeException("assoc!: not a transient associative");
+            for (int i = 1; i < args.length; i += 2) {
+                ta = (clojure.lang.ITransientAssociative) ta.assoc(args[i], args[i + 1]);
+            }
+            return ta;
+        });
+
+        globalVars.put("dissoc!", (BuiltinFunction) args -> {
+            checkArity(args, 2, "dissoc!");
+            if (args[0] instanceof clojure.lang.ITransientMap tm)
+                return tm.without(args[1]);
+            throw new RuntimeException("dissoc!: not a transient map");
+        });
+
+        globalVars.put("pop!", (BuiltinFunction) args -> {
+            checkArity(args, 1, "pop!");
+            if (args[0] instanceof clojure.lang.ITransientVector tv)
+                return tv.pop();
+            throw new RuntimeException("pop!: not a transient vector");
+        });
+
+        // remove-method
+        globalVars.put("remove-method", (BuiltinFunction) args -> {
+            checkArity(args, 2, "remove-method");
+            if (!(args[0] instanceof clojure.truffle.runtime.ClojureMultiMethod mm))
+                throw new RuntimeException("remove-method: first arg must be a multimethod");
+            mm.removeMethod(args[1]);
+            return mm;
+        });
+
+        globalVars.put("remove-all-methods", (BuiltinFunction) args -> {
+            checkArity(args, 1, "remove-all-methods");
+            if (!(args[0] instanceof clojure.truffle.runtime.ClojureMultiMethod mm))
+                throw new RuntimeException("remove-all-methods: first arg must be a multimethod");
+            mm.removeAllMethods();
+            return mm;
+        });
+
+        // alter-meta!
+        globalVars.put("alter-meta!", (BuiltinFunction) args -> {
+            if (args.length < 2) throw new RuntimeException("alter-meta!: expected at least 2 args");
+            // For atoms and other reference types
+            if (args[0] instanceof clojure.truffle.runtime.ClojureAtom atom) {
+                Object f = args[1];
+                Object[] fArgs = new Object[args.length - 1];
+                fArgs[0] = atom.getMeta();
+                System.arraycopy(args, 2, fArgs, 1, args.length - 2);
+                Object newMeta = callFunction(f, fArgs);
+                atom.setMeta(newMeta);
+                return newMeta;
+            }
+            throw new RuntimeException("alter-meta!: unsupported reference type");
+        });
+
+        // pmap
+        globalVars.put("pmap", (BuiltinFunction) args -> {
+            if (args.length < 2) throw new RuntimeException("pmap: expected at least 2 args");
+            Object f = args[0];
+            java.util.List<Object> items = new ArrayList<>();
+            for (clojure.lang.ISeq seq = clojure.lang.RT.seq(args[1]); seq != null; seq = seq.next())
+                items.add(seq.first());
+            java.util.List<java.util.concurrent.Future<Object>> futures = new ArrayList<>();
+            java.util.concurrent.ExecutorService executor =
+                    java.util.concurrent.Executors.newFixedThreadPool(
+                            Math.min(items.size(), Runtime.getRuntime().availableProcessors() + 2));
+            try {
+                for (Object item : items) {
+                    futures.add(executor.submit(() -> callFunction(f, new Object[]{item})));
+                }
+                java.util.List<Object> results = new ArrayList<>();
+                for (var future : futures) {
+                    try {
+                        results.add(future.get());
+                    } catch (Exception e) {
+                        throw new RuntimeException("pmap: " + e.getMessage(), e);
+                    }
+                }
+                return clojure.lang.PersistentList.create(results);
+            } finally {
+                executor.shutdown();
+            }
+        });
+
+        // bean
+        globalVars.put("bean", (BuiltinFunction) args -> {
+            checkArity(args, 1, "bean");
+            Object obj = args[0];
+            clojure.lang.IPersistentMap result = clojure.lang.PersistentArrayMap.EMPTY;
+            try {
+                java.beans.BeanInfo info = java.beans.Introspector.getBeanInfo(obj.getClass());
+                for (java.beans.PropertyDescriptor pd : info.getPropertyDescriptors()) {
+                    java.lang.reflect.Method getter = pd.getReadMethod();
+                    if (getter != null) {
+                        Object val = getter.invoke(obj);
+                        result = result.assoc(clojure.lang.Keyword.intern(pd.getName()), val);
+                    }
+                }
+            } catch (Exception e) {
+                throw new RuntimeException("bean: " + e.getMessage(), e);
+            }
+            return result;
+        });
+
+        // bases
+        globalVars.put("bases", (BuiltinFunction) args -> {
+            checkArity(args, 1, "bases");
+            Class<?> clazz = (args[0] instanceof Class<?> c) ? c : args[0].getClass();
+            java.util.List<Object> result = new ArrayList<>();
+            Class<?> sup = clazz.getSuperclass();
+            if (sup != null) result.add(sup);
+            for (Class<?> iface : clazz.getInterfaces()) result.add(iface);
+            return result.isEmpty() ? ClojureNil.INSTANCE
+                    : clojure.lang.PersistentList.create(result);
+        });
+
+        // future?
+        globalVars.put("future?", (BuiltinFunction) args -> {
+            checkArity(args, 1, "future?");
+            return args[0] instanceof java.util.concurrent.Future;
+        });
+
+        // realized? enhancement for futures
+        // (already exists, but ensure it handles futures)
+
+        // bit operations
+        globalVars.put("unsigned-bit-shift-right", (BuiltinFunction) args -> {
+            checkArity(args, 2, "unsigned-bit-shift-right");
+            return ((Number) args[0]).longValue() >>> ((Number) args[1]).longValue();
+        });
+
         // Copy all builtins into clojure.core namespace
         ClojureNamespace core = namespaces.get("clojure.core");
         if (core != null) {

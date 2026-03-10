@@ -54,6 +54,16 @@ public class ClojureAtom implements TruffleObject {
         return watches;
     }
 
+    private volatile Object meta;
+
+    public Object getMeta() {
+        return meta != null ? meta : ClojureNil.INSTANCE;
+    }
+
+    public void setMeta(Object newMeta) {
+        this.meta = newMeta;
+    }
+
     @ExportMessage
     boolean hasLanguage() {
         return true;
