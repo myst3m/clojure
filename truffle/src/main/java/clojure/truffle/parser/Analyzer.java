@@ -256,6 +256,13 @@ public class Analyzer {
                     case "letfn":       return analyzeLetfn(seq);
                     case "do-template": return analyzeDo(seq); // fallback
                     case "binding":     return analyzeBinding(seq);
+                    case "when-not":    return analyzeWhenNot(seq);
+                    case "if-not":      return analyzeIfNot(seq);
+                    case "condp":       return analyzeCondp(seq);
+                    case "while":       return analyzeWhile(seq);
+                    case "comment":     return new NilNode();
+                    case "declare":     return analyzeDeclare(seq);
+                    case "defonce":     return analyzeDefonce(seq);
                 }
             }
             // Static method call: (Class/method args...)
@@ -1818,6 +1825,131 @@ public class Analyzer {
         while (args != null) { body.add(analyze(args.first())); args = args.next(); }
         return new clojure.truffle.nodes.BindingNode(context, varNames, valueNodes,
                 body.toArray(new ExpressionNode[0]));
+    }
+
+    private ExpressionNode analyzeWhenNot(ISeq seq) {
+        // (when-not test body...) => (if (not test) (do body...) nil)
+        ISeq args = seq.next();
+        if (args == null) return new NilNode();
+        Object test = args.first();
+        args = args.next();
+        List<Object> body = new ArrayList<>();
+        while (args != null) { body.add(args.first()); args = args.next(); }
+        List<Object> doBody = new ArrayList<>();
+        doBody.add(Symbol.intern("do"));
+        doBody.addAll(body);
+        return analyze(RT.list(Symbol.intern("if"),
+                RT.list(Symbol.intern("not"), test),
+                PersistentList.create(doBody),
+                null));
+    }
+
+    private ExpressionNode analyzeIfNot(ISeq seq) {
+        // (if-not test then else) => (if (not test) then else)
+        ISeq args = seq.next();
+        if (args == null) return new NilNode();
+        Object test = args.first();
+        args = args.next();
+        Object thenForm = args != null ? args.first() : null;
+        Object elseForm = (args != null && args.next() != null) ? args.next().first() : null;
+        return analyze(RT.list(Symbol.intern("if"),
+                RT.list(Symbol.intern("not"), test),
+                thenForm, elseForm));
+    }
+
+    private ExpressionNode analyzeCondp(ISeq seq) {
+        // (condp pred expr clause...) where clause is: test-val result or test-val :>> fn
+        ISeq args = seq.next();
+        if (args == null) throw err("condp: missing pred");
+        Object pred = args.first(); args = args.next();
+        if (args == null) throw err("condp: missing expr");
+        Object expr = args.first(); args = args.next();
+
+        Symbol tmpSym = Symbol.intern("__condp_val__");
+        List<Object> body = new ArrayList<>();
+        while (args != null) {
+            Object testVal = args.first();
+            args = args.next();
+            if (args == null) {
+                // Default clause (no pair) — testVal is the default result
+                body.add(testVal);
+                break;
+            }
+            Object result = args.first();
+            args = args.next();
+            // (if (pred testVal tmpSym) result ...)
+            body.add(0, RT.list(Symbol.intern("if"),
+                    RT.list(pred, testVal, tmpSym),
+                    result,
+                    null)); // placeholder
+        }
+        // Chain the conditions: replace null placeholders
+        if (body.isEmpty()) return new NilNode();
+        // Build nested if from inside out
+        Object result = body.get(body.size() - 1);
+        // Check if last element is a standalone default or an if
+        for (int i = body.size() - 1; i >= 0; i--) {
+            Object item = body.get(i);
+            if (item instanceof ISeq s && Symbol.intern("if").equals(s.first())) {
+                // Replace the nil (else) with the current accumulated result
+                // (if test then nil) -> (if test then result)
+                ISeq ifArgs = s.next();
+                Object cond = ifArgs.first();
+                Object then = ifArgs.next().first();
+                item = RT.list(Symbol.intern("if"), cond, then, result);
+                result = item;
+            } else if (i < body.size() - 1) {
+                // shouldn't happen
+                result = item;
+            }
+        }
+        // Wrap in let to evaluate expr once
+        return analyze(RT.list(Symbol.intern("let"),
+                PersistentVector.create(java.util.List.of(tmpSym, expr)),
+                result));
+    }
+
+    private ExpressionNode analyzeWhile(ISeq seq) {
+        // (while test body...) - expand to loop/recur with if
+        ISeq args = seq.next();
+        if (args == null) return new NilNode();
+        Object test = args.first();
+        args = args.next();
+        List<Object> body = new ArrayList<>();
+        while (args != null) { body.add(args.first()); args = args.next(); }
+        // (loop [] (when test body... (recur)))
+        List<Object> whenBody = new ArrayList<>();
+        whenBody.add(Symbol.intern("when"));
+        whenBody.add(test);
+        whenBody.addAll(body);
+        whenBody.add(RT.list(Symbol.intern("recur")));
+        return analyze(RT.list(Symbol.intern("loop"),
+                PersistentVector.EMPTY,
+                PersistentList.create(whenBody)));
+    }
+
+    private ExpressionNode analyzeDeclare(ISeq seq) {
+        // (declare name1 name2 ...) - forward declarations
+        ISeq args = seq.next();
+        List<ExpressionNode> nodes = new ArrayList<>();
+        while (args != null) {
+            Symbol sym = (Symbol) args.first();
+            // Define as nil if not already defined
+            nodes.add(analyze(RT.list(Symbol.intern("def"), sym)));
+            args = args.next();
+        }
+        if (nodes.isEmpty()) return new NilNode();
+        return new DoNode(nodes.toArray(new ExpressionNode[0]));
+    }
+
+    private ExpressionNode analyzeDefonce(ISeq seq) {
+        // (defonce name expr) - only define if not already bound (runtime check)
+        ISeq args = seq.next();
+        if (args == null) throw err("defonce: missing name");
+        Symbol sym = (Symbol) args.first();
+        args = args.next();
+        ExpressionNode valueNode = args != null ? analyze(args.first()) : new NilNode();
+        return new clojure.truffle.nodes.DefonceNode(context, sym.getName(), valueNode);
     }
 
     private ExpressionNode[] analyzeArgList(ISeq args) {
