@@ -27,6 +27,7 @@ public class Main {
     private static void evalAndPrint(String code) {
         try (Context context = Context.newBuilder("clj")
                 .allowAllAccess(true)
+                .option("engine.WarnInterpreterOnly", "false")
                 .build()) {
             Value result = context.eval("clj", code);
             System.out.println(formatResult(result));
@@ -40,6 +41,7 @@ public class Main {
 
         try (Context context = Context.newBuilder("clj")
                 .allowAllAccess(true)
+                .option("engine.WarnInterpreterOnly", "false")
                 .build()) {
             BufferedReader reader = new BufferedReader(new InputStreamReader(System.in));
             while (true) {

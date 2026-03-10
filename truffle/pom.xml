@@ -13,7 +13,7 @@
     <description>Clojure implementation on GraalVM Truffle</description>
 
     <properties>
-        <truffle.version>23.1.2</truffle.version>
+        <truffle.version>25.0.1</truffle.version>
         <maven.compiler.source>17</maven.compiler.source>
         <maven.compiler.target>17</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
