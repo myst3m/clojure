@@ -53,6 +53,20 @@ public class ClojureMultiMethod {
         return null;
     }
 
+    private final ConcurrentHashMap<Object, java.util.Set<Object>> preferences = new ConcurrentHashMap<>();
+
+    public void preferMethod(Object preferred, Object other) {
+        preferences.computeIfAbsent(preferred, k -> java.util.Collections.newSetFromMap(new ConcurrentHashMap<>())).add(other);
+    }
+
+    public clojure.lang.IPersistentMap getMethodTable() {
+        clojure.lang.IPersistentMap result = clojure.lang.PersistentArrayMap.EMPTY;
+        for (var entry : methods.entrySet()) {
+            result = result.assoc(entry.getKey(), entry.getValue());
+        }
+        return result;
+    }
+
     public String getName() { return name; }
 
     @Override

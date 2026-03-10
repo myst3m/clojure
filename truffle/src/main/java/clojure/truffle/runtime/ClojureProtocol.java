@@ -52,6 +52,12 @@ public class ClojureProtocol {
         return null;
     }
 
+    public Object resolve(String methodName, Object typeKey) {
+        Map<String, Object> methods = implementations.get(typeKey);
+        if (methods != null) return methods.get(methodName);
+        return null;
+    }
+
     public boolean hasImplementation(Object target) {
         if (target instanceof ClojureDeftypeInstance inst) {
             return implementations.containsKey(inst.getTypeName());

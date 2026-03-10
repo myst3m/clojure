@@ -3392,8 +3392,16 @@ public class ClojureContext {
             java.util.List<Object> result = new ArrayList<>();
             for (clojure.lang.ISeq seq = clojure.lang.RT.seq(args[1]); seq != null; seq = seq.next()) {
                 Object mapped = callFunction(f, new Object[]{seq.first()});
-                if (mapped instanceof ClojureNil) continue;
-                for (clojure.lang.ISeq inner = clojure.lang.RT.seq(mapped); inner != null; inner = inner.next()) {
+                if (mapped == null || mapped instanceof ClojureNil) continue;
+                clojure.lang.ISeq inner = null;
+                try {
+                    inner = clojure.lang.RT.seq(mapped);
+                } catch (IllegalArgumentException e) {
+                    // Non-seqable result (e.g. scalar from for :when) - treat as single element
+                    result.add(mapped);
+                    continue;
+                }
+                for (; inner != null; inner = inner.next()) {
                     result.add(inner.first());
                 }
             }
@@ -3818,6 +3826,221 @@ public class ClojureContext {
             return newVal;
         });
 
+        // --- Phase 12: delay/force ---
+        globalVars.put("delay", (BuiltinFunction) args -> {
+            // Note: in real Clojure, delay is a macro. Here we treat it as a builtin
+            // that takes a thunk (fn of no args)
+            checkArity(args, 1, "delay");
+            Object thunk = args[0];
+            return new Object() {
+                private volatile Object value;
+                private volatile boolean realized = false;
+                public synchronized Object deref() {
+                    if (!realized) {
+                        value = callFunction(thunk, new Object[0]);
+                        realized = true;
+                    }
+                    return value;
+                }
+                public boolean isRealized() { return realized; }
+                @Override public String toString() {
+                    return realized ? "#delay[" + value + "]" : "#delay[:pending]";
+                }
+            };
+        });
+
+        globalVars.put("force", (BuiltinFunction) args -> {
+            checkArity(args, 1, "force");
+            Object x = args[0];
+            try {
+                java.lang.reflect.Method m = x.getClass().getMethod("deref");
+                return m.invoke(x);
+            } catch (Exception e) {
+                return x; // If not a delay, return as-is
+            }
+        });
+
+        // --- Phase 12: Java array interop ---
+        globalVars.put("make-array", (BuiltinFunction) args -> {
+            if (args.length < 2) throw new RuntimeException("make-array: expected at least 2 args");
+            Class<?> clazz = (Class<?>) args[0];
+            int size = ((Number) args[1]).intValue();
+            return java.lang.reflect.Array.newInstance(clazz, size);
+        });
+
+        globalVars.put("object-array", (BuiltinFunction) args -> {
+            checkArity(args, 1, "object-array");
+            if (args[0] instanceof Number n) {
+                return new Object[n.intValue()];
+            }
+            // Convert collection to array
+            java.util.List<Object> items = new ArrayList<>();
+            for (clojure.lang.ISeq seq = clojure.lang.RT.seq(args[0]); seq != null; seq = seq.next()) {
+                items.add(seq.first());
+            }
+            return items.toArray();
+        });
+
+        globalVars.put("to-array", (BuiltinFunction) args -> {
+            checkArity(args, 1, "to-array");
+            java.util.List<Object> items = new ArrayList<>();
+            for (clojure.lang.ISeq seq = clojure.lang.RT.seq(args[0]); seq != null; seq = seq.next()) {
+                items.add(seq.first());
+            }
+            return items.toArray();
+        });
+
+        globalVars.put("into-array", (BuiltinFunction) args -> {
+            if (args.length == 1) {
+                java.util.List<Object> items = new ArrayList<>();
+                for (clojure.lang.ISeq seq = clojure.lang.RT.seq(args[0]); seq != null; seq = seq.next()) {
+                    items.add(seq.first());
+                }
+                return items.toArray();
+            }
+            checkArity(args, 2, "into-array");
+            Class<?> clazz = (Class<?>) args[0];
+            java.util.List<Object> items = new ArrayList<>();
+            for (clojure.lang.ISeq seq = clojure.lang.RT.seq(args[1]); seq != null; seq = seq.next()) {
+                items.add(seq.first());
+            }
+            Object arr = java.lang.reflect.Array.newInstance(clazz, items.size());
+            for (int i = 0; i < items.size(); i++) {
+                java.lang.reflect.Array.set(arr, i, items.get(i));
+            }
+            return arr;
+        });
+
+        globalVars.put("aset", (BuiltinFunction) args -> {
+            checkArity(args, 3, "aset");
+            int idx = ((Number) args[1]).intValue();
+            java.lang.reflect.Array.set(args[0], idx, args[2]);
+            return args[2];
+        });
+
+        globalVars.put("aget", (BuiltinFunction) args -> {
+            checkArity(args, 2, "aget");
+            int idx = ((Number) args[1]).intValue();
+            Object val = java.lang.reflect.Array.get(args[0], idx);
+            return val == null ? ClojureNil.INSTANCE : val;
+        });
+
+        globalVars.put("alength", (BuiltinFunction) args -> {
+            checkArity(args, 1, "alength");
+            return (long) java.lang.reflect.Array.getLength(args[0]);
+        });
+
+        globalVars.put("aclone", (BuiltinFunction) args -> {
+            checkArity(args, 1, "aclone");
+            int len = java.lang.reflect.Array.getLength(args[0]);
+            Object newArr = java.lang.reflect.Array.newInstance(
+                    args[0].getClass().getComponentType(), len);
+            System.arraycopy(args[0], 0, newArr, 0, len);
+            return newArr;
+        });
+
+        globalVars.put("array?", (BuiltinFunction) args -> {
+            checkArity(args, 1, "array?");
+            return args[0] != null && args[0].getClass().isArray();
+        });
+
+        // --- Phase 12: Protocol extension ---
+        globalVars.put("extend-type", (BuiltinFunction) args -> {
+            // (extend-type Type Protocol (method [args] body) ...)
+            // This is handled by the analyzer as a special form
+            throw new RuntimeException("extend-type should be handled by analyzer");
+        });
+
+        globalVars.put("satisfies?", (BuiltinFunction) args -> {
+            checkArity(args, 2, "satisfies?");
+            if (!(args[0] instanceof clojure.truffle.runtime.ClojureProtocol proto))
+                throw new RuntimeException("satisfies?: first arg must be a protocol");
+            Object obj = args[1];
+            String typeKey;
+            if (obj instanceof clojure.truffle.runtime.ClojureDeftypeInstance dti) {
+                typeKey = dti.getTypeName();
+            } else if (obj instanceof ClojureNil) {
+                typeKey = "nil";
+            } else {
+                typeKey = obj.getClass().getName();
+            }
+            // Check if any method of the protocol is implemented for this type
+            for (String methodName : proto.getMethodNames()) {
+                if (proto.resolve(methodName, typeKey) != null) return true;
+            }
+            return false;
+        });
+
+        globalVars.put("prefer-method", (BuiltinFunction) args -> {
+            checkArity(args, 3, "prefer-method");
+            if (!(args[0] instanceof ClojureMultiMethod mm))
+                throw new RuntimeException("prefer-method: first arg must be a multimethod");
+            mm.preferMethod(args[1], args[2]);
+            return mm;
+        });
+
+        globalVars.put("methods", (BuiltinFunction) args -> {
+            checkArity(args, 1, "methods");
+            if (!(args[0] instanceof ClojureMultiMethod mm))
+                throw new RuntimeException("methods: first arg must be a multimethod");
+            return mm.getMethodTable();
+        });
+
+        // --- Phase 12: Misc ---
+        globalVars.put("dorun", (BuiltinFunction) args -> {
+            if (args.length < 1) throw new RuntimeException("dorun: expected 1-2 args");
+            Object coll = args.length == 1 ? args[0] : args[1];
+            for (clojure.lang.ISeq seq = clojure.lang.RT.seq(coll); seq != null; seq = seq.next()) {
+                // force evaluation
+            }
+            return ClojureNil.INSTANCE;
+        });
+
+        globalVars.put("doall", (BuiltinFunction) args -> {
+            if (args.length < 1) throw new RuntimeException("doall: expected 1-2 args");
+            Object coll = args.length == 1 ? args[0] : args[1];
+            clojure.lang.ISeq seq = clojure.lang.RT.seq(coll);
+            if (seq == null) return clojure.lang.PersistentList.EMPTY;
+            // Force full realization
+            java.util.List<Object> items = new ArrayList<>();
+            for (; seq != null; seq = seq.next()) items.add(seq.first());
+            return clojure.lang.PersistentList.create(items);
+        });
+
+        globalVars.put("line-seq", (BuiltinFunction) args -> {
+            checkArity(args, 1, "line-seq");
+            java.io.BufferedReader rdr = (java.io.BufferedReader) args[0];
+            java.util.List<Object> lines = new ArrayList<>();
+            try {
+                String line;
+                while ((line = rdr.readLine()) != null) lines.add(line);
+            } catch (java.io.IOException e) {
+                throw new RuntimeException("line-seq: " + e.getMessage());
+            }
+            return clojure.lang.PersistentList.create(lines);
+        });
+
+        globalVars.put("with-out-str", (BuiltinFunction) args -> {
+            // This would need macro support, for now provide as a function taking a thunk
+            throw new RuntimeException("with-out-str is not yet supported as a function");
+        });
+
+        globalVars.put("time", (BuiltinFunction) args -> {
+            // time as a function taking a thunk
+            checkArity(args, 1, "time");
+            long start = System.nanoTime();
+            Object result = callFunction(args[0], new Object[0]);
+            long elapsed = System.nanoTime() - start;
+            PrintStream out = new PrintStream(env.out());
+            out.println("\"Elapsed time: " + (elapsed / 1000000.0) + " msecs\"");
+            return result;
+        });
+
+        globalVars.put("rand", (BuiltinFunction) args -> {
+            if (args.length == 0) return Math.random();
+            return Math.random() * ((Number) args[0]).doubleValue();
+        });
+
         // Copy all builtins into clojure.core namespace
         ClojureNamespace core = namespaces.get("clojure.core");
         if (core != null) {
@@ -4144,12 +4367,15 @@ public class ClojureContext {
     }
 
     private static Object clojureCons(Object elem, Object coll) {
-        if (coll instanceof ClojureNil) {
+        if (coll == null || coll instanceof ClojureNil) {
             return clojure.lang.PersistentList.create(java.util.List.of(elem));
         }
-        if (coll instanceof clojure.lang.Seqable s) {
-            clojure.lang.ISeq seq = s.seq();
+        if (coll instanceof clojure.lang.ISeq seq) {
+            // Don't call .seq() to avoid realizing lazy sequences
             return new clojure.lang.Cons(elem, seq);
+        }
+        if (coll instanceof clojure.lang.Seqable s) {
+            return new clojure.lang.Cons(elem, s.seq());
         }
         throw new RuntimeException("cons: not a sequence: " + coll);
     }

@@ -266,6 +266,9 @@ public class Analyzer {
                     case "with-open":   return analyzeWithOpen(seq);
                     case "reify":       return analyzeReify(seq);
                     case "proxy":       return analyzeReify(seq); // similar handling
+                    case "extend-type": return analyzeExtendType(seq);
+                    case "extend-protocol": return analyzeExtendProtocol(seq);
+                    case "delay":       return analyzeDelay(seq);
                 }
             }
             // Static method call: (Class/method args...)
@@ -378,10 +381,21 @@ public class Analyzer {
     }
 
     private ExpressionNode analyzeConstructor(String className, ISeq args) {
-        Class<?> clazz = JavaInteropUtil.resolveClass(className);
-        List<ExpressionNode> argList = new ArrayList<>();
-        while (args != null) { argList.add(analyze(args.first())); args = args.next(); }
-        return new JavaConstructorNode(clazz, argList.toArray(new ExpressionNode[0]));
+        // Try Java class first
+        try {
+            Class<?> clazz = JavaInteropUtil.resolveClass(className);
+            List<ExpressionNode> argList = new ArrayList<>();
+            while (args != null) { argList.add(analyze(args.first())); args = args.next(); }
+            return new JavaConstructorNode(clazz, argList.toArray(new ExpressionNode[0]));
+        } catch (RuntimeException e) {
+            // Not a Java class, try deftype constructor (->TypeName)
+            List<ExpressionNode> argList = new ArrayList<>();
+            while (args != null) { argList.add(analyze(args.first())); args = args.next(); }
+            // Look up ->ClassName constructor function
+            String ctorName = "->" + className;
+            return new InvokeNode(new SymbolNode(context, ctorName),
+                    argList.toArray(new ExpressionNode[0]));
+        }
     }
 
     private ExpressionNode analyzeNew(ISeq seq) {
@@ -957,7 +971,6 @@ public class Analyzer {
         // :when modifier
         if (key instanceof Keyword kw && kw.getName().equals("when")) {
             Object pred = bindings.nth(pos + 1);
-            // Wrap remaining in (when pred ...)
             ExpressionNode innerNode = analyzeForBindings(bindings, pos + 2, body);
             return new IfNode(analyze(pred), innerNode, new NilNode());
         }
@@ -965,7 +978,6 @@ public class Analyzer {
         // :let modifier
         if (key instanceof Keyword kw && kw.getName().equals("let")) {
             IPersistentVector letBindings = (IPersistentVector) bindings.nth(pos + 1);
-            // Wrap remaining in (let [...] ...)
             Object innerForm = buildForInner(bindings, pos + 2, body);
             return analyze(RT.list(Symbol.intern("let"), letBindings, innerForm));
         }
@@ -1114,21 +1126,28 @@ public class Analyzer {
         String nsName = nsSym.getName();
         args = args.next();
 
-        // Collect require directives
+        // Collect require and import directives
         List<Object> requireSpecs = new ArrayList<>();
+        List<Object> importSpecs = new ArrayList<>();
         while (args != null) {
             Object directive = args.first();
             if (directive instanceof ISeq ds) {
                 Object head = ds.first();
-                if (head instanceof Keyword kw && kw.getName().equals("require")) {
-                    for (ISeq specs = ds.next(); specs != null; specs = specs.next())
-                        requireSpecs.add(specs.first());
+                if (head instanceof Keyword kw) {
+                    if (kw.getName().equals("require")) {
+                        for (ISeq specs = ds.next(); specs != null; specs = specs.next())
+                            requireSpecs.add(specs.first());
+                    } else if (kw.getName().equals("import")) {
+                        for (ISeq specs = ds.next(); specs != null; specs = specs.next())
+                            importSpecs.add(specs.first());
+                    }
                 }
             }
             args = args.next();
         }
 
         List<Object> capturedSpecs = List.copyOf(requireSpecs);
+        List<Object> capturedImports = List.copyOf(importSpecs);
         return new ExpressionNode() {
             @Override
             public Object executeGeneric(com.oracle.truffle.api.frame.VirtualFrame frame) {
@@ -1141,6 +1160,10 @@ public class Analyzer {
                 // Process requires
                 for (Object spec : capturedSpecs) {
                     processRequireSpec(spec);
+                }
+                // Process imports: (:import [java.util ArrayList HashMap])
+                for (Object spec : capturedImports) {
+                    processImportSpec(spec);
                 }
                 return ClojureNil.INSTANCE;
             }
@@ -1950,6 +1973,159 @@ public class Analyzer {
         }
         if (nodes.isEmpty()) return new NilNode();
         return new DoNode(nodes.toArray(new ExpressionNode[0]));
+    }
+
+    private ExpressionNode analyzeDelay(ISeq seq) {
+        // (delay body) => (delay (fn [] body))
+        ISeq args = seq.next();
+        List<Object> body = new ArrayList<>();
+        while (args != null) { body.add(args.first()); args = args.next(); }
+        List<Object> doForm = new ArrayList<>();
+        doForm.add(Symbol.intern("do"));
+        doForm.addAll(body);
+        Object fnForm = RT.list(Symbol.intern("fn"), PersistentVector.EMPTY, PersistentList.create(doForm));
+        // Call the builtin delay function directly, not recurse through analyze
+        ExpressionNode fnNode = analyze(fnForm);
+        return new InvokeNode(new SymbolNode(context, "delay"), new ExpressionNode[]{fnNode});
+    }
+
+    private ExpressionNode analyzeExtendType(ISeq seq) {
+        // (extend-type Type Protocol (method [this args] body) ...)
+        ISeq args = seq.next();
+        if (args == null) throw err("extend-type: missing type");
+        Object typeForm = args.first();
+        args = args.next();
+
+        // For deftype types (symbols that aren't Java classes), use the type name as string key
+        ExpressionNode typeNode;
+        if (typeForm instanceof Symbol typeSym) {
+            // Try Java class first
+            try {
+                Class<?> clazz = JavaInteropUtil.resolveClass(typeSym.getName());
+                typeNode = new QuoteNode(clazz);
+            } catch (RuntimeException e) {
+                // Not a Java class - use type name string (for deftype types)
+                typeNode = new QuoteNode(typeSym.getName());
+            }
+        } else {
+            typeNode = analyze(typeForm);
+        }
+
+        List<ExpressionNode> nodes = new ArrayList<>();
+        while (args != null) {
+            // Protocol name
+            Object protoForm = args.first();
+            args = args.next();
+            // Collect methods until next symbol (protocol) or end
+            java.util.Map<String, Object> methodForms = new java.util.LinkedHashMap<>();
+            while (args != null && args.first() instanceof ISeq) {
+                ISeq methodDef = (ISeq) args.first();
+                String methodName = ((Symbol) methodDef.first()).getName();
+                // Build fn form
+                List<Object> fnParts = new ArrayList<>();
+                fnParts.add(Symbol.intern("fn"));
+                ISeq rest = methodDef.next();
+                while (rest != null) { fnParts.add(rest.first()); rest = rest.next(); }
+                methodForms.put(methodName, PersistentList.create(fnParts));
+                args = args.next();
+            }
+            nodes.add(new ExtendTypeNode(context, typeNode, analyze(protoForm),
+                    methodForms, this));
+        }
+        if (nodes.size() == 1) return nodes.get(0);
+        return new DoNode(nodes.toArray(new ExpressionNode[0]));
+    }
+
+    private ExpressionNode analyzeExtendProtocol(ISeq seq) {
+        // (extend-protocol Protocol Type1 (method ...) Type2 (method ...) ...)
+        ISeq args = seq.next();
+        if (args == null) throw err("extend-protocol: missing protocol");
+        Object protoForm = args.first();
+        args = args.next();
+
+        List<ExpressionNode> nodes = new ArrayList<>();
+        while (args != null) {
+            // Type name
+            Object typeForm = args.first();
+            args = args.next();
+            java.util.Map<String, Object> methodForms = new java.util.LinkedHashMap<>();
+            while (args != null && args.first() instanceof ISeq) {
+                ISeq methodDef = (ISeq) args.first();
+                String methodName = ((Symbol) methodDef.first()).getName();
+                List<Object> fnParts = new ArrayList<>();
+                fnParts.add(Symbol.intern("fn"));
+                ISeq rest = methodDef.next();
+                while (rest != null) { fnParts.add(rest.first()); rest = rest.next(); }
+                methodForms.put(methodName, PersistentList.create(fnParts));
+                args = args.next();
+            }
+            // Resolve type: Java class or deftype name string
+            ExpressionNode typeNode;
+            if (typeForm instanceof Symbol typeSym) {
+                try {
+                    Class<?> clazz = JavaInteropUtil.resolveClass(typeSym.getName());
+                    typeNode = new QuoteNode(clazz);
+                } catch (RuntimeException e) {
+                    typeNode = new QuoteNode(typeSym.getName());
+                }
+            } else {
+                typeNode = analyze(typeForm);
+            }
+            nodes.add(new ExtendTypeNode(context, typeNode, analyze(protoForm),
+                    methodForms, this));
+        }
+        if (nodes.isEmpty()) return new NilNode();
+        if (nodes.size() == 1) return nodes.get(0);
+        return new DoNode(nodes.toArray(new ExpressionNode[0]));
+    }
+
+    private void processImportSpec(Object spec) {
+        if (spec instanceof Symbol sym) {
+            // (import java.util.ArrayList) - import single class
+            String fqn = sym.getName();
+            try {
+                Class<?> clazz = Class.forName(fqn);
+                String simpleName = clazz.getSimpleName();
+                context.setVar(simpleName, clazz);
+            } catch (ClassNotFoundException e) {
+                throw new RuntimeException("import: class not found: " + fqn);
+            }
+        } else if (spec instanceof IPersistentVector v) {
+            // [java.util ArrayList HashMap] - package prefix form
+            if (v.count() < 2) return;
+            String pkg = ((Symbol) v.nth(0)).getName();
+            for (int i = 1; i < v.count(); i++) {
+                String className = ((Symbol) v.nth(i)).getName();
+                String fqn = pkg + "." + className;
+                try {
+                    Class<?> clazz = Class.forName(fqn);
+                    context.setVar(className, clazz);
+                } catch (ClassNotFoundException e) {
+                    throw new RuntimeException("import: class not found: " + fqn);
+                }
+            }
+        } else if (spec instanceof ISeq sl) {
+            // (java.util ArrayList HashMap) - list form
+            Object first = sl.first();
+            if (first instanceof Symbol pkgSym) {
+                String pkg = pkgSym.getName();
+                for (ISeq rest = sl.next(); rest != null; rest = rest.next()) {
+                    String className = ((Symbol) rest.first()).getName();
+                    String fqn = pkg + "." + className;
+                    try {
+                        Class<?> clazz = Class.forName(fqn);
+                        context.setVar(className, clazz);
+                    } catch (ClassNotFoundException e) {
+                        throw new RuntimeException("import: class not found: " + fqn);
+                    }
+                }
+            }
+        }
+    }
+
+    // Expose analyze for ExtendTypeNode
+    public ExpressionNode analyzePublic(Object form) {
+        return analyze(form);
     }
 
     private ExpressionNode analyzeWithOpen(ISeq seq) {
