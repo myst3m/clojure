@@ -232,7 +232,7 @@ public class Analyzer {
                     case "defmethod":   return analyzeDefmethod(seq);
                     case "defprotocol": return analyzeDefprotocol(seq);
                     case "deftype":     return analyzeDeftype(seq);
-                    case "defrecord":   return analyzeDeftype(seq); // same as deftype for now
+                    case "defrecord":   return analyzeDefrecord(seq);
                     case "ns":          return analyzeNs(seq);
                     case "in-ns":       return analyzeInNs(seq);
                     case "require":     return analyzeRequire(seq);
@@ -272,6 +272,7 @@ public class Analyzer {
                     case "delay":       return analyzeDelay(seq);
                     case "future":      return analyzeFuture(seq);
                     case "locking":     return analyzeLocking(seq);
+                    case "dosync":      return analyzeDo(seq); // simplified: just execute body
                 }
             }
             // Static method call: (Class/method args...)
@@ -601,6 +602,98 @@ public class Analyzer {
                         throw new RuntimeException("->" + typeName + ": expected " +
                                 capturedFieldNames.size() + " args");
                     return new ClojureDeftypeInstance(typeName, ctorArgs.clone(), fieldIdx);
+                });
+
+                // Register protocol implementations
+                for (var entry : capturedProtoMethods.entrySet()) {
+                    String protoName = entry.getKey();
+                    Object protoObj = context.getVar(protoName);
+                    if (protoObj instanceof ClojureProtocol proto) {
+                        java.util.Map<String, Object> methodMap = new java.util.HashMap<>();
+                        for (var methodEntry : entry.getValue().entrySet()) {
+                            Object fn = methodEntry.getValue().executeGeneric(frame);
+                            methodMap.put(methodEntry.getKey(), fn);
+                        }
+                        proto.extend(typeName, methodMap);
+                    }
+                }
+                return ClojureNil.INSTANCE;
+            }
+        };
+    }
+
+    private ExpressionNode analyzeDefrecord(ISeq seq) {
+        // defrecord is like deftype but also registers map->TypeName constructor
+        ISeq args = seq.next();
+        if (args == null) throw err("defrecord: missing name");
+        if (!(args.first() instanceof Symbol typeSym)) throw err("defrecord: name must be a symbol");
+        String typeName = typeSym.getName();
+        args = args.next();
+        if (args == null) throw err("defrecord: missing fields");
+        if (!(args.first() instanceof IPersistentVector fieldVec)) throw err("defrecord: fields must be a vector");
+
+        List<String> fieldNames = new ArrayList<>();
+        for (int i = 0; i < fieldVec.count(); i++) {
+            if (!(fieldVec.nth(i) instanceof Symbol fs)) throw err("defrecord: field must be a symbol");
+            fieldNames.add(fs.getName());
+        }
+        args = args.next();
+
+        // Parse protocol implementations (same as deftype)
+        java.util.Map<String, java.util.Map<String, ExpressionNode>> protoMethods = new java.util.LinkedHashMap<>();
+        String currentProto = null;
+        while (args != null) {
+            Object form = args.first();
+            if (form instanceof Symbol protoSym) {
+                currentProto = protoSym.getName();
+                protoMethods.putIfAbsent(currentProto, new java.util.LinkedHashMap<>());
+            } else if (form instanceof ISeq methodSeq && currentProto != null) {
+                if (!(methodSeq.first() instanceof Symbol methodSym))
+                    throw err("defrecord: method name must be a symbol");
+                String methodName = methodSym.getName();
+                ISeq methodArgs = methodSeq.next();
+                if (methodArgs == null || !(methodArgs.first() instanceof IPersistentVector))
+                    throw err("defrecord: method must have param vector");
+                IPersistentVector methodParams = (IPersistentVector) methodArgs.first();
+                ISeq methodBody = methodArgs.next();
+                ExpressionNode methodFn = compileDeftypeMethod(typeName, fieldNames, methodParams, methodBody);
+                protoMethods.get(currentProto).put(methodName, methodFn);
+            }
+            args = args.next();
+        }
+
+        List<String> capturedFieldNames = List.copyOf(fieldNames);
+        java.util.Map<String, java.util.Map<String, ExpressionNode>> capturedProtoMethods =
+                new java.util.LinkedHashMap<>(protoMethods);
+
+        return new ExpressionNode() {
+            @Override
+            public Object executeGeneric(com.oracle.truffle.api.frame.VirtualFrame frame) {
+                java.util.Map<String, Integer> fieldIdx = new java.util.LinkedHashMap<>();
+                for (int i = 0; i < capturedFieldNames.size(); i++)
+                    fieldIdx.put(capturedFieldNames.get(i), i);
+
+                // Register ->TypeName positional constructor
+                context.setVar("->" + typeName, (ClojureContext.BuiltinFunction) ctorArgs -> {
+                    if (ctorArgs.length != capturedFieldNames.size())
+                        throw new RuntimeException("->" + typeName + ": expected " +
+                                capturedFieldNames.size() + " args");
+                    return new ClojureDeftypeInstance(typeName, ctorArgs.clone(), fieldIdx);
+                });
+
+                // Register map->TypeName map-based constructor
+                context.setVar("map->" + typeName, (ClojureContext.BuiltinFunction) ctorArgs -> {
+                    if (ctorArgs.length != 1)
+                        throw new RuntimeException("map->" + typeName + ": expected 1 arg (a map)");
+                    Object mapArg = ctorArgs[0];
+                    if (!(mapArg instanceof clojure.lang.IPersistentMap m))
+                        throw new RuntimeException("map->" + typeName + ": arg must be a map");
+                    Object[] fieldValues = new Object[capturedFieldNames.size()];
+                    for (int i = 0; i < capturedFieldNames.size(); i++) {
+                        clojure.lang.Keyword kw = clojure.lang.Keyword.intern(capturedFieldNames.get(i));
+                        fieldValues[i] = m.valAt(kw);
+                    }
+                    return new ClojureDeftypeInstance(typeName, fieldValues, fieldIdx);
                 });
 
                 // Register protocol implementations

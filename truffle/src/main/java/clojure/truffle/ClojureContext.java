@@ -174,6 +174,10 @@ public class ClojureContext {
             registerEdnNamespace();
             return;
         }
+        if (nsName.equals("clojure.java.io")) {
+            registerJavaIoNamespace();
+            return;
+        }
         if (!loadingNamespaces.add(nsName))
             throw new RuntimeException("Circular require detected: " + nsName);
         try {
@@ -1752,8 +1756,9 @@ public class ClojureContext {
         globalVars.put("future-call", (BuiltinFunction) args -> {
             checkArity(args, 1, "future-call");
             Object fn = args[0];
-            java.util.concurrent.Future<Object> future = java.util.concurrent.Executors
-                    .newSingleThreadExecutor().submit(() -> callFunction(fn, new Object[0]));
+            java.util.concurrent.ExecutorService exec = java.util.concurrent.Executors
+                    .newSingleThreadExecutor(r -> { Thread t = new Thread(r); t.setDaemon(true); return t; });
+            java.util.concurrent.Future<Object> future = exec.submit(() -> callFunction(fn, new Object[0]));
             return future;
         });
 
@@ -2676,6 +2681,8 @@ public class ClojureContext {
             Object ref = args[0];
             if (ref instanceof ClojureAtom atom) return atom.deref();
             if (ref instanceof ClojureVolatile vol) return vol.deref();
+            if (ref instanceof clojure.truffle.runtime.ClojureAgent ag) return ag.deref();
+            if (ref instanceof clojure.truffle.runtime.ClojureRef r) return r.deref();
             if (ref instanceof ClojurePromise p) {
                 if (args.length == 3) {
                     long timeout = ((Number) args[1]).longValue();
@@ -4280,6 +4287,104 @@ public class ClojureContext {
             return false;
         });
 
+        // --- Phase 15 builtins ---
+
+        // Agents
+        globalVars.put("agent", (BuiltinFunction) args -> {
+            checkArity(args, 1, "agent");
+            return new clojure.truffle.runtime.ClojureAgent(args[0]);
+        });
+
+        globalVars.put("send", (BuiltinFunction) args -> {
+            if (args.length < 2) throw new RuntimeException("send: expected at least 2 args");
+            if (!(args[0] instanceof clojure.truffle.runtime.ClojureAgent ag))
+                throw new RuntimeException("send: first arg must be an agent");
+            Object fn = args[1];
+            Object[] extraArgs = new Object[args.length - 2];
+            System.arraycopy(args, 2, extraArgs, 0, extraArgs.length);
+            ag.send(fn, extraArgs, this);
+            return ag;
+        });
+
+        globalVars.put("send-off", (BuiltinFunction) args -> {
+            // Same as send for our simplified implementation
+            if (args.length < 2) throw new RuntimeException("send-off: expected at least 2 args");
+            if (!(args[0] instanceof clojure.truffle.runtime.ClojureAgent ag))
+                throw new RuntimeException("send-off: first arg must be an agent");
+            Object fn = args[1];
+            Object[] extraArgs = new Object[args.length - 2];
+            System.arraycopy(args, 2, extraArgs, 0, extraArgs.length);
+            ag.send(fn, extraArgs, this);
+            return ag;
+        });
+
+        globalVars.put("await", (BuiltinFunction) args -> {
+            // Simple implementation: sleep briefly to let agent actions complete
+            try { Thread.sleep(100); } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            return ClojureNil.INSTANCE;
+        });
+
+        globalVars.put("agent-error", (BuiltinFunction) args -> {
+            checkArity(args, 1, "agent-error");
+            if (!(args[0] instanceof clojure.truffle.runtime.ClojureAgent ag))
+                throw new RuntimeException("agent-error: first arg must be an agent");
+            Throwable err = ag.getError();
+            return err != null ? err : ClojureNil.INSTANCE;
+        });
+
+        globalVars.put("restart-agent", (BuiltinFunction) args -> {
+            checkArity(args, 2, "restart-agent");
+            if (!(args[0] instanceof clojure.truffle.runtime.ClojureAgent ag))
+                throw new RuntimeException("restart-agent: first arg must be an agent");
+            ag.restart(args[1]);
+            return ag;
+        });
+
+        globalVars.put("agent?", (BuiltinFunction) args -> {
+            checkArity(args, 1, "agent?");
+            return args[0] instanceof clojure.truffle.runtime.ClojureAgent;
+        });
+
+        // Refs (simplified, no real STM)
+        globalVars.put("ref", (BuiltinFunction) args -> {
+            checkArity(args, 1, "ref");
+            return new clojure.truffle.runtime.ClojureRef(args[0]);
+        });
+
+        globalVars.put("ref-set", (BuiltinFunction) args -> {
+            checkArity(args, 2, "ref-set");
+            if (!(args[0] instanceof clojure.truffle.runtime.ClojureRef r))
+                throw new RuntimeException("ref-set: first arg must be a ref");
+            return r.refSet(args[1]);
+        });
+
+        globalVars.put("alter", (BuiltinFunction) args -> {
+            if (args.length < 2) throw new RuntimeException("alter: expected at least 2 args");
+            if (!(args[0] instanceof clojure.truffle.runtime.ClojureRef r))
+                throw new RuntimeException("alter: first arg must be a ref");
+            Object fn = args[1];
+            Object[] moreArgs = new Object[args.length - 2];
+            System.arraycopy(args, 2, moreArgs, 0, moreArgs.length);
+            return r.alter(fn, moreArgs, this);
+        });
+
+        globalVars.put("commute", (BuiltinFunction) args -> {
+            if (args.length < 2) throw new RuntimeException("commute: expected at least 2 args");
+            if (!(args[0] instanceof clojure.truffle.runtime.ClojureRef r))
+                throw new RuntimeException("commute: first arg must be a ref");
+            Object fn = args[1];
+            Object[] moreArgs = new Object[args.length - 2];
+            System.arraycopy(args, 2, moreArgs, 0, moreArgs.length);
+            return r.commute(fn, moreArgs, this);
+        });
+
+        globalVars.put("ref?", (BuiltinFunction) args -> {
+            checkArity(args, 1, "ref?");
+            return args[0] instanceof clojure.truffle.runtime.ClojureRef;
+        });
+
         // --- Phase 14 builtins ---
 
         // identical?
@@ -4379,7 +4484,8 @@ public class ClojureContext {
             java.util.List<java.util.concurrent.Future<Object>> futures = new ArrayList<>();
             java.util.concurrent.ExecutorService executor =
                     java.util.concurrent.Executors.newFixedThreadPool(
-                            Math.min(items.size(), Runtime.getRuntime().availableProcessors() + 2));
+                            Math.min(items.size(), Runtime.getRuntime().availableProcessors() + 2),
+                            r -> { Thread t = new Thread(r); t.setDaemon(true); return t; });
             try {
                 for (Object item : items) {
                     futures.add(executor.submit(() -> callFunction(f, new Object[]{item})));
@@ -4911,6 +5017,104 @@ public class ClojureContext {
         ClojureNamespace ns = getOrCreateNamespace("clojure.edn");
         Object readStr = globalVars.get("read-string");
         if (readStr != null) ns.intern("read-string", readStr);
+    }
+
+    private void registerJavaIoNamespace() {
+        ClojureNamespace ns = getOrCreateNamespace("clojure.java.io");
+
+        ns.intern("reader", (BuiltinFunction) args -> {
+            if (args.length < 1) throw new RuntimeException("reader: expected at least 1 arg");
+            Object x = args[0];
+            try {
+                if (x instanceof String s) {
+                    return new java.io.BufferedReader(new java.io.FileReader(s));
+                }
+                if (x instanceof java.io.File f) {
+                    return new java.io.BufferedReader(new java.io.FileReader(f));
+                }
+                if (x instanceof java.io.InputStream is) {
+                    return new java.io.BufferedReader(new java.io.InputStreamReader(is));
+                }
+                if (x instanceof java.io.Reader r) {
+                    return (r instanceof java.io.BufferedReader) ? r : new java.io.BufferedReader(r);
+                }
+                throw new RuntimeException("reader: cannot coerce to reader: " + x.getClass().getName());
+            } catch (java.io.FileNotFoundException e) {
+                throw new RuntimeException("reader: " + e.getMessage());
+            }
+        });
+
+        ns.intern("writer", (BuiltinFunction) args -> {
+            if (args.length < 1) throw new RuntimeException("writer: expected at least 1 arg");
+            Object x = args[0];
+            try {
+                if (x instanceof String s) {
+                    return new java.io.BufferedWriter(new java.io.FileWriter(s));
+                }
+                if (x instanceof java.io.File f) {
+                    return new java.io.BufferedWriter(new java.io.FileWriter(f));
+                }
+                if (x instanceof java.io.OutputStream os) {
+                    return new java.io.BufferedWriter(new java.io.OutputStreamWriter(os));
+                }
+                if (x instanceof java.io.Writer w) {
+                    return (w instanceof java.io.BufferedWriter) ? w : new java.io.BufferedWriter(w);
+                }
+                throw new RuntimeException("writer: cannot coerce to writer: " + x.getClass().getName());
+            } catch (java.io.IOException e) {
+                throw new RuntimeException("writer: " + e.getMessage());
+            }
+        });
+
+        ns.intern("file", (BuiltinFunction) args -> {
+            if (args.length == 1) return new java.io.File(args[0].toString());
+            if (args.length == 2) return new java.io.File(args[0].toString(), args[1].toString());
+            throw new RuntimeException("file: expected 1 or 2 args");
+        });
+
+        ns.intern("input-stream", (BuiltinFunction) args -> {
+            checkArity(args, 1, "input-stream");
+            Object x = args[0];
+            try {
+                if (x instanceof String s) return new java.io.FileInputStream(s);
+                if (x instanceof java.io.File f) return new java.io.FileInputStream(f);
+                if (x instanceof java.io.InputStream is) return is;
+                throw new RuntimeException("input-stream: cannot coerce: " + x.getClass().getName());
+            } catch (java.io.FileNotFoundException e) {
+                throw new RuntimeException("input-stream: " + e.getMessage());
+            }
+        });
+
+        ns.intern("output-stream", (BuiltinFunction) args -> {
+            checkArity(args, 1, "output-stream");
+            Object x = args[0];
+            try {
+                if (x instanceof String s) return new java.io.FileOutputStream(s);
+                if (x instanceof java.io.File f) return new java.io.FileOutputStream(f);
+                if (x instanceof java.io.OutputStream os) return os;
+                throw new RuntimeException("output-stream: cannot coerce: " + x.getClass().getName());
+            } catch (java.io.FileNotFoundException e) {
+                throw new RuntimeException("output-stream: " + e.getMessage());
+            }
+        });
+
+        ns.intern("delete-file", (BuiltinFunction) args -> {
+            if (args.length < 1) throw new RuntimeException("delete-file: expected 1 arg");
+            java.io.File f = (args[0] instanceof java.io.File) ?
+                    (java.io.File) args[0] : new java.io.File(args[0].toString());
+            boolean deleted = f.delete();
+            if (!deleted && (args.length < 2 || isTruthy(args[1])))
+                throw new RuntimeException("delete-file: could not delete " + f);
+            return deleted;
+        });
+
+        ns.intern("make-parents", (BuiltinFunction) args -> {
+            checkArity(args, 1, "make-parents");
+            java.io.File f = (args[0] instanceof java.io.File) ?
+                    (java.io.File) args[0] : new java.io.File(args[0].toString());
+            java.io.File parent = f.getParentFile();
+            return parent != null && parent.mkdirs();
+        });
     }
 
     private static java.util.Set<Class<?>> clojure_allInterfaces(Class<?> clazz) {
