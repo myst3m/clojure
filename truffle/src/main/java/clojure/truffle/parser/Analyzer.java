@@ -8,6 +8,7 @@ import clojure.truffle.nodes.interop.*;
 import clojure.truffle.runtime.ClojureDeftypeInstance;
 import clojure.truffle.runtime.ClojureFunction;
 import clojure.truffle.runtime.ClojureMultiMethod;
+import clojure.truffle.runtime.ClojureNamespace;
 import clojure.truffle.runtime.ClojureNil;
 import clojure.truffle.runtime.ClojureProtocol;
 import clojure.truffle.runtime.MultiArityFunction;
@@ -213,6 +214,9 @@ public class Analyzer {
                     case "defprotocol": return analyzeDefprotocol(seq);
                     case "deftype":     return analyzeDeftype(seq);
                     case "defrecord":   return analyzeDeftype(seq); // same as deftype for now
+                    case "ns":          return analyzeNs(seq);
+                    case "in-ns":       return analyzeInNs(seq);
+                    case "require":     return analyzeRequire(seq);
                     case "do-template": return analyzeDo(seq); // fallback
                 }
             }
@@ -278,9 +282,25 @@ public class Analyzer {
     // --- Java Interop ---
 
     private boolean isJavaClassName(String name) {
-        // Heuristic: starts with uppercase, or contains '.' (like java.util.List)
         if (name.isEmpty()) return false;
-        if (name.contains(".")) return true;
+        // If it looks like a Clojure namespace (registered or contains lowercase first segment), not Java
+        if (name.contains(".")) {
+            // Check: if first segment starts with lowercase and matches known Clojure patterns, skip
+            String firstSeg = name.contains(".") ? name.substring(0, name.indexOf('.')) : name;
+            if (Character.isLowerCase(firstSeg.charAt(0))) {
+                // Check if there's a registered var with this prefix (e.g., clojure.string/split)
+                // Also check known Clojure namespace patterns
+                if (name.startsWith("clojure.") || name.startsWith("user.")) return false;
+                // Try to resolve as Java class
+                try {
+                    Class.forName(name);
+                    return true;
+                } catch (ClassNotFoundException e) {
+                    return false;
+                }
+            }
+            return true; // e.g., java.util.List
+        }
         return Character.isUpperCase(name.charAt(0));
     }
 
@@ -574,6 +594,121 @@ public class Analyzer {
             fnSeq = RT.list(Symbol.intern("fn*"), params, wrappedBody);
         }
         return analyzeFn(fnSeq);
+    }
+
+    // --- Namespace ---
+
+    private ExpressionNode analyzeNs(ISeq seq) {
+        // (ns my.ns (:require [some.ns :as s]) (:require [other.ns :refer [foo]]))
+        ISeq args = seq.next();
+        if (args == null) throw err("ns: missing name");
+        if (!(args.first() instanceof Symbol nsSym)) throw err("ns: name must be a symbol");
+        String nsName = nsSym.getName();
+        args = args.next();
+
+        // Collect require directives
+        List<Object> requireSpecs = new ArrayList<>();
+        while (args != null) {
+            Object directive = args.first();
+            if (directive instanceof ISeq ds) {
+                Object head = ds.first();
+                if (head instanceof Keyword kw && kw.getName().equals("require")) {
+                    for (ISeq specs = ds.next(); specs != null; specs = specs.next())
+                        requireSpecs.add(specs.first());
+                }
+            }
+            args = args.next();
+        }
+
+        List<Object> capturedSpecs = List.copyOf(requireSpecs);
+        return new ExpressionNode() {
+            @Override
+            public Object executeGeneric(com.oracle.truffle.api.frame.VirtualFrame frame) {
+                context.getOrCreateNamespace(nsName);
+                context.setCurrentNamespace(nsName);
+                // Refer all of clojure.core
+                ClojureNamespace ns = context.getNamespace(nsName);
+                ClojureNamespace core = context.getNamespace("clojure.core");
+                if (core != null) ns.referAll(core);
+                // Process requires
+                for (Object spec : capturedSpecs) {
+                    processRequireSpec(spec);
+                }
+                return ClojureNil.INSTANCE;
+            }
+        };
+    }
+
+    private ExpressionNode analyzeInNs(ISeq seq) {
+        ISeq args = seq.next();
+        if (args == null) throw err("in-ns: missing name");
+        ExpressionNode nameNode = analyze(args.first());
+        return new ExpressionNode() {
+            @Child ExpressionNode nsNode = nameNode;
+            @Override
+            public Object executeGeneric(com.oracle.truffle.api.frame.VirtualFrame frame) {
+                Object name = nsNode.executeGeneric(frame);
+                String nsName;
+                if (name instanceof clojure.lang.Symbol sym) nsName = sym.getName();
+                else nsName = name.toString();
+                context.getOrCreateNamespace(nsName);
+                context.setCurrentNamespace(nsName);
+                return ClojureNil.INSTANCE;
+            }
+        };
+    }
+
+    private ExpressionNode analyzeRequire(ISeq seq) {
+        ISeq args = seq.next();
+        List<Object> specs = new ArrayList<>();
+        while (args != null) {
+            specs.add(args.first());
+            args = args.next();
+        }
+        List<Object> capturedSpecs = List.copyOf(specs);
+        return new ExpressionNode() {
+            @Override
+            public Object executeGeneric(com.oracle.truffle.api.frame.VirtualFrame frame) {
+                for (Object spec : capturedSpecs) processRequireSpec(spec);
+                return ClojureNil.INSTANCE;
+            }
+        };
+    }
+
+    private void processRequireSpec(Object spec) {
+        if (spec instanceof Symbol sym) {
+            // Simple require: (require 'some.ns)
+            context.loadNamespace(sym.getName());
+        } else if (spec instanceof IPersistentVector v) {
+            // [some.ns :as s] or [some.ns :refer [foo bar]]
+            if (v.count() == 0) return;
+            String nsName = ((Symbol) v.nth(0)).getName();
+            context.loadNamespace(nsName);
+            ClojureNamespace reqNs = context.getNamespace(nsName);
+            ClojureNamespace currentNs = context.getNamespace(context.getCurrentNamespace());
+            if (reqNs == null || currentNs == null) return;
+
+            for (int i = 1; i < v.count(); i += 2) {
+                Object key = v.nth(i);
+                if (key instanceof Keyword kw) {
+                    if (kw.getName().equals("as") && i + 1 < v.count()) {
+                        String alias = ((Symbol) v.nth(i + 1)).getName();
+                        currentNs.alias(alias, reqNs);
+                    } else if (kw.getName().equals("refer") && i + 1 < v.count()) {
+                        Object referSpec = v.nth(i + 1);
+                        if (referSpec instanceof Keyword rk && rk.getName().equals("all")) {
+                            currentNs.referAll(reqNs);
+                        } else if (referSpec instanceof IPersistentVector rv) {
+                            for (int j = 0; j < rv.count(); j++) {
+                                String symName = ((Symbol) rv.nth(j)).getName();
+                                Object val = reqNs.resolve(symName);
+                                if (val != null) currentNs.refer(symName, val);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // --- Destructuring ---
