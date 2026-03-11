@@ -14,10 +14,13 @@ public class Main {
 
     public static void main(String[] args) throws Exception {
         String classpath = null;
+        String evalExpr = null;
         List<String> remaining = new ArrayList<>();
         for (int i = 0; i < args.length; i++) {
             if (("-cp".equals(args[i]) || "-classpath".equals(args[i])) && i + 1 < args.length) {
                 classpath = args[++i];
+            } else if ("-e".equals(args[i]) && i + 1 < args.length) {
+                evalExpr = args[++i];
             } else {
                 remaining.add(args[i]);
             }
@@ -28,7 +31,9 @@ public class Main {
             System.setProperty("clojure.truffle.classpath", classpath);
         }
 
-        if (remaining.size() > 0 && remaining.get(0).endsWith(".clj")) {
+        if (evalExpr != null) {
+            evalAndPrint(evalExpr);
+        } else if (remaining.size() > 0 && (remaining.get(0).endsWith(".clj") || remaining.get(0).endsWith(".cljc"))) {
             String code = Files.readString(Path.of(remaining.get(0)));
             evalAndPrint(code);
         } else if (remaining.size() > 0) {

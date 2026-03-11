@@ -19,6 +19,8 @@ public class ClojureDeftypeInstance implements TruffleObject, clojure.lang.ILook
     private final Map<String, Integer> fieldIndex;
     // Extra fields added via assoc (not part of original deftype/defrecord)
     private final clojure.lang.IPersistentMap extras;
+    // Per-type method implementations (IFn invoke, IDeref deref, etc.)
+    private Map<String, Object> methods;
 
     public ClojureDeftypeInstance(String typeName, Object[] fields, Map<String, Integer> fieldIndex) {
         this(typeName, fields, fieldIndex, clojure.lang.PersistentArrayMap.EMPTY);
@@ -31,6 +33,9 @@ public class ClojureDeftypeInstance implements TruffleObject, clojure.lang.ILook
         this.fieldIndex = fieldIndex;
         this.extras = extras;
     }
+
+    public void setMethods(Map<String, Object> methods) { this.methods = methods; }
+    public Object getMethod(String name) { return methods != null ? methods.get(name) : null; }
 
     public String getTypeName() { return typeName; }
 

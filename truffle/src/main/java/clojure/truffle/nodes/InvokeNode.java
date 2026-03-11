@@ -23,6 +23,11 @@ public class InvokeNode extends ExpressionNode {
     public Object executeGeneric(VirtualFrame frame) {
         Object function = functionNode.executeGeneric(frame);
 
+        // Dereference ClojureVar to its value
+        if (function instanceof clojure.truffle.runtime.ClojureVar cvar) {
+            function = cvar.deref();
+        }
+
         Object[] argValues = new Object[argumentNodes.length];
         for (int i = 0; i < argumentNodes.length; i++) {
             argValues[i] = argumentNodes[i].executeGeneric(frame);
@@ -83,6 +88,30 @@ public class InvokeNode extends ExpressionNode {
                 throw new RuntimeException("Set lookup expects 1 arg");
             Object val = s.get(argValues[0]);
             return val == null ? clojure.truffle.runtime.ClojureNil.INSTANCE : val;
+        }
+        // Deftype instances as functions (IFn implementation via type method registry)
+        if (function instanceof clojure.truffle.runtime.ClojureDeftypeInstance dt) {
+            Object invokeFn = dt.getMethod("invoke");
+            if (invokeFn != null) {
+                // Prepend 'this' (the instance) to args
+                Object[] fnArgs = new Object[argValues.length + 1];
+                fnArgs[0] = dt;
+                System.arraycopy(argValues, 0, fnArgs, 1, argValues.length);
+                if (invokeFn instanceof ClojureFunction fn2) {
+                    Object[] callArgs2 = new Object[fnArgs.length + 1];
+                    callArgs2[0] = fn2;
+                    System.arraycopy(fnArgs, 0, callArgs2, 1, fnArgs.length);
+                    return callNode.call(fn2.getCallTarget(), callArgs2);
+                } else if (invokeFn instanceof MultiArityFunction maf2) {
+                    ClojureFunction fn2 = maf2.resolve(fnArgs.length);
+                    Object[] callArgs2 = new Object[fnArgs.length + 1];
+                    callArgs2[0] = fn2;
+                    System.arraycopy(fnArgs, 0, callArgs2, 1, fnArgs.length);
+                    return callNode.call(fn2.getCallTarget(), callArgs2);
+                } else if (invokeFn instanceof ClojureContext.BuiltinFunction bf) {
+                    return bf.execute(fnArgs);
+                }
+            }
         }
 
         throw new RuntimeException("Cannot invoke: " + function + " (type: " +

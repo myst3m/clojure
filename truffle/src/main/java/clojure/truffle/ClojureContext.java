@@ -31,6 +31,7 @@ public class ClojureContext {
     public static final boolean DEBUG = Boolean.getBoolean("clojure.truffle.debug");
     private final ConcurrentHashMap<String, Object> globalVars = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Object> macros = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, clojure.lang.IPersistentMap> varMeta = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, ClojureNamespace> namespaces = new ConcurrentHashMap<>();
     private volatile String currentNamespace = "user";
     private final java.util.Set<String> loadingNamespaces =
@@ -46,6 +47,8 @@ public class ClojureContext {
     private final java.util.List<String> classpathEntries = new java.util.ArrayList<>();
     // ClassLoader for -cp entries (for Java class resolution)
     private ClassLoader cpClassLoader;
+    // Per-type method registry for deftype methods (IFn, IDeref, etc.)
+    private final ConcurrentHashMap<String, ConcurrentHashMap<String, Object>> typeMethodRegistry = new ConcurrentHashMap<>();
 
     @FunctionalInterface
     public interface BuiltinFunction {
@@ -57,6 +60,7 @@ public class ClojureContext {
     public static class NamedBuiltin implements BuiltinFunction {
         private final String name;
         private final BuiltinFunction delegate;
+        private volatile clojure.lang.IPersistentMap meta;
         public NamedBuiltin(String name, BuiltinFunction delegate) {
             this.name = name;
             this.delegate = delegate;
@@ -64,6 +68,8 @@ public class ClojureContext {
         @Override public Object execute(Object[] args) { return delegate.execute(args); }
         @Override public String name() { return name; }
         @Override public String toString() { return "<builtin:" + name + ">"; }
+        public clojure.lang.IPersistentMap getMeta() { return meta; }
+        public void setMeta(clojure.lang.IPersistentMap meta) { this.meta = meta; }
     }
 
     /** Register a builtin function with a name for debugging. */
@@ -135,6 +141,16 @@ public class ClojureContext {
         return env;
     }
 
+    // Type method registry for deftype
+    public void registerTypeMethod(String typeName, String methodName, Object fn) {
+        typeMethodRegistry.computeIfAbsent(typeName, k -> new ConcurrentHashMap<>()).put(methodName, fn);
+    }
+
+    public Object lookupTypeMethod(String typeName, String methodName) {
+        var methods = typeMethodRegistry.get(typeName);
+        return methods != null ? methods.get(methodName) : null;
+    }
+
     public void setVar(String name, Object value) {
         // Only put into globalVars if we're in clojure.core (or no namespace yet)
         // Otherwise, namespace-local defs should NOT pollute the global scope
@@ -187,6 +203,16 @@ public class ClojureContext {
             sym = name.substring(slash + 1);
         }
         return new clojure.truffle.runtime.ClojureVar(this, ns, sym);
+    }
+
+    public clojure.lang.IPersistentMap getVarMeta(String qualifiedName) {
+        return varMeta.get(qualifiedName);
+    }
+
+    public void setVarMeta(String qualifiedName, clojure.lang.IPersistentMap meta) {
+        if (meta != null) {
+            varMeta.put(qualifiedName, meta);
+        }
     }
 
     public void setMacro(String name, Object fn) {
@@ -273,10 +299,19 @@ public class ClojureContext {
             Object bound = threadBindings.get().get(name);
             if (bound != null) return bound;
         }
+        // Dynamic resolution for *ns*
+        if ("*ns*".equals(name)) {
+            return clojure.lang.Namespace.findOrCreate(clojure.lang.Symbol.intern(currentNamespace));
+        }
         return getVar(name);
     }
 
     public void loadNamespace(String nsName) {
+        if (nsName == null || nsName.isEmpty()) {
+            System.err.println("[NS-ERROR] Attempted to load empty namespace name!");
+            new Exception("Empty namespace trace").printStackTrace(System.err);
+            return;
+        }
         if (namespaces.containsKey(nsName)) { if (DEBUG) System.err.println("[NS] skip (cached): " + nsName); return; }
         if (DEBUG) System.err.println("[NS] loading: " + nsName + " (current=" + currentNamespace + ")");
         // Built-in pseudo-namespaces
@@ -293,12 +328,18 @@ public class ClojureContext {
             registerEdnNamespace();
             return;
         }
+        if (nsName.equals("clojure.pprint")) {
+            registerPprintNamespace();
+            return;
+        }
         if (nsName.equals("clojure.java.io")) {
             registerJavaIoNamespace();
             return;
         }
         if (!loadingNamespaces.add(nsName))
             throw new RuntimeException("Circular require detected: " + nsName);
+        System.err.println("[NS-LOAD] >> " + nsName);
+        long nsStartTime = System.currentTimeMillis();
         try {
             String basePath = nsName.replace('.', '/').replace('-', '_');
             String path = basePath + ".clj";
@@ -337,6 +378,7 @@ public class ClojureContext {
                 clojure.lang.Var.popThreadBindings();
             }
             currentNamespace = prevNs;
+            System.err.println("[NS-LOAD] << " + nsName + " (" + (System.currentTimeMillis() - nsStartTime) + "ms)");
         } catch (java.io.IOException e) {
             throw new RuntimeException("Error loading namespace: " + nsName, e);
         } finally {
@@ -376,7 +418,7 @@ public class ClojureContext {
                 "for", "doseq", "dotimes", "case", "condp", "while",
                 "if-let", "when-let", "if-some", "when-some", "when-not", "if-not",
                 "->", "->>", "as->", "some->", "some->>", "cond->", "cond->>",
-                "doto", "..", "comment", "declare", "defonce", "with-open",
+                "doto", "..", "comment", "declare", "defonce", "with-open", "with-bindings",
                 "ns", "in-ns", "require", "import", "use", "refer", "refer-clojure",
                 "reify", "proxy", "extend-type", "extend-protocol",
                 "defmulti", "defmethod", "defprotocol", "deftype", "defrecord",
@@ -398,7 +440,8 @@ public class ClojureContext {
                 "*print-length*", "*print-level*", "*print-dup*", "*print-readably*",
                 "*print-namespace-maps*", "*data-readers*", "*default-data-reader-fn*",
                 "*read-eval*", "*command-line-args*", "*compile-path*",
-                "*compile-files*", "*assert*", "*math-context*", "*file*"}) {
+                "*compile-files*", "*assert*", "*math-context*", "*file*",
+                "*compiler-options*"}) {
             globalVars.put(v, false);
             dynamicVars.add(v);
         }
@@ -684,8 +727,16 @@ public class ClojureContext {
         defBuiltin("map", args -> {
             if (args.length < 2) throw new RuntimeException("map: expected at least 2 args");
             Object fn = args[0];
-            Object coll = args[1];
-            return lazyMap(fn, coll);
+            if (args.length == 2) {
+                return lazyMap(fn, args[1]);
+            }
+            // Multi-collection map: (map f coll1 coll2 ...)
+            clojure.lang.ISeq[] seqs = new clojure.lang.ISeq[args.length - 1];
+            for (int i = 1; i < args.length; i++) {
+                seqs[i - 1] = seqOf(args[i]);
+                if (seqs[i - 1] == null) return clojure.lang.PersistentList.EMPTY;
+            }
+            return lazyMapMulti(fn, seqs);
         });
 
         defBuiltin("filter", args -> {
@@ -934,7 +985,7 @@ public class ClojureContext {
 
         defBuiltin("keys", args -> {
             checkArity(args, 1, "keys");
-            if (args[0] instanceof ClojureNil) return ClojureNil.INSTANCE;
+            if (args[0] == null || args[0] instanceof ClojureNil) return ClojureNil.INSTANCE;
             if (args[0] instanceof clojure.lang.IPersistentMap m) {
                 java.util.List<Object> keys = new ArrayList<>();
                 for (clojure.lang.ISeq s = m.seq(); s != null; s = s.next()) {
@@ -944,12 +995,29 @@ public class ClojureContext {
                 for (int i = keys.size() - 1; i >= 0; i--) result = result.cons(keys.get(i));
                 return result;
             }
-            throw new RuntimeException("keys: not a map");
+            // Support seqs of MapEntry (e.g. from (filter pred map))
+            if (args[0] instanceof clojure.lang.Seqable || args[0] instanceof Iterable) {
+                clojure.lang.ISeq s = seqOf(args[0]);
+                if (s == null) return clojure.lang.PersistentList.EMPTY;
+                java.util.List<Object> keys2 = new ArrayList<>();
+                for (; s != null; s = s.next()) {
+                    Object item = s.first();
+                    if (item instanceof clojure.lang.IMapEntry me) {
+                        keys2.add(me.key());
+                    } else {
+                        throw new RuntimeException("keys: element is not a map entry: " + item);
+                    }
+                }
+                clojure.lang.IPersistentCollection result = clojure.lang.PersistentList.EMPTY;
+                for (int i = keys2.size() - 1; i >= 0; i--) result = result.cons(keys2.get(i));
+                return result;
+            }
+            throw new RuntimeException("keys: not a map, got: " + args[0].getClass().getName());
         });
 
         defBuiltin("vals", args -> {
             checkArity(args, 1, "vals");
-            if (args[0] instanceof ClojureNil) return ClojureNil.INSTANCE;
+            if (args[0] == null || args[0] instanceof ClojureNil) return ClojureNil.INSTANCE;
             if (args[0] instanceof clojure.lang.IPersistentMap m) {
                 java.util.List<Object> vals = new ArrayList<>();
                 for (clojure.lang.ISeq s = m.seq(); s != null; s = s.next()) {
@@ -959,7 +1027,25 @@ public class ClojureContext {
                 for (int i = vals.size() - 1; i >= 0; i--) result = result.cons(vals.get(i));
                 return result;
             }
-            throw new RuntimeException("vals: not a map");
+            // Support seqs of MapEntry (e.g. from (filter pred map))
+            // Also handle Seqable types (LazySeq, Cons, etc.)
+            if (args[0] instanceof clojure.lang.Seqable || args[0] instanceof Iterable) {
+                clojure.lang.ISeq s = seqOf(args[0]);
+                if (s == null) return clojure.lang.PersistentList.EMPTY;
+                java.util.List<Object> vals = new ArrayList<>();
+                for (; s != null; s = s.next()) {
+                    Object item = s.first();
+                    if (item instanceof clojure.lang.IMapEntry me) {
+                        vals.add(me.val());
+                    } else {
+                        throw new RuntimeException("vals: element is not a map entry: " + item);
+                    }
+                }
+                clojure.lang.IPersistentCollection result = clojure.lang.PersistentList.EMPTY;
+                for (int i = vals.size() - 1; i >= 0; i--) result = result.cons(vals.get(i));
+                return result;
+            }
+            throw new RuntimeException("vals: not a map, got: " + args[0].getClass().getName());
         });
 
         // --- Atom ---
@@ -1275,6 +1361,7 @@ public class ClojureContext {
                 throw new RuntimeException("instance?: first arg must be a class");
             Object val = args[1];
             if (val instanceof ClojureNil) return false;
+            if (c == clojure.lang.Atom.class && val instanceof ClojureAtom) return true;
             return c.isInstance(val);
         });
 
@@ -1295,16 +1382,7 @@ public class ClojureContext {
             return ClojureNil.INSTANCE;
         });
 
-        defBuiltin("with-meta", args -> {
-            checkArity(args, 2, "with-meta");
-            if (!(args[0] instanceof clojure.lang.IObj obj))
-                throw new RuntimeException("with-meta: object does not support metadata");
-            if (args[1] instanceof ClojureNil)
-                return obj.withMeta(null);
-            if (!(args[1] instanceof clojure.lang.IPersistentMap meta))
-                throw new RuntimeException("with-meta: metadata must be a map");
-            return obj.withMeta(meta);
-        });
+        // with-meta is defined later in registerBuiltins (after more type support)
 
         defBuiltin("vary-meta", args -> {
             if (args.length < 2) throw new RuntimeException("vary-meta: expected at least 2 args");
@@ -1731,6 +1809,22 @@ public class ClojureContext {
         });
 
         defBuiltin("distinct", args -> {
+            if (args.length == 0) {
+                // Transducer arity
+                return (BuiltinFunction) xfArgs -> {
+                    checkArity(xfArgs, 1, "distinct-transducer");
+                    Object rf = xfArgs[0];
+                    java.util.Set<Object> seen = new java.util.HashSet<>();
+                    return new TransducerRf(rf) {
+                        @Override public Object step(Object acc, Object input) {
+                            if (seen.add(input)) {
+                                return callFunction(innerRf, new Object[]{acc, input});
+                            }
+                            return acc;
+                        }
+                    };
+                };
+            }
             checkArity(args, 1, "distinct");
             java.util.Set<Object> seen = new java.util.LinkedHashSet<>();
             for (clojure.lang.ISeq s = seqOf(args[0]); s != null; s = s.next())
@@ -1762,6 +1856,56 @@ public class ClojureContext {
             java.util.List<Object> parts = new ArrayList<>();
             for (int i = 0; i + n <= items.size(); i += step)
                 parts.add(clojure.lang.PersistentVector.create(items.subList(i, i + n)));
+            clojure.lang.IPersistentCollection result = clojure.lang.PersistentList.EMPTY;
+            for (int i = parts.size() - 1; i >= 0; i--) result = result.cons(parts.get(i));
+            return result;
+        });
+
+        defBuiltin("partition-all", args -> {
+            if (args.length < 1 || args.length > 3)
+                throw new RuntimeException("partition-all: expected 1-3 args");
+            if (args.length == 1) {
+                // Transducer arity
+                int n = ((Number) args[0]).intValue();
+                return (BuiltinFunction) xfArgs -> {
+                    checkArity(xfArgs, 1, "partition-all-transducer");
+                    Object rf = xfArgs[0];
+                    java.util.List<Object> buf = new ArrayList<>();
+                    return new TransducerRf(rf) {
+                        @Override public Object step(Object acc, Object input) {
+                            buf.add(input);
+                            if (buf.size() == n) {
+                                Object chunk = clojure.lang.PersistentVector.create(new ArrayList<>(buf));
+                                buf.clear();
+                                return callFunction(innerRf, new Object[]{acc, chunk});
+                            }
+                            return acc;
+                        }
+                        @Override public Object execute(Object[] a) {
+                            if (a.length == 1) {
+                                // completion - flush remaining
+                                Object acc = a[0];
+                                if (!buf.isEmpty()) {
+                                    Object chunk = clojure.lang.PersistentVector.create(new ArrayList<>(buf));
+                                    buf.clear();
+                                    acc = callFunction(innerRf, new Object[]{acc, chunk});
+                                }
+                                return callFunction(innerRf, new Object[]{acc});
+                            }
+                            return super.execute(a);
+                        }
+                    };
+                };
+            }
+            int n = ((Number) args[0]).intValue();
+            int step = args.length == 3 ? ((Number) args[1]).intValue() : n;
+            Object coll = args.length == 2 ? args[1] : args[2];
+            java.util.List<Object> items = new ArrayList<>();
+            for (clojure.lang.ISeq s = seqOf(coll); s != null; s = s.next())
+                items.add(s.first());
+            java.util.List<Object> parts = new ArrayList<>();
+            for (int i = 0; i < items.size(); i += step)
+                parts.add(clojure.lang.PersistentVector.create(items.subList(i, Math.min(i + n, items.size()))));
             clojure.lang.IPersistentCollection result = clojure.lang.PersistentList.EMPTY;
             for (int i = parts.size() - 1; i >= 0; i--) result = result.cons(parts.get(i));
             return result;
@@ -2194,7 +2338,7 @@ public class ClojureContext {
             Object f = args[0];
             Object coll = args[1];
             java.util.Map<Object, java.util.List<Object>> groups = new java.util.LinkedHashMap<>();
-            for (clojure.lang.ISeq seq = clojure.lang.RT.seq(coll); seq != null; seq = seq.next()) {
+            for (clojure.lang.ISeq seq = seqOf(coll); seq != null; seq = seq.next()) {
                 Object item = seq.first();
                 Object key = callFunction(f, new Object[]{item});
                 groups.computeIfAbsent(key, k -> new ArrayList<>()).add(item);
@@ -2210,7 +2354,7 @@ public class ClojureContext {
         defBuiltin("frequencies", args -> {
             checkArity(args, 1, "frequencies");
             java.util.Map<Object, Long> freqs = new java.util.LinkedHashMap<>();
-            for (clojure.lang.ISeq seq = clojure.lang.RT.seq(args[0]); seq != null; seq = seq.next()) {
+            for (clojure.lang.ISeq seq = seqOf(args[0]); seq != null; seq = seq.next()) {
                 Object item = seq.first();
                 freqs.merge(item, 1L, Long::sum);
             }
@@ -2225,7 +2369,7 @@ public class ClojureContext {
             checkArity(args, 2, "take-while");
             Object pred = args[0];
             return new LazySeq(() -> {
-                return lazyTakeWhile(pred, clojure.lang.RT.seq(args[1]));
+                return lazyTakeWhile(pred, seqOf(args[1]));
             });
         });
 
@@ -2233,7 +2377,7 @@ public class ClojureContext {
             checkArity(args, 2, "drop-while");
             Object pred = args[0];
             Object coll = args[1];
-            clojure.lang.ISeq seq = clojure.lang.RT.seq(coll);
+            clojure.lang.ISeq seq = seqOf(coll);
             while (seq != null) {
                 Object val = callFunction(pred, new Object[]{seq.first()});
                 if (!isTruthy(val)) break;
@@ -2248,7 +2392,7 @@ public class ClojureContext {
         defBuiltin("every?", args -> {
             checkArity(args, 2, "every?");
             Object pred = args[0];
-            for (clojure.lang.ISeq seq = clojure.lang.RT.seq(args[1]); seq != null; seq = seq.next()) {
+            for (clojure.lang.ISeq seq = seqOf(args[1]); seq != null; seq = seq.next()) {
                 if (!isTruthy(callFunction(pred, new Object[]{seq.first()}))) return false;
             }
             return true;
@@ -2257,7 +2401,7 @@ public class ClojureContext {
         defBuiltin("some", args -> {
             checkArity(args, 2, "some");
             Object pred = args[0];
-            for (clojure.lang.ISeq seq = clojure.lang.RT.seq(args[1]); seq != null; seq = seq.next()) {
+            for (clojure.lang.ISeq seq = seqOf(args[1]); seq != null; seq = seq.next()) {
                 Object result = callFunction(pred, new Object[]{seq.first()});
                 if (isTruthy(result)) return result;
             }
@@ -2267,7 +2411,7 @@ public class ClojureContext {
         defBuiltin("not-every?", args -> {
             checkArity(args, 2, "not-every?");
             Object pred = args[0];
-            for (clojure.lang.ISeq seq = clojure.lang.RT.seq(args[1]); seq != null; seq = seq.next()) {
+            for (clojure.lang.ISeq seq = seqOf(args[1]); seq != null; seq = seq.next()) {
                 if (!isTruthy(callFunction(pred, new Object[]{seq.first()}))) return true;
             }
             return false;
@@ -2276,7 +2420,7 @@ public class ClojureContext {
         defBuiltin("not-any?", args -> {
             checkArity(args, 2, "not-any?");
             Object pred = args[0];
-            for (clojure.lang.ISeq seq = clojure.lang.RT.seq(args[1]); seq != null; seq = seq.next()) {
+            for (clojure.lang.ISeq seq = seqOf(args[1]); seq != null; seq = seq.next()) {
                 if (isTruthy(callFunction(pred, new Object[]{seq.first()}))) return false;
             }
             return true;
@@ -2302,7 +2446,7 @@ public class ClojureContext {
                         if (item instanceof clojure.lang.MapEntry me)
                             return ((clojure.lang.IPersistentMap) rArgs[0]).assoc(me.key(), me.val());
                         if (item instanceof clojure.lang.Seqable) {
-                            clojure.lang.ISeq s = clojure.lang.RT.seq(item);
+                            clojure.lang.ISeq s = seqOf(item);
                             if (s != null && s.next() != null && s.next().next() == null)
                                 return ((clojure.lang.IPersistentMap) rArgs[0]).assoc(s.first(), s.next().first());
                         }
@@ -2317,15 +2461,16 @@ public class ClojureContext {
                 Object xrf = callFunction(xform, new Object[]{rf});
                 Object acc = to;
                 if (from instanceof ClojureNil) return to;
-                for (clojure.lang.ISeq seq = clojure.lang.RT.seq(from); seq != null; seq = seq.next()) {
+                for (clojure.lang.ISeq seq = seqOf(from); seq != null; seq = seq.next()) {
                     acc = callFunction(xrf, new Object[]{acc, seq.first()});
                     if (acc instanceof Reduced r) { acc = r.value; break; }
                 }
                 return acc;
             }
             from = args[1];
+            if (to == null || to instanceof ClojureNil) to = clojure.lang.PersistentList.EMPTY;
             if (from instanceof ClojureNil) return to;
-            for (clojure.lang.ISeq seq = clojure.lang.RT.seq(from); seq != null; seq = seq.next()) {
+            for (clojure.lang.ISeq seq = seqOf(from); seq != null; seq = seq.next()) {
                 Object item = seq.first();
                 if (to instanceof clojure.lang.IPersistentVector v) {
                     to = v.cons(item);
@@ -2336,7 +2481,7 @@ public class ClojureContext {
                         to = m.assoc(iv.nth(0), iv.nth(1));
                     } else if (item instanceof clojure.lang.Seqable) {
                         // Support lists, lazy-seqs as [k v] pairs
-                        clojure.lang.ISeq s = clojure.lang.RT.seq(item);
+                        clojure.lang.ISeq s = seqOf(item);
                         if (s != null && s.next() != null && s.next().next() == null) {
                             to = m.assoc(s.first(), s.next().first());
                         } else {
@@ -2384,7 +2529,7 @@ public class ClojureContext {
             checkArity(args, 2, "take-last");
             int n = ((Number) args[0]).intValue();
             java.util.List<Object> items = new ArrayList<>();
-            for (clojure.lang.ISeq seq = clojure.lang.RT.seq(args[1]); seq != null; seq = seq.next()) {
+            for (clojure.lang.ISeq seq = seqOf(args[1]); seq != null; seq = seq.next()) {
                 items.add(seq.first());
             }
             if (n >= items.size()) return clojure.lang.PersistentList.create(items);
@@ -2395,7 +2540,7 @@ public class ClojureContext {
             int n = args.length == 1 ? 1 : ((Number) args[0]).intValue();
             Object coll = args.length == 1 ? args[0] : args[1];
             java.util.List<Object> items = new ArrayList<>();
-            for (clojure.lang.ISeq seq = clojure.lang.RT.seq(coll); seq != null; seq = seq.next()) {
+            for (clojure.lang.ISeq seq = seqOf(coll); seq != null; seq = seq.next()) {
                 items.add(seq.first());
             }
             if (n >= items.size()) return clojure.lang.PersistentList.EMPTY;
@@ -2406,7 +2551,7 @@ public class ClojureContext {
             checkArity(args, 2, "split-at");
             int n = ((Number) args[0]).intValue();
             java.util.List<Object> items = new ArrayList<>();
-            for (clojure.lang.ISeq seq = clojure.lang.RT.seq(args[1]); seq != null; seq = seq.next()) {
+            for (clojure.lang.ISeq seq = seqOf(args[1]); seq != null; seq = seq.next()) {
                 items.add(seq.first());
             }
             int splitPt = Math.min(n, items.size());
@@ -2421,7 +2566,7 @@ public class ClojureContext {
             java.util.List<Object> before = new ArrayList<>();
             java.util.List<Object> after = new ArrayList<>();
             boolean splitting = true;
-            for (clojure.lang.ISeq seq = clojure.lang.RT.seq(args[1]); seq != null; seq = seq.next()) {
+            for (clojure.lang.ISeq seq = seqOf(args[1]); seq != null; seq = seq.next()) {
                 Object item = seq.first();
                 if (splitting && isTruthy(callFunction(pred, new Object[]{item}))) {
                     before.add(item);
@@ -2441,7 +2586,7 @@ public class ClojureContext {
             java.util.List<Object> result = new ArrayList<>();
             java.util.List<Object> current = new ArrayList<>();
             Object lastVal = new Object(); // sentinel
-            for (clojure.lang.ISeq seq = clojure.lang.RT.seq(args[1]); seq != null; seq = seq.next()) {
+            for (clojure.lang.ISeq seq = seqOf(args[1]); seq != null; seq = seq.next()) {
                 Object item = seq.first();
                 Object val = callFunction(f, new Object[]{item});
                 if (lastVal != val && !lastVal.equals(val) && !current.isEmpty()) {
@@ -2469,12 +2614,19 @@ public class ClojureContext {
 
         defBuiltin("with-meta", args -> {
             checkArity(args, 2, "with-meta");
-            if (!(args[1] instanceof clojure.lang.IPersistentMap m))
-                throw new RuntimeException("with-meta: metadata must be a map");
+            clojure.lang.IPersistentMap m;
+            if (args[1] == null || args[1] instanceof ClojureNil) {
+                m = null;
+            } else if (args[1] instanceof clojure.lang.IPersistentMap pm) {
+                m = pm;
+            } else {
+                throw new RuntimeException("with-meta: metadata must be a map, got: " + args[1].getClass().getName());
+            }
             if (args[0] instanceof clojure.lang.IObj obj) {
                 return obj.withMeta(m);
             }
-            throw new RuntimeException("with-meta: object does not support metadata");
+            // For non-IObj types, return as-is (best effort)
+            return args[0];
         });
 
         defBuiltin("vary-meta", args -> {
@@ -2541,7 +2693,7 @@ public class ClojureContext {
             if (args.length == 1) {
                 // (str/join coll)
                 StringBuilder sb = new StringBuilder();
-                for (clojure.lang.ISeq seq = clojure.lang.RT.seq(args[0]); seq != null; seq = seq.next()) {
+                for (clojure.lang.ISeq seq = seqOf(args[0]); seq != null; seq = seq.next()) {
                     sb.append(printString(seq.first(), false));
                 }
                 return sb.toString();
@@ -2550,7 +2702,7 @@ public class ClojureContext {
             String sep = args[0].toString();
             StringBuilder sb = new StringBuilder();
             boolean first = true;
-            for (clojure.lang.ISeq seq = clojure.lang.RT.seq(args[1]); seq != null; seq = seq.next()) {
+            for (clojure.lang.ISeq seq = seqOf(args[1]); seq != null; seq = seq.next()) {
                 if (!first) sb.append(sep);
                 sb.append(printString(seq.first(), false));
                 first = false;
@@ -2571,6 +2723,13 @@ public class ClojureContext {
         defBuiltin("str/trimr", args -> {
             checkArity(args, 1, "str/trimr");
             return args[0].toString().stripTrailing();
+        });
+
+        defBuiltin("str/capitalize", args -> {
+            checkArity(args, 1, "str/capitalize");
+            String s = args[0].toString();
+            if (s.isEmpty()) return s;
+            return Character.toUpperCase(s.charAt(0)) + s.substring(1).toLowerCase();
         });
 
         defBuiltin("str/upper-case", args -> {
@@ -2696,7 +2855,7 @@ public class ClojureContext {
             checkArity(args, 1, "set");
             if (args[0] instanceof ClojureNil) return clojure.lang.PersistentHashSet.EMPTY;
             java.util.List<Object> items = new ArrayList<>();
-            for (clojure.lang.ISeq seq = clojure.lang.RT.seq(args[0]); seq != null; seq = seq.next()) {
+            for (clojure.lang.ISeq seq = seqOf(args[0]); seq != null; seq = seq.next()) {
                 items.add(seq.first());
             }
             return clojure.lang.PersistentHashSet.create(items);
@@ -2722,6 +2881,7 @@ public class ClojureContext {
 
         defBuiltin("disj", args -> {
             if (args.length < 2) throw new RuntimeException("disj: expected at least 2 args");
+            if (args[0] == null || args[0] instanceof ClojureNil) return ClojureNil.INSTANCE;
             clojure.lang.IPersistentSet s = (clojure.lang.IPersistentSet) args[0];
             for (int i = 1; i < args.length; i++) {
                 s = s.disjoin(args[i]);
@@ -2791,6 +2951,16 @@ public class ClojureContext {
             return args[0].getClass();
         });
 
+        defBuiltin("munge", args -> {
+            checkArity(args, 1, "munge");
+            return clojure.lang.Compiler.munge(args[0].toString());
+        });
+
+        defBuiltin("demunge", args -> {
+            checkArity(args, 1, "demunge");
+            return clojure.lang.Compiler.demunge(args[0].toString());
+        });
+
         defBuiltin("instance?", args -> {
             checkArity(args, 2, "instance?");
             if (args[0] instanceof ClojureProtocol proto) {
@@ -2800,6 +2970,8 @@ public class ClojureContext {
             if (!(args[0] instanceof Class<?> clazz))
                 throw new RuntimeException("instance?: first arg must be a Class, got " + args[0].getClass().getName());
             if (args[1] instanceof ClojureNil) return false;
+            // ClojureAtom should be recognized as clojure.lang.Atom
+            if (clazz == clojure.lang.Atom.class && args[1] instanceof ClojureAtom) return true;
             return clazz.isInstance(args[1]);
         });
 
@@ -2867,7 +3039,7 @@ public class ClojureContext {
         defBuiltin("run!", args -> {
             checkArity(args, 2, "run!");
             Object f = args[0];
-            for (clojure.lang.ISeq seq = clojure.lang.RT.seq(args[1]); seq != null; seq = seq.next()) {
+            for (clojure.lang.ISeq seq = seqOf(args[1]); seq != null; seq = seq.next()) {
                 callFunction(f, new Object[]{seq.first()});
             }
             return ClojureNil.INSTANCE;
@@ -2878,13 +3050,13 @@ public class ClojureContext {
             Object f = args[0];
             java.util.List<Object> result = new ArrayList<>();
             if (args.length == 2) {
-                for (clojure.lang.ISeq seq = clojure.lang.RT.seq(args[1]); seq != null; seq = seq.next()) {
+                for (clojure.lang.ISeq seq = seqOf(args[1]); seq != null; seq = seq.next()) {
                     result.add(callFunction(f, new Object[]{seq.first()}));
                 }
             } else {
                 // Multi-coll mapv
                 clojure.lang.ISeq[] seqs = new clojure.lang.ISeq[args.length - 1];
-                for (int i = 1; i < args.length; i++) seqs[i-1] = clojure.lang.RT.seq(args[i]);
+                for (int i = 1; i < args.length; i++) seqs[i-1] = seqOf(args[i]);
                 while (true) {
                     Object[] fArgs = new Object[seqs.length];
                     boolean done = false;
@@ -2904,7 +3076,7 @@ public class ClojureContext {
             checkArity(args, 2, "filterv");
             Object pred = args[0];
             java.util.List<Object> result = new ArrayList<>();
-            for (clojure.lang.ISeq seq = clojure.lang.RT.seq(args[1]); seq != null; seq = seq.next()) {
+            for (clojure.lang.ISeq seq = seqOf(args[1]); seq != null; seq = seq.next()) {
                 Object item = seq.first();
                 if (isTruthy(callFunction(pred, new Object[]{item}))) result.add(item);
             }
@@ -3085,7 +3257,7 @@ public class ClojureContext {
             // Apply xform to f to get the reducing function
             Object xf = callFunction(xform, new Object[]{f});
             Object acc = init;
-            for (clojure.lang.ISeq seq = clojure.lang.RT.seq(coll); seq != null; seq = seq.next()) {
+            for (clojure.lang.ISeq seq = seqOf(coll); seq != null; seq = seq.next()) {
                 acc = callFunction(xf, new Object[]{acc, seq.first()});
                 // Check for reduced
                 if (acc instanceof Reduced r) {
@@ -3344,7 +3516,7 @@ public class ClojureContext {
                     if (kids != null && !(kids instanceof ClojureNil)) {
                         // Add children at front for depth-first
                         java.util.List<Object> childList = new ArrayList<>();
-                        for (clojure.lang.ISeq seq = clojure.lang.RT.seq(kids); seq != null; seq = seq.next()) {
+                        for (clojure.lang.ISeq seq = seqOf(kids); seq != null; seq = seq.next()) {
                             childList.add(seq.first());
                         }
                         // Use a stack approach by adding at beginning
@@ -3368,7 +3540,7 @@ public class ClojureContext {
         defBuiltin("cycle", args -> {
             checkArity(args, 1, "cycle");
             java.util.List<Object> items = new ArrayList<>();
-            for (clojure.lang.ISeq seq = clojure.lang.RT.seq(args[0]); seq != null; seq = seq.next()) {
+            for (clojure.lang.ISeq seq = seqOf(args[0]); seq != null; seq = seq.next()) {
                 items.add(seq.first());
             }
             if (items.isEmpty()) return ClojureNil.INSTANCE;
@@ -3414,7 +3586,7 @@ public class ClojureContext {
             int n = ((Number) args[0]).intValue();
             if (args[1] instanceof clojure.lang.Counted c) return (long) Math.min(c.count(), n);
             long count = 0;
-            for (clojure.lang.ISeq seq = clojure.lang.RT.seq(args[1]); seq != null && count < n; seq = seq.next()) {
+            for (clojure.lang.ISeq seq = seqOf(args[1]); seq != null && count < n; seq = seq.next()) {
                 count++;
             }
             return count;
@@ -3423,7 +3595,7 @@ public class ClojureContext {
         defBuiltin("sequence", args -> {
             if (args.length == 1) {
                 // (sequence coll) - coerce to seq
-                clojure.lang.ISeq seq = clojure.lang.RT.seq(args[0]);
+                clojure.lang.ISeq seq = seqOf(args[0]);
                 return seq == null ? clojure.lang.PersistentList.EMPTY : seq;
             }
             if (args.length == 2) {
@@ -3440,7 +3612,7 @@ public class ClojureContext {
                 };
                 Object xf = callFunction(xform, new Object[]{rf});
                 Object acc = result;
-                for (clojure.lang.ISeq seq = clojure.lang.RT.seq(coll); seq != null; seq = seq.next()) {
+                for (clojure.lang.ISeq seq = seqOf(coll); seq != null; seq = seq.next()) {
                     acc = callFunction(xf, new Object[]{acc, seq.first()});
                     if (acc instanceof Reduced r) { acc = r.value; break; }
                 }
@@ -3457,7 +3629,7 @@ public class ClojureContext {
             if (args[0] instanceof ClojureNil) return clojure.lang.PersistentVector.EMPTY;
             if (args[0] instanceof clojure.lang.IPersistentVector v) return v;
             java.util.List<Object> items = new ArrayList<>();
-            for (clojure.lang.ISeq seq = clojure.lang.RT.seq(args[0]); seq != null; seq = seq.next()) {
+            for (clojure.lang.ISeq seq = seqOf(args[0]); seq != null; seq = seq.next()) {
                 items.add(seq.first());
             }
             return clojure.lang.PersistentVector.create(items);
@@ -3465,7 +3637,7 @@ public class ClojureContext {
 
         defBuiltin("second", args -> {
             checkArity(args, 1, "second");
-            clojure.lang.ISeq seq = clojure.lang.RT.seq(args[0]);
+            clojure.lang.ISeq seq = seqOf(args[0]);
             if (seq == null) return ClojureNil.INSTANCE;
             seq = seq.next();
             if (seq == null) return ClojureNil.INSTANCE;
@@ -3476,7 +3648,7 @@ public class ClojureContext {
             checkArity(args, 1, "last");
             if (args[0] instanceof ClojureNil) return ClojureNil.INSTANCE;
             Object result = ClojureNil.INSTANCE;
-            for (clojure.lang.ISeq seq = clojure.lang.RT.seq(args[0]); seq != null; seq = seq.next()) {
+            for (clojure.lang.ISeq seq = seqOf(args[0]); seq != null; seq = seq.next()) {
                 result = seq.first();
             }
             return result;
@@ -3485,7 +3657,7 @@ public class ClojureContext {
         defBuiltin("butlast", args -> {
             checkArity(args, 1, "butlast");
             java.util.List<Object> items = new ArrayList<>();
-            for (clojure.lang.ISeq seq = clojure.lang.RT.seq(args[0]); seq != null; seq = seq.next()) {
+            for (clojure.lang.ISeq seq = seqOf(args[0]); seq != null; seq = seq.next()) {
                 items.add(seq.first());
             }
             if (items.isEmpty()) return ClojureNil.INSTANCE;
@@ -3518,14 +3690,14 @@ public class ClojureContext {
 
         defBuiltin("nfirst", args -> {
             checkArity(args, 1, "nfirst");
-            clojure.lang.ISeq seq = clojure.lang.RT.seq(args[0]);
+            clojure.lang.ISeq seq = seqOf(args[0]);
             if (seq == null) return ClojureNil.INSTANCE;
-            return clojure.lang.RT.seq(seq.first());
+            return seqOf(seq.first());
         });
 
         defBuiltin("nnext", args -> {
             checkArity(args, 1, "nnext");
-            clojure.lang.ISeq seq = clojure.lang.RT.seq(args[0]);
+            clojure.lang.ISeq seq = seqOf(args[0]);
             if (seq == null) return ClojureNil.INSTANCE;
             seq = seq.next();
             if (seq == null) return ClojureNil.INSTANCE;
@@ -3534,16 +3706,16 @@ public class ClojureContext {
 
         defBuiltin("ffirst", args -> {
             checkArity(args, 1, "ffirst");
-            clojure.lang.ISeq seq = clojure.lang.RT.seq(args[0]);
+            clojure.lang.ISeq seq = seqOf(args[0]);
             if (seq == null) return ClojureNil.INSTANCE;
-            clojure.lang.ISeq inner = clojure.lang.RT.seq(seq.first());
+            clojure.lang.ISeq inner = seqOf(seq.first());
             if (inner == null) return ClojureNil.INSTANCE;
             return inner.first();
         });
 
         defBuiltin("fnext", args -> {
             checkArity(args, 1, "fnext");
-            clojure.lang.ISeq seq = clojure.lang.RT.seq(args[0]);
+            clojure.lang.ISeq seq = seqOf(args[0]);
             if (seq == null) return ClojureNil.INSTANCE;
             seq = seq.next();
             if (seq == null) return ClojureNil.INSTANCE;
@@ -3552,7 +3724,7 @@ public class ClojureContext {
 
         defBuiltin("next", args -> {
             checkArity(args, 1, "next");
-            clojure.lang.ISeq seq = clojure.lang.RT.seq(args[0]);
+            clojure.lang.ISeq seq = seqOf(args[0]);
             if (seq == null) return ClojureNil.INSTANCE;
             clojure.lang.ISeq n = seq.next();
             return n == null ? (Object) ClojureNil.INSTANCE : n;
@@ -3576,7 +3748,7 @@ public class ClojureContext {
                 return indexed.nth(idx);
             }
             // Fall back to seq traversal for lists
-            clojure.lang.ISeq seq = clojure.lang.RT.seq(coll);
+            clojure.lang.ISeq seq = seqOf(coll);
             for (int i = 0; i < idx && seq != null; i++) seq = seq.next();
             if (seq == null) {
                 if (notFound != null) return notFound;
@@ -3629,7 +3801,7 @@ public class ClojureContext {
             if (lastArg instanceof ClojureNil) {
                 // no-op
             } else {
-                for (clojure.lang.ISeq seq = clojure.lang.RT.seq(lastArg); seq != null; seq = seq.next()) {
+                for (clojure.lang.ISeq seq = seqOf(lastArg); seq != null; seq = seq.next()) {
                     allArgs.add(seq.first());
                 }
             }
@@ -3645,7 +3817,7 @@ public class ClojureContext {
             if (args.length < 1 || args.length > 2) throw new RuntimeException("sort: expected 1-2 args");
             Object coll = args.length == 1 ? args[0] : args[1];
             java.util.List<Object> items = new ArrayList<>();
-            for (clojure.lang.ISeq seq = clojure.lang.RT.seq(coll); seq != null; seq = seq.next()) {
+            for (clojure.lang.ISeq seq = seqOf(coll); seq != null; seq = seq.next()) {
                 items.add(seq.first());
             }
             if (args.length == 2) {
@@ -3666,7 +3838,7 @@ public class ClojureContext {
         defBuiltin("reverse", args -> {
             checkArity(args, 1, "reverse");
             java.util.List<Object> items = new ArrayList<>();
-            for (clojure.lang.ISeq seq = clojure.lang.RT.seq(args[0]); seq != null; seq = seq.next()) {
+            for (clojure.lang.ISeq seq = seqOf(args[0]); seq != null; seq = seq.next()) {
                 items.add(seq.first());
             }
             java.util.Collections.reverse(items);
@@ -3731,13 +3903,13 @@ public class ClojureContext {
             Object f = args[0];
             // For simplicity, handle single collection case
             java.util.List<Object> result = new ArrayList<>();
-            for (clojure.lang.ISeq seq = clojure.lang.RT.seq(args[1]); seq != null; seq = seq.next()) {
+            for (clojure.lang.ISeq seq = seqOf(args[1]); seq != null; seq = seq.next()) {
                 Object mapped = callFunction(f, new Object[]{seq.first()});
                 if (mapped == null || mapped instanceof ClojureNil) continue;
                 clojure.lang.ISeq inner = null;
                 try {
-                    inner = clojure.lang.RT.seq(mapped);
-                } catch (IllegalArgumentException e) {
+                    inner = seqOf(mapped);
+                } catch (Exception e) {
                     // Non-seqable result (e.g. scalar from for :when) - treat as single element
                     result.add(mapped);
                     continue;
@@ -3756,7 +3928,7 @@ public class ClojureContext {
             Object f = args[0];
             java.util.List<Object> result = new ArrayList<>();
             long idx = 0;
-            for (clojure.lang.ISeq seq = clojure.lang.RT.seq(args[1]); seq != null; seq = seq.next()) {
+            for (clojure.lang.ISeq seq = seqOf(args[1]); seq != null; seq = seq.next()) {
                 Object val = callFunction(f, new Object[]{idx++, seq.first()});
                 if (val != null && !(val instanceof ClojureNil)) result.add(val);
             }
@@ -3939,7 +4111,7 @@ public class ClojureContext {
                         callFunction(inner, new Object[]{me.val()}));
             } else if (form instanceof clojure.lang.IPersistentList) {
                 java.util.List<Object> result = new ArrayList<>();
-                for (clojure.lang.ISeq seq = clojure.lang.RT.seq(form); seq != null; seq = seq.next()) {
+                for (clojure.lang.ISeq seq = seqOf(form); seq != null; seq = seq.next()) {
                     result.add(callFunction(inner, new Object[]{seq.first()}));
                 }
                 walked = clojure.lang.PersistentList.create(result);
@@ -4198,6 +4370,152 @@ public class ClojureContext {
             return java.lang.reflect.Array.newInstance(clazz, size);
         });
 
+        defBuiltin("byte-array", args -> {
+            if (args.length == 1) {
+                if (args[0] instanceof Number n) {
+                    return new byte[n.intValue()];
+                }
+                // Convert collection to byte array
+                java.util.List<Object> items = new ArrayList<>();
+                for (clojure.lang.ISeq seq = seqOf(args[0]); seq != null; seq = seq.next())
+                    items.add(seq.first());
+                byte[] result = new byte[items.size()];
+                for (int i = 0; i < items.size(); i++)
+                    result[i] = ((Number) items.get(i)).byteValue();
+                return result;
+            } else if (args.length == 2) {
+                int size = ((Number) args[0]).intValue();
+                byte[] result = new byte[size];
+                if (args[1] instanceof Number n) {
+                    java.util.Arrays.fill(result, n.byteValue());
+                } else {
+                    int i = 0;
+                    for (clojure.lang.ISeq seq = seqOf(args[1]); seq != null && i < size; seq = seq.next(), i++)
+                        result[i] = ((Number) seq.first()).byteValue();
+                }
+                return result;
+            }
+            throw new RuntimeException("byte-array: expected 1-2 args");
+        });
+
+        defBuiltin("int-array", args -> {
+            if (args.length == 1) {
+                if (args[0] instanceof Number n) {
+                    return new int[n.intValue()];
+                }
+                java.util.List<Object> items = new ArrayList<>();
+                for (clojure.lang.ISeq seq = seqOf(args[0]); seq != null; seq = seq.next())
+                    items.add(seq.first());
+                int[] result = new int[items.size()];
+                for (int i = 0; i < items.size(); i++)
+                    result[i] = ((Number) items.get(i)).intValue();
+                return result;
+            } else if (args.length == 2) {
+                int size = ((Number) args[0]).intValue();
+                int[] result = new int[size];
+                if (args[1] instanceof Number n) {
+                    java.util.Arrays.fill(result, n.intValue());
+                } else {
+                    int i = 0;
+                    for (clojure.lang.ISeq seq = seqOf(args[1]); seq != null && i < size; seq = seq.next(), i++)
+                        result[i] = ((Number) seq.first()).intValue();
+                }
+                return result;
+            }
+            throw new RuntimeException("int-array: expected 1-2 args");
+        });
+
+        defBuiltin("long-array", args -> {
+            if (args.length == 1) {
+                if (args[0] instanceof Number n) {
+                    return new long[n.intValue()];
+                }
+                java.util.List<Object> items = new ArrayList<>();
+                for (clojure.lang.ISeq seq = seqOf(args[0]); seq != null; seq = seq.next())
+                    items.add(seq.first());
+                long[] result = new long[items.size()];
+                for (int i = 0; i < items.size(); i++)
+                    result[i] = ((Number) items.get(i)).longValue();
+                return result;
+            } else if (args.length == 2) {
+                int size = ((Number) args[0]).intValue();
+                long[] result = new long[size];
+                if (args[1] instanceof Number n) {
+                    java.util.Arrays.fill(result, n.longValue());
+                } else {
+                    int i = 0;
+                    for (clojure.lang.ISeq seq = seqOf(args[1]); seq != null && i < size; seq = seq.next(), i++)
+                        result[i] = ((Number) seq.first()).longValue();
+                }
+                return result;
+            }
+            throw new RuntimeException("long-array: expected 1-2 args");
+        });
+
+        defBuiltin("double-array", args -> {
+            if (args.length == 1) {
+                if (args[0] instanceof Number n) {
+                    return new double[n.intValue()];
+                }
+                java.util.List<Object> items = new ArrayList<>();
+                for (clojure.lang.ISeq seq = seqOf(args[0]); seq != null; seq = seq.next())
+                    items.add(seq.first());
+                double[] result = new double[items.size()];
+                for (int i = 0; i < items.size(); i++)
+                    result[i] = ((Number) items.get(i)).doubleValue();
+                return result;
+            } else if (args.length == 2) {
+                int size = ((Number) args[0]).intValue();
+                double[] result = new double[size];
+                if (args[1] instanceof Number n) {
+                    java.util.Arrays.fill(result, n.doubleValue());
+                } else {
+                    int i = 0;
+                    for (clojure.lang.ISeq seq = seqOf(args[1]); seq != null && i < size; seq = seq.next(), i++)
+                        result[i] = ((Number) seq.first()).doubleValue();
+                }
+                return result;
+            }
+            throw new RuntimeException("double-array: expected 1-2 args");
+        });
+
+        defBuiltin("char-array", args -> {
+            if (args.length == 1) {
+                if (args[0] instanceof Number n) {
+                    return new char[n.intValue()];
+                }
+                if (args[0] instanceof String s) {
+                    return s.toCharArray();
+                }
+                java.util.List<Object> items = new ArrayList<>();
+                for (clojure.lang.ISeq seq = seqOf(args[0]); seq != null; seq = seq.next())
+                    items.add(seq.first());
+                char[] result = new char[items.size()];
+                for (int i = 0; i < items.size(); i++) {
+                    Object item = items.get(i);
+                    result[i] = (item instanceof Character c) ? c : (char) ((Number) item).intValue();
+                }
+                return result;
+            }
+            throw new RuntimeException("char-array: expected 1 arg");
+        });
+
+        defBuiltin("boolean-array", args -> {
+            if (args.length == 1) {
+                if (args[0] instanceof Number n) {
+                    return new boolean[n.intValue()];
+                }
+                java.util.List<Object> items = new ArrayList<>();
+                for (clojure.lang.ISeq seq = seqOf(args[0]); seq != null; seq = seq.next())
+                    items.add(seq.first());
+                boolean[] result = new boolean[items.size()];
+                for (int i = 0; i < items.size(); i++)
+                    result[i] = isTruthy(items.get(i));
+                return result;
+            }
+            throw new RuntimeException("boolean-array: expected 1 arg");
+        });
+
         defBuiltin("object-array", args -> {
             checkArity(args, 1, "object-array");
             if (args[0] instanceof Number n) {
@@ -4205,7 +4523,7 @@ public class ClojureContext {
             }
             // Convert collection to array
             java.util.List<Object> items = new ArrayList<>();
-            for (clojure.lang.ISeq seq = clojure.lang.RT.seq(args[0]); seq != null; seq = seq.next()) {
+            for (clojure.lang.ISeq seq = seqOf(args[0]); seq != null; seq = seq.next()) {
                 items.add(seq.first());
             }
             return items.toArray();
@@ -4214,7 +4532,7 @@ public class ClojureContext {
         defBuiltin("to-array", args -> {
             checkArity(args, 1, "to-array");
             java.util.List<Object> items = new ArrayList<>();
-            for (clojure.lang.ISeq seq = clojure.lang.RT.seq(args[0]); seq != null; seq = seq.next()) {
+            for (clojure.lang.ISeq seq = seqOf(args[0]); seq != null; seq = seq.next()) {
                 items.add(seq.first());
             }
             return items.toArray();
@@ -4223,7 +4541,7 @@ public class ClojureContext {
         defBuiltin("into-array", args -> {
             if (args.length == 1) {
                 java.util.List<Object> items = new ArrayList<>();
-                for (clojure.lang.ISeq seq = clojure.lang.RT.seq(args[0]); seq != null; seq = seq.next()) {
+                for (clojure.lang.ISeq seq = seqOf(args[0]); seq != null; seq = seq.next()) {
                     items.add(seq.first());
                 }
                 return items.toArray();
@@ -4231,7 +4549,7 @@ public class ClojureContext {
             checkArity(args, 2, "into-array");
             Class<?> clazz = (Class<?>) args[0];
             java.util.List<Object> items = new ArrayList<>();
-            for (clojure.lang.ISeq seq = clojure.lang.RT.seq(args[1]); seq != null; seq = seq.next()) {
+            for (clojure.lang.ISeq seq = seqOf(args[1]); seq != null; seq = seq.next()) {
                 items.add(seq.first());
             }
             Object arr = java.lang.reflect.Array.newInstance(clazz, items.size());
@@ -4349,7 +4667,7 @@ public class ClojureContext {
         defBuiltin("dorun", args -> {
             if (args.length < 1) throw new RuntimeException("dorun: expected 1-2 args");
             Object coll = args.length == 1 ? args[0] : args[1];
-            for (clojure.lang.ISeq seq = clojure.lang.RT.seq(coll); seq != null; seq = seq.next()) {
+            for (clojure.lang.ISeq seq = seqOf(coll); seq != null; seq = seq.next()) {
                 // force evaluation
             }
             return ClojureNil.INSTANCE;
@@ -4358,7 +4676,7 @@ public class ClojureContext {
         defBuiltin("doall", args -> {
             if (args.length < 1) throw new RuntimeException("doall: expected 1-2 args");
             Object coll = args.length == 1 ? args[0] : args[1];
-            clojure.lang.ISeq seq = clojure.lang.RT.seq(coll);
+            clojure.lang.ISeq seq = seqOf(coll);
             if (seq == null) return clojure.lang.PersistentList.EMPTY;
             // Force full realization
             java.util.List<Object> items = new ArrayList<>();
@@ -4447,6 +4765,22 @@ public class ClojureContext {
         });
 
         // dedupe
+        defBuiltin("cat", args -> {
+            // cat is a transducer that concatenates elements from inner collections
+            checkArity(args, 1, "cat");
+            Object rf = args[0];
+            return new TransducerRf(rf) {
+                @Override public Object step(Object acc, Object input) {
+                    Object result = acc;
+                    for (clojure.lang.ISeq s = seqOf(input); s != null; s = s.next()) {
+                        result = callFunction(innerRf, new Object[]{result, s.first()});
+                        if (result instanceof Reduced) return result;
+                    }
+                    return result;
+                }
+            };
+        });
+
         defBuiltin("dedupe", args -> {
             if (args.length == 0) {
                 // Return transducer
@@ -4465,7 +4799,7 @@ public class ClojureContext {
             checkArity(args, 1, "dedupe");
             java.util.List<Object> result = new ArrayList<>();
             Object prev = new Object(); // sentinel
-            for (clojure.lang.ISeq seq = clojure.lang.RT.seq(args[0]); seq != null; seq = seq.next()) {
+            for (clojure.lang.ISeq seq = seqOf(args[0]); seq != null; seq = seq.next()) {
                 Object item = seq.first();
                 if (!item.equals(prev)) {
                     result.add(item);
@@ -4555,7 +4889,7 @@ public class ClojureContext {
             };
             Object xrf = callFunction(xform, new Object[]{collectRf});
             Object acc = result;
-            for (clojure.lang.ISeq seq = clojure.lang.RT.seq(coll); seq != null; seq = seq.next()) {
+            for (clojure.lang.ISeq seq = seqOf(coll); seq != null; seq = seq.next()) {
                 acc = callFunction(xrf, new Object[]{acc, seq.first()});
                 if (acc instanceof Reduced r) { acc = r.value; break; }
             }
@@ -4576,7 +4910,7 @@ public class ClojureContext {
                 return v.nth((int) (Math.random() * v.count()));
             }
             java.util.List<Object> items = new ArrayList<>();
-            for (clojure.lang.ISeq seq = clojure.lang.RT.seq(args[0]); seq != null; seq = seq.next())
+            for (clojure.lang.ISeq seq = seqOf(args[0]); seq != null; seq = seq.next())
                 items.add(seq.first());
             return items.get((int) (Math.random() * items.size()));
         });
@@ -4585,7 +4919,7 @@ public class ClojureContext {
         defBuiltin("shuffle", args -> {
             checkArity(args, 1, "shuffle");
             java.util.List<Object> items = new ArrayList<>();
-            for (clojure.lang.ISeq seq = clojure.lang.RT.seq(args[0]); seq != null; seq = seq.next())
+            for (clojure.lang.ISeq seq = seqOf(args[0]); seq != null; seq = seq.next())
                 items.add(seq.first());
             java.util.Collections.shuffle(items);
             return clojure.lang.PersistentVector.create(items);
@@ -4595,7 +4929,7 @@ public class ClojureContext {
         defBuiltin("not-any?", args -> {
             checkArity(args, 2, "not-any?");
             Object pred = args[0];
-            for (clojure.lang.ISeq seq = clojure.lang.RT.seq(args[1]); seq != null; seq = seq.next()) {
+            for (clojure.lang.ISeq seq = seqOf(args[1]); seq != null; seq = seq.next()) {
                 if (isTruthy(callFunction(pred, new Object[]{seq.first()}))) return false;
             }
             return true;
@@ -4605,7 +4939,7 @@ public class ClojureContext {
         defBuiltin("not-every?", args -> {
             checkArity(args, 2, "not-every?");
             Object pred = args[0];
-            for (clojure.lang.ISeq seq = clojure.lang.RT.seq(args[1]); seq != null; seq = seq.next()) {
+            for (clojure.lang.ISeq seq = seqOf(args[1]); seq != null; seq = seq.next()) {
                 if (!isTruthy(callFunction(pred, new Object[]{seq.first()}))) return true;
             }
             return false;
@@ -4816,6 +5150,28 @@ public class ClojureContext {
                 }
                 return newMeta;
             }
+            if (args[0] instanceof clojure.truffle.runtime.MultiArityFunction maf) {
+                fArgs[0] = maf.getMeta();
+                if (fArgs[0] == null || fArgs[0] instanceof ClojureNil) {
+                    fArgs[0] = clojure.lang.PersistentArrayMap.EMPTY;
+                }
+                Object newMeta = callFunction(f, fArgs);
+                if (newMeta instanceof clojure.lang.IPersistentMap m) {
+                    maf.setMeta(m);
+                }
+                return newMeta;
+            }
+            if (args[0] instanceof NamedBuiltin nb) {
+                fArgs[0] = nb.getMeta();
+                if (fArgs[0] == null || fArgs[0] instanceof ClojureNil) {
+                    fArgs[0] = clojure.lang.PersistentArrayMap.EMPTY;
+                }
+                Object newMeta = callFunction(f, fArgs);
+                if (newMeta instanceof clojure.lang.IPersistentMap m) {
+                    nb.setMeta(m);
+                }
+                return newMeta;
+            }
             // For other IObj types, try with-meta approach
             if (args[0] instanceof clojure.lang.IObj iobj) {
                 fArgs[0] = iobj.meta();
@@ -4826,7 +5182,9 @@ public class ClojureContext {
                     return newMeta;
                 }
             }
-            throw new RuntimeException("alter-meta!: unsupported reference type: " + args[0].getClass().getName());
+            // Fallback: apply f but can't store the result
+            fArgs[0] = clojure.lang.PersistentArrayMap.EMPTY;
+            return callFunction(f, fArgs);
         });
 
         // pmap
@@ -4834,7 +5192,7 @@ public class ClojureContext {
             if (args.length < 2) throw new RuntimeException("pmap: expected at least 2 args");
             Object f = args[0];
             java.util.List<Object> items = new ArrayList<>();
-            for (clojure.lang.ISeq seq = clojure.lang.RT.seq(args[1]); seq != null; seq = seq.next())
+            for (clojure.lang.ISeq seq = seqOf(args[1]); seq != null; seq = seq.next())
                 items.add(seq.first());
             java.util.List<java.util.concurrent.Future<Object>> futures = new ArrayList<>();
             java.util.concurrent.ExecutorService executor =
@@ -4920,10 +5278,10 @@ public class ClojureContext {
             Object pred = args[0];
             Object coll = args[1];
             java.util.List<Object> result = new java.util.ArrayList<>();
-            for (clojure.lang.ISeq s = clojure.lang.RT.seq(coll); s != null; s = s.next()) {
+            for (clojure.lang.ISeq s = seqOf(coll); s != null; s = s.next()) {
                 Object item = s.first();
                 Object test = callFunction(pred, new Object[]{item});
-                if (!clojure.lang.RT.booleanCast(test)) {
+                if (!isTruthy(test)) {
                     result.add(item);
                 }
             }
@@ -5110,7 +5468,7 @@ public class ClojureContext {
             checkArity(args, 2, "group-by");
             Object f = args[0];
             clojure.lang.IPersistentMap result = clojure.lang.PersistentArrayMap.EMPTY;
-            for (clojure.lang.ISeq s = clojure.lang.RT.seq(args[1]); s != null; s = s.next()) {
+            for (clojure.lang.ISeq s = seqOf(args[1]); s != null; s = s.next()) {
                 Object item = s.first();
                 Object key = callFunction(f, new Object[]{item});
                 Object existing = result.valAt(key);
@@ -5129,7 +5487,7 @@ public class ClojureContext {
         defBuiltin("frequencies", args -> {
             checkArity(args, 1, "frequencies");
             clojure.lang.IPersistentMap result = clojure.lang.PersistentArrayMap.EMPTY;
-            for (clojure.lang.ISeq s = clojure.lang.RT.seq(args[0]); s != null; s = s.next()) {
+            for (clojure.lang.ISeq s = seqOf(args[0]); s != null; s = s.next()) {
                 Object item = s.first();
                 Object count = result.valAt(item);
                 long n = (count == null) ? 0L : ((Number) count).longValue();
@@ -5145,7 +5503,7 @@ public class ClojureContext {
             java.util.List<Object> result = new java.util.ArrayList<>();
             java.util.List<Object> current = new java.util.ArrayList<>();
             Object lastKey = new Object(); // sentinel
-            for (clojure.lang.ISeq s = clojure.lang.RT.seq(args[1]); s != null; s = s.next()) {
+            for (clojure.lang.ISeq s = seqOf(args[1]); s != null; s = s.next()) {
                 Object item = s.first();
                 Object key = callFunction(f, new Object[]{item});
                 if (!current.isEmpty() && !clojure.lang.Util.equiv(key, lastKey)) {
@@ -5165,7 +5523,7 @@ public class ClojureContext {
             Object f = args[0];
             java.util.List<Object> result = new java.util.ArrayList<>();
             long idx = 0;
-            for (clojure.lang.ISeq s = clojure.lang.RT.seq(args[1]); s != null; s = s.next()) {
+            for (clojure.lang.ISeq s = seqOf(args[1]); s != null; s = s.next()) {
                 result.add(callFunction(f, new Object[]{idx, s.first()}));
                 idx++;
             }
@@ -5248,7 +5606,7 @@ public class ClojureContext {
             checkArity(args, 2, "select-keys");
             clojure.lang.IPersistentMap m = (clojure.lang.IPersistentMap) args[0];
             clojure.lang.IPersistentMap result = clojure.lang.PersistentArrayMap.EMPTY;
-            for (clojure.lang.ISeq s = clojure.lang.RT.seq(args[1]); s != null; s = s.next()) {
+            for (clojure.lang.ISeq s = seqOf(args[1]); s != null; s = s.next()) {
                 Object key = s.first();
                 clojure.lang.IMapEntry entry = m.entryAt(key);
                 if (entry != null) {
@@ -5262,8 +5620,10 @@ public class ClojureContext {
         defBuiltin("zipmap", args -> {
             checkArity(args, 2, "zipmap");
             clojure.lang.IPersistentMap result = clojure.lang.PersistentArrayMap.EMPTY;
-            clojure.lang.ISeq ks = clojure.lang.RT.seq(args[0]);
-            clojure.lang.ISeq vs = clojure.lang.RT.seq(args[1]);
+            if (args[0] == null || args[0] instanceof ClojureNil ||
+                args[1] == null || args[1] instanceof ClojureNil) return result;
+            clojure.lang.ISeq ks = seqOf(args[0]);
+            clojure.lang.ISeq vs = seqOf(args[1]);
             while (ks != null && vs != null) {
                 result = result.assoc(ks.first(), vs.first());
                 ks = ks.next();
@@ -5748,7 +6108,7 @@ public class ClojureContext {
                 return clojure.lang.PersistentVector.create(result);
             }
             // For seqs
-            clojure.lang.ISeq s = clojure.lang.RT.seq(coll);
+            clojure.lang.ISeq s = seqOf(coll);
             java.util.List<Object> result = new java.util.ArrayList<>();
             while (s != null) {
                 Object item = s.first();
@@ -5817,7 +6177,7 @@ public class ClojureContext {
     /**
      * Search for a resource (.clj file) in classpath entries, then classloader, then filesystem.
      */
-    private java.io.InputStream findResource(String path) {
+    public java.io.InputStream findResource(String path) {
         // 1. Search -cp classpath entries (JARs and directories)
         for (String entry : classpathEntries) {
             java.io.File f = new java.io.File(entry);
@@ -5874,6 +6234,11 @@ public class ClojureContext {
     }
 
     public Object callFunction(Object fn, Object[] args) {
+        // Dereference ClojureVar to its value
+        if (fn instanceof clojure.truffle.runtime.ClojureVar cvar) {
+            Object val = cvar.deref();
+            return callFunction(val, args);
+        }
         if (fn instanceof ClojureFunction clf) {
                 Object[] callArgs = new Object[args.length + 1];
                 callArgs[0] = clf;
@@ -5895,11 +6260,27 @@ public class ClojureContext {
                     throw new RuntimeException("Keyword lookup expects 1 or 2 args");
                 Object map = args[0];
                 if (map instanceof clojure.lang.ILookup lookup) {
-                    Object notFound = args.length == 2 ? args[1] : ClojureNil.INSTANCE;
+                        Object notFound = args.length == 2 ? args[1] : ClojureNil.INSTANCE;
                     Object val = lookup.valAt(kw, notFound);
                     return val == null ? ClojureNil.INSTANCE : val;
                 }
                 return args.length == 2 ? args[1] : ClojureNil.INSTANCE;
+            } else if (fn instanceof clojure.lang.IPersistentSet s) {
+                if (args.length != 1)
+                    throw new RuntimeException("Set lookup expects 1 arg");
+                Object val = s.get(args[0]);
+                return val == null ? ClojureNil.INSTANCE : val;
+            } else if (fn instanceof clojure.lang.IPersistentMap m) {
+                if (args.length < 1 || args.length > 2)
+                    throw new RuntimeException("Map lookup expects 1 or 2 args");
+                Object val = m.valAt(args[0],
+                        args.length == 2 ? args[1] : ClojureNil.INSTANCE);
+                return val == null ? ClojureNil.INSTANCE : val;
+            } else if (fn instanceof clojure.lang.IPersistentVector v) {
+                if (args.length != 1)
+                    throw new RuntimeException("Vector lookup expects 1 arg");
+                int idx = ((Number) args[0]).intValue();
+                return v.nth(idx);
             }
             throw new RuntimeException("Not a function: " + fn);
     }
@@ -5918,11 +6299,19 @@ public class ClojureContext {
     // --- Seq helper ---
 
     private static clojure.lang.ISeq seqOf(Object coll) {
-        if (coll instanceof ClojureNil) return null;
+        if (coll == null || coll instanceof ClojureNil) return null;
         if (coll instanceof LazySeq ls) return ls.seq();
-        if (coll instanceof clojure.lang.ISeq seq) return seq;
+        if (coll instanceof clojure.lang.ISeq seq) {
+            // Must call seq() to normalize: EmptyList is ISeq but seq() returns null
+            return seq.seq();
+        }
         if (coll instanceof clojure.lang.Seqable s) return s.seq();
-        throw new RuntimeException("Not seqable: " + coll);
+        // Delegate to RT.seq for String, Iterable, arrays, Map etc.
+        try {
+            return clojure.lang.RT.seq(coll);
+        } catch (IllegalArgumentException e) {
+            throw new RuntimeException("Not seqable: " + coll);
+        }
     }
 
     // --- Lazy helpers ---
@@ -5939,6 +6328,26 @@ public class ClojureContext {
             clojure.lang.ISeq rest = s.next();
             LazySeq lazyRest = (LazySeq) lazyMap(fn, rest == null ? (Object) ClojureNil.INSTANCE : rest);
             return (Object) new clojure.lang.Cons(first, lazyRest);
+        });
+    }
+
+    private Object lazyMapMulti(Object fn, clojure.lang.ISeq[] seqs) {
+        return new LazySeq(() -> {
+            Object[] firsts = new Object[seqs.length];
+            clojure.lang.ISeq[] nexts = new clojure.lang.ISeq[seqs.length];
+            for (int i = 0; i < seqs.length; i++) {
+                if (seqs[i] == null) return null;
+                firsts[i] = seqs[i].first();
+                nexts[i] = seqs[i].next();
+            }
+            Object result = callFunction(fn, firsts);
+            // Check if any seq is exhausted
+            boolean hasMore = true;
+            for (clojure.lang.ISeq n : nexts) {
+                if (n == null) { hasMore = false; break; }
+            }
+            if (!hasMore) return (Object) new clojure.lang.Cons(result, null);
+            return (Object) new clojure.lang.Cons(result, (LazySeq) lazyMapMulti(fn, nexts));
         });
     }
 
@@ -6253,7 +6662,7 @@ public class ClojureContext {
         ClojureNamespace ns = getOrCreateNamespace("clojure.string");
         // Map str/xxx builtins to clojure.string/xxx
         String[] fns = {"split", "join", "trim", "triml", "trimr", "upper-case", "lower-case",
-                "replace", "replace-first", "starts-with?", "ends-with?", "includes?",
+                "capitalize", "replace", "replace-first", "starts-with?", "ends-with?", "includes?",
                 "blank?", "index-of", "last-index-of", "reverse"};
         for (String fn : fns) {
             Object val = globalVars.get("str/" + fn);
@@ -6266,7 +6675,7 @@ public class ClojureContext {
         ns.intern("union", (BuiltinFunction) args -> {
             clojure.lang.IPersistentSet result = clojure.lang.PersistentHashSet.EMPTY;
             for (Object arg : args) {
-                for (clojure.lang.ISeq seq = clojure.lang.RT.seq(arg); seq != null; seq = seq.next()) {
+                for (clojure.lang.ISeq seq = seqOf(arg); seq != null; seq = seq.next()) {
                     result = (clojure.lang.IPersistentSet) result.cons(seq.first());
                 }
             }
@@ -6314,6 +6723,49 @@ public class ClojureContext {
             }
             return true;
         });
+        ns.intern("map-invert", (BuiltinFunction) args -> {
+            checkArity(args, 1, "map-invert");
+            clojure.lang.IPersistentMap result = clojure.lang.PersistentArrayMap.EMPTY;
+            for (clojure.lang.ISeq seq = seqOf(args[0]); seq != null; seq = seq.next()) {
+                clojure.lang.MapEntry entry = (clojure.lang.MapEntry) seq.first();
+                result = result.assoc(entry.val(), entry.key());
+            }
+            return result;
+        });
+        ns.intern("rename-keys", (BuiltinFunction) args -> {
+            checkArity(args, 2, "rename-keys");
+            clojure.lang.IPersistentMap m = (clojure.lang.IPersistentMap) args[0];
+            clojure.lang.IPersistentMap kmap = (clojure.lang.IPersistentMap) args[1];
+            clojure.lang.IPersistentMap result = m;
+            for (clojure.lang.ISeq seq = kmap.seq(); seq != null; seq = seq.next()) {
+                clojure.lang.MapEntry entry = (clojure.lang.MapEntry) seq.first();
+                Object oldKey = entry.key();
+                Object newKey = entry.val();
+                if (m.containsKey(oldKey)) {
+                    result = result.without(oldKey);
+                    result = result.assoc(newKey, m.valAt(oldKey));
+                }
+            }
+            return result;
+        });
+        ns.intern("join", (BuiltinFunction) args -> {
+            // clojure.set/join: natural join of two relations
+            if (args.length < 2) throw new RuntimeException("clojure.set/join: expected 2+ args");
+            // Simplified: return first arg
+            return args[0];
+        });
+        ns.intern("select", (BuiltinFunction) args -> {
+            checkArity(args, 2, "clojure.set/select");
+            Object pred = args[0];
+            clojure.lang.IPersistentSet s = (clojure.lang.IPersistentSet) args[1];
+            clojure.lang.IPersistentSet result = clojure.lang.PersistentHashSet.EMPTY;
+            for (clojure.lang.ISeq seq = s.seq(); seq != null; seq = seq.next()) {
+                if (isTruthy(callFunction(pred, new Object[]{seq.first()}))) {
+                    result = (clojure.lang.IPersistentSet) result.cons(seq.first());
+                }
+            }
+            return result;
+        });
     }
 
     private void registerWalkNamespace() {
@@ -6329,6 +6781,54 @@ public class ClojureContext {
         ClojureNamespace ns = getOrCreateNamespace("clojure.edn");
         Object readStr = globalVars.get("read-string");
         if (readStr != null) ns.intern("read-string", readStr);
+    }
+
+    private void registerPprintNamespace() {
+        ClojureNamespace ns = getOrCreateNamespace("clojure.pprint");
+
+        // pprint: pretty-print an object
+        ns.intern("pprint", (BuiltinFunction) args -> {
+            if (args.length < 1 || args.length > 2) throw new RuntimeException("pprint: expected 1-2 args");
+            Object obj = args[0];
+            java.io.Writer writer = (args.length == 2 && args[1] instanceof java.io.Writer w) ? w : new java.io.OutputStreamWriter(System.out);
+            String s = printString(obj, true);
+            try {
+                writer.write(s);
+                writer.write("\n");
+                writer.flush();
+            } catch (java.io.IOException e) {
+                throw new RuntimeException(e);
+            }
+            return ClojureNil.INSTANCE;
+        });
+
+        // cl-format: simplified - just delegate to format
+        ns.intern("cl-format", (BuiltinFunction) args -> {
+            // Simplified: cl-format writer fmt args...
+            // For basic use, just return formatted string
+            if (args.length < 2) throw new RuntimeException("cl-format: expected at least 2 args");
+            return ClojureNil.INSTANCE; // stub
+        });
+
+        // print-table: print a collection of maps as a table
+        ns.intern("print-table", (BuiltinFunction) args -> {
+            // Simplified stub
+            if (args.length < 1) throw new RuntimeException("print-table: expected at least 1 arg");
+            Object rows = args.length == 2 ? args[1] : args[0];
+            for (clojure.lang.ISeq seq = seqOf(rows); seq != null; seq = seq.next()) {
+                System.out.println(printString(seq.first(), true));
+            }
+            return ClojureNil.INSTANCE;
+        });
+
+        // write: stub
+        ns.intern("write", (BuiltinFunction) args -> {
+            if (args.length >= 1) System.out.print(printString(args[0], true));
+            return ClojureNil.INSTANCE;
+        });
+
+        // *print-right-margin*
+        ns.intern("*print-right-margin*", 72L);
     }
 
     private void registerJavaIoNamespace() {
@@ -6379,9 +6879,12 @@ public class ClojureContext {
         });
 
         ns.intern("file", (BuiltinFunction) args -> {
-            if (args.length == 1) return new java.io.File(args[0].toString());
-            if (args.length == 2) return new java.io.File(args[0].toString(), args[1].toString());
-            throw new RuntimeException("file: expected 1 or 2 args");
+            if (args.length == 0) throw new RuntimeException("file: expected at least 1 arg");
+            java.io.File f = new java.io.File(args[0].toString());
+            for (int i = 1; i < args.length; i++) {
+                f = new java.io.File(f, args[i].toString());
+            }
+            return f;
         });
 
         ns.intern("input-stream", (BuiltinFunction) args -> {
@@ -6720,7 +7223,7 @@ public class ClojureContext {
             walked = result;
         } else if (form instanceof clojure.lang.IPersistentList || form instanceof clojure.lang.ISeq) {
             java.util.List<Object> result = new ArrayList<>();
-            for (clojure.lang.ISeq seq = clojure.lang.RT.seq(form); seq != null; seq = seq.next()) {
+            for (clojure.lang.ISeq seq = seqOf(form); seq != null; seq = seq.next()) {
                 result.add(postwalk(f, seq.first()));
             }
             walked = result.isEmpty() ? clojure.lang.PersistentList.EMPTY : clojure.lang.PersistentList.create(result);
@@ -6751,7 +7254,7 @@ public class ClojureContext {
             return result;
         } else if (prewalked instanceof clojure.lang.IPersistentList || prewalked instanceof clojure.lang.ISeq) {
             java.util.List<Object> result = new ArrayList<>();
-            for (clojure.lang.ISeq seq = clojure.lang.RT.seq(prewalked); seq != null; seq = seq.next()) {
+            for (clojure.lang.ISeq seq = seqOf(prewalked); seq != null; seq = seq.next()) {
                 result.add(prewalk(f, seq.first()));
             }
             return result.isEmpty() ? clojure.lang.PersistentList.EMPTY : clojure.lang.PersistentList.create(result);
@@ -6800,7 +7303,7 @@ public class ClojureContext {
     private void flattenHelper(Object coll, java.util.List<Object> result) {
         if (coll == null || coll == ClojureNil.INSTANCE) return;
         if (coll instanceof clojure.lang.Seqable) {
-            for (clojure.lang.ISeq s = clojure.lang.RT.seq(coll); s != null; s = s.next()) {
+            for (clojure.lang.ISeq s = seqOf(coll); s != null; s = s.next()) {
                 Object item = s.first();
                 if (item instanceof clojure.lang.Seqable && !(item instanceof String)
                         && !(item instanceof clojure.lang.MapEntry)) {
@@ -6815,6 +7318,7 @@ public class ClojureContext {
     }
 
     private Object updateIn(Object m, clojure.lang.IPersistentVector ks, int i, Object f, Object[] extraArgs) {
+        if (m == null || m instanceof ClojureNil) m = clojure.lang.PersistentArrayMap.EMPTY;
         if (i == ks.count() - 1) {
             Object key = ks.nth(i);
             Object oldVal = ClojureNil.INSTANCE;

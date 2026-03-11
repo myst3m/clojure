@@ -12,7 +12,7 @@ import clojure.lang.IPersistentMap;
  * This is the object returned by (var x) or #'x.
  */
 @ExportLibrary(InteropLibrary.class)
-public class ClojureVar implements TruffleObject, IDeref {
+public class ClojureVar implements TruffleObject, IDeref, clojure.lang.IMeta, clojure.lang.IHashEq {
 
     private final String namespace;
     private final String name;
@@ -33,7 +33,39 @@ public class ClojureVar implements TruffleObject, IDeref {
 
     @Override
     public Object deref() {
+        // Try namespace-qualified lookup first
+        if (namespace != null) {
+            String qname = namespace + "/" + name;
+            Object val = context.getVarWithBindings(qname);
+            if (val != null) return val;
+            // Also check namespace's own vars
+            ClojureNamespace ns = context.getNamespace(namespace);
+            if (ns != null) {
+                val = ns.resolve(name);
+                if (val != null) return val;
+            }
+        }
         return context.getVarWithBindings(name);
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (!(o instanceof ClojureVar other)) return false;
+        return java.util.Objects.equals(namespace, other.namespace)
+            && java.util.Objects.equals(name, other.name);
+    }
+
+    @Override
+    public int hashCode() {
+        return java.util.Objects.hash(namespace, name);
+    }
+
+    @Override
+    public int hasheq() {
+        return clojure.lang.Util.hashCombine(
+            clojure.lang.Util.hasheq(namespace),
+            clojure.lang.Util.hasheq(name));
     }
 
     public Object get() {
@@ -52,8 +84,26 @@ public class ClojureVar implements TruffleObject, IDeref {
         return context.getVar(name) != null;
     }
 
-    public IPersistentMap getMeta() { return meta; }
-    public void setMeta(IPersistentMap meta) { this.meta = meta; }
+    public IPersistentMap getMeta() {
+        if (meta != null) return meta;
+        // Look up from context's var metadata store
+        if (context != null) {
+            String qname = namespace != null ? namespace + "/" + name : name;
+            return context.getVarMeta(qname);
+        }
+        return null;
+    }
+    public void setMeta(IPersistentMap meta) {
+        this.meta = meta;
+        // Write through to context's central store
+        if (context != null && meta != null) {
+            String qname = namespace != null ? namespace + "/" + name : name;
+            context.setVarMeta(qname, meta);
+        }
+    }
+
+    @Override
+    public IPersistentMap meta() { return getMeta(); }
 
     @ExportMessage
     boolean hasLanguage() { return true; }

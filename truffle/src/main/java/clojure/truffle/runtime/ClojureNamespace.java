@@ -7,6 +7,7 @@ public class ClojureNamespace {
     private final String name;
     private final ConcurrentHashMap<String, Object> interns = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Object> refers = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, String> referSources = new ConcurrentHashMap<>(); // sym -> source ns name
     private final ConcurrentHashMap<String, ClojureNamespace> aliases = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Class<?>> imports = new ConcurrentHashMap<>();
 
@@ -33,14 +34,25 @@ public class ClojureNamespace {
         refers.put(sym, val);
     }
 
+    public void refer(String sym, Object val, String sourceNs) {
+        refers.put(sym, val);
+        if (sourceNs != null) referSources.put(sym, sourceNs);
+    }
+
     public void referAll(ClojureNamespace other) {
         refers.putAll(other.interns);
+        for (String sym : other.interns.keySet()) {
+            referSources.put(sym, other.getName());
+        }
     }
 
     public void referOnly(ClojureNamespace other, java.util.List<String> syms) {
         for (String sym : syms) {
             Object val = other.resolve(sym);
-            if (val != null) refers.put(sym, val);
+            if (val != null) {
+                refers.put(sym, val);
+                referSources.put(sym, other.getName());
+            }
         }
     }
 
@@ -48,6 +60,7 @@ public class ClojureNamespace {
         for (var entry : other.interns.entrySet()) {
             if (!excludes.contains(entry.getKey())) {
                 refers.put(entry.getKey(), entry.getValue());
+                referSources.put(entry.getKey(), other.getName());
             }
         }
     }
@@ -56,7 +69,13 @@ public class ClojureNamespace {
         for (var entry : other.interns.entrySet()) {
             String newName = renames.getOrDefault(entry.getKey(), entry.getKey());
             refers.put(newName, entry.getValue());
+            referSources.put(newName, other.getName());
         }
+    }
+
+    /** Get the source namespace for a referred symbol */
+    public String getReferSource(String sym) {
+        return referSources.get(sym);
     }
 
     public void unmap(String sym) {

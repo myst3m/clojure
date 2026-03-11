@@ -15,6 +15,10 @@ public class FnNode extends ExpressionNode {
         this.outerCaptureSlots = outerCaptureSlots;
     }
 
+    public boolean hasOuterCaptures() {
+        return outerCaptureSlots != null && outerCaptureSlots.length > 0;
+    }
+
     @Override
     public Object executeGeneric(VirtualFrame frame) {
         Object[] captured = null;

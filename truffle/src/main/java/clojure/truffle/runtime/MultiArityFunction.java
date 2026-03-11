@@ -1,9 +1,12 @@
 package clojure.truffle.runtime;
 
+import clojure.lang.IPersistentMap;
+
 public class MultiArityFunction {
     private final int[] arities;
     private final ClojureFunction[] functions;
     private final int variadicIndex;
+    private volatile IPersistentMap meta;
 
     public MultiArityFunction(int[] arities, ClojureFunction[] functions, int variadicIndex) {
         this.arities = arities;
@@ -25,6 +28,9 @@ public class MultiArityFunction {
         }
         throw new RuntimeException("Wrong number of args (" + argCount + ") passed to fn");
     }
+
+    public IPersistentMap getMeta() { return meta; }
+    public void setMeta(IPersistentMap meta) { this.meta = meta; }
 
     @Override
     public String toString() {
