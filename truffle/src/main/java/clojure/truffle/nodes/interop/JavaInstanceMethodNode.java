@@ -33,7 +33,7 @@ public class JavaInstanceMethodNode extends ExpressionNode {
         }
 
         try {
-            Object[] coerced = JavaInteropUtil.coerceArgs(args, method.getParameterTypes());
+            Object[] coerced = JavaInteropUtil.coerceArgs(method, args);
             Object result = method.invoke(target, coerced);
             return JavaInteropUtil.wrapResult(result);
         } catch (java.lang.reflect.InvocationTargetException e) {

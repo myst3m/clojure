@@ -31,7 +31,7 @@ public class JavaStaticMethodNode extends ExpressionNode {
         }
 
         try {
-            Object[] coerced = JavaInteropUtil.coerceArgs(args, method.getParameterTypes());
+            Object[] coerced = JavaInteropUtil.coerceArgs(method, args);
             Object result = method.invoke(null, coerced);
             return JavaInteropUtil.wrapResult(result);
         } catch (java.lang.reflect.InvocationTargetException e) {

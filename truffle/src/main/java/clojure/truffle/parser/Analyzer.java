@@ -271,7 +271,7 @@ public class Analyzer {
                     case "with-open":   return analyzeWithOpen(seq);
                     case "with-out-str": return analyzeWithOutStr(seq);
                     case "reify":       return analyzeReify(seq);
-                    case "proxy":       return analyzeReify(seq); // similar handling
+                    case "proxy":       return analyzeProxy(seq);
                     case "extend-type": return analyzeExtendType(seq);
                     case "extend-protocol": return analyzeExtendProtocol(seq);
                     case "delay":       return analyzeDelay(seq);
@@ -2807,23 +2807,36 @@ public class Analyzer {
 
     private ExpressionNode analyzeReify(ISeq seq) {
         // (reify Protocol/Interface (method [args] body)...)
-        // For now, create a map-based dispatch object
         ISeq args = seq.next();
         if (args == null) return new NilNode();
 
         // Collect interface/protocol names and methods
-        List<Object> interfaces = new ArrayList<>();
+        List<Class<?>> javaInterfaces = new ArrayList<>();
+        List<Symbol> protocolNames = new ArrayList<>();
         java.util.Map<String, Object> methods = new java.util.LinkedHashMap<>();
 
         while (args != null) {
             Object item = args.first();
-            if (item instanceof Symbol) {
-                interfaces.add(item);
+            if (item instanceof Symbol sym) {
+                // Try to resolve as Java interface
+                try {
+                    Class<?> clazz = JavaInteropUtil.resolveClass(sym.getName());
+                    if (clazz.isInterface()) {
+                        javaInterfaces.add(clazz);
+                    } else {
+                        protocolNames.add(sym);
+                    }
+                } catch (RuntimeException e) {
+                    Object varVal = context.getVar(sym.getName());
+                    if (varVal instanceof Class<?> c && c.isInterface()) {
+                        javaInterfaces.add(c);
+                    } else {
+                        protocolNames.add(sym);
+                    }
+                }
             } else if (item instanceof ISeq methodDef) {
-                // (method-name [this args...] body...)
                 String methodName = ((Symbol) methodDef.first()).getName();
                 ISeq rest = methodDef.next();
-                // Build as fn form
                 List<Object> fnForm = new ArrayList<>();
                 fnForm.add(Symbol.intern("fn"));
                 while (rest != null) { fnForm.add(rest.first()); rest = rest.next(); }
@@ -2832,19 +2845,79 @@ public class Analyzer {
             args = args.next();
         }
 
-        // Create a deftype-like instance with method functions
-        // Analyze each method as a fn and store in a map
-        List<ExpressionNode> nodes = new ArrayList<>();
+        List<ExpressionNode> methodNodeList = new ArrayList<>();
         List<String> methodNames = new ArrayList<>();
         for (var entry : methods.entrySet()) {
             methodNames.add(entry.getKey());
-            nodes.add(analyze(entry.getValue()));
+            methodNodeList.add(analyze(entry.getValue()));
         }
 
-        // Return a ReifyNode that creates an object with these methods
+        // If there are Java interfaces, use ProxyNode for proper implementation
+        if (!javaInterfaces.isEmpty()) {
+            return new ProxyNode(context,
+                    javaInterfaces.toArray(new Class<?>[0]),
+                    methodNames.toArray(new String[0]),
+                    methodNodeList.toArray(new ExpressionNode[0]));
+        }
+
+        // Otherwise use simple ReifyNode for protocol-only
         return new clojure.truffle.nodes.ReifyNode(context,
                 methodNames.toArray(new String[0]),
-                nodes.toArray(new ExpressionNode[0]));
+                methodNodeList.toArray(new ExpressionNode[0]));
+    }
+
+    private ExpressionNode analyzeProxy(ISeq seq) {
+        // (proxy [Interface1 Interface2] [ctor-args]
+        //   (method1 [this arg] body)
+        //   (method2 [this arg1 arg2] body))
+        ISeq args = seq.next();
+        if (args == null) throw err("proxy: missing interface vector");
+
+        // Parse interfaces
+        IPersistentVector interfaceVec = (IPersistentVector) args.first();
+        List<Class<?>> interfaces = new ArrayList<>();
+        for (int i = 0; i < interfaceVec.count(); i++) {
+            Symbol ifaceSym = (Symbol) interfaceVec.nth(i);
+            String name = ifaceSym.getName();
+            try {
+                interfaces.add(JavaInteropUtil.resolveClass(name));
+            } catch (RuntimeException e) {
+                Object varVal = context.getVar(name);
+                if (varVal instanceof Class<?> c) {
+                    interfaces.add(c);
+                } else {
+                    throw new RuntimeException("proxy: cannot resolve interface: " + name);
+                }
+            }
+        }
+        args = args.next();
+
+        // Skip constructor args vector (not used for interface proxies)
+        if (args != null && args.first() instanceof IPersistentVector) {
+            args = args.next();
+        }
+
+        // Parse methods
+        List<String> methodNames = new ArrayList<>();
+        List<ExpressionNode> methodNodes = new ArrayList<>();
+        while (args != null) {
+            Object item = args.first();
+            if (item instanceof ISeq methodDef) {
+                String methodName = ((Symbol) methodDef.first()).getName();
+                ISeq rest = methodDef.next();
+                List<Object> fnForm = new ArrayList<>();
+                fnForm.add(Symbol.intern("fn"));
+                while (rest != null) { fnForm.add(rest.first()); rest = rest.next(); }
+                methodNames.add(methodName);
+                methodNodes.add(analyze(PersistentList.create(fnForm)));
+            }
+            args = args.next();
+        }
+
+        return new ProxyNode(context,
+                interfaces.toArray(new Class<?>[0]),
+                methodNames.toArray(new String[0]),
+                methodNodes.toArray(new ExpressionNode[0]));
     }
 
     private ExpressionNode analyzeDefonce(ISeq seq) {

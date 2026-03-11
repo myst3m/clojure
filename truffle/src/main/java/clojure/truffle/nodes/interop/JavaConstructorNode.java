@@ -22,14 +22,14 @@ public class JavaConstructorNode extends ExpressionNode {
             args[i] = argNodes[i].executeGeneric(frame);
         }
 
-        Constructor<?> ctor = JavaInteropUtil.findConstructor(clazz, args.length);
+        Constructor<?> ctor = JavaInteropUtil.findConstructor(clazz, args);
         if (ctor == null) {
             throw new RuntimeException("No matching constructor for " + clazz.getName() +
                     " with " + args.length + " args");
         }
 
         try {
-            Object[] coerced = JavaInteropUtil.coerceArgs(args, ctor.getParameterTypes());
+            Object[] coerced = JavaInteropUtil.coerceArgs(ctor, args);
             return ctor.newInstance(coerced);
         } catch (java.lang.reflect.InvocationTargetException e) {
             Throwable cause = e.getCause();
