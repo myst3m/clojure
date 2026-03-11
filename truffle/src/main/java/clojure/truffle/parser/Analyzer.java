@@ -299,6 +299,11 @@ public class Analyzer {
                         }
                     }
                 }
+                // Check if symbol resolves to a namespace var first (e.g. protocol, deftype)
+                // before trying Java class resolution, so user-defined names take priority
+                if (context != null && context.getVar(name) != null) {
+                    return new SymbolNode(context, name);
+                }
                 try {
                     Class<?> clazz = JavaInteropUtil.resolveClass(name);
                     return new QuoteNode(clazz);
@@ -1761,7 +1766,17 @@ public class Analyzer {
         if (key instanceof Keyword kw && kw.getName().equals("when")) {
             Object pred = bindings.nth(pos + 1);
             ExpressionNode innerNode = analyzeForBindings(bindings, pos + 2, body);
-            return new IfNode(analyze(pred), innerNode, new NilNode());
+            if (pos + 2 >= bindings.count()) {
+                // No more bindings after :when — innerNode is a bare value, not a seq.
+                // Wrap in (list value) so mapcat gets a seq to concatenate.
+                ExpressionNode listWrapped = new InvokeNode(
+                        new SymbolNode(context, "list"),
+                        new ExpressionNode[]{innerNode});
+                return new IfNode(analyze(pred), listWrapped, new NilNode());
+            } else {
+                // More bindings follow — innerNode already returns a seq from map/mapcat.
+                return new IfNode(analyze(pred), innerNode, new NilNode());
+            }
         }
 
         // :let modifier
@@ -2112,6 +2127,11 @@ public class Analyzer {
                             String targetName = (renames != null && renames.containsKey(symName))
                                     ? renames.get(symName) : symName;
                             currentNs.refer(targetName, val);
+                            // Also refer the macro entry if it exists
+                            Object macroVal = reqNs.resolve("__macro__" + symName);
+                            if (macroVal != null) {
+                                currentNs.refer("__macro__" + targetName, macroVal);
+                            }
                         }
                     }
                 }
@@ -3163,6 +3183,28 @@ public class Analyzer {
         return cl != null ? Class.forName(fqn, true, cl) : Class.forName(fqn);
     }
 
+    private boolean tryImportDeftype(String fqn) {
+        // For FQN like "clojure.tools.reader.reader_types.SourceLoggingPushbackReader",
+        // check if this is a deftype from a Clojure namespace.
+        // The namespace uses hyphens but the class FQN uses underscores.
+        int lastDot = fqn.lastIndexOf('.');
+        if (lastDot > 0) {
+            String nsPart = fqn.substring(0, lastDot).replace('_', '-');
+            String typeName = fqn.substring(lastDot + 1);
+            ClojureNamespace ns = context.getNamespace(nsPart);
+            if (ns != null) {
+                // Look up the deftype constructor or type name var in that namespace
+                Object typeVar = context.getVar(nsPart + "/" + typeName);
+                if (typeVar == null) typeVar = context.getVar(typeName);
+                if (typeVar != null) {
+                    context.setVar(typeName, typeVar);
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     private void processImportSpec(Object spec) {
         if (spec instanceof Symbol sym) {
             // (import java.util.ArrayList) - import single class
@@ -3172,7 +3214,9 @@ public class Analyzer {
                 String simpleName = clazz.getSimpleName();
                 context.setVar(simpleName, clazz);
             } catch (ClassNotFoundException e) {
-                throw new RuntimeException("import: class not found: " + fqn);
+                if (!tryImportDeftype(fqn)) {
+                    throw new RuntimeException("import: class not found: " + fqn);
+                }
             }
         } else if (spec instanceof IPersistentVector v) {
             // [java.util ArrayList HashMap] - package prefix form
@@ -3185,7 +3229,9 @@ public class Analyzer {
                     Class<?> clazz = loadClass(fqn);
                     context.setVar(className, clazz);
                 } catch (ClassNotFoundException e) {
-                    throw new RuntimeException("import: class not found: " + fqn);
+                    if (!tryImportDeftype(fqn)) {
+                        throw new RuntimeException("import: class not found: " + fqn);
+                    }
                 }
             }
         } else if (spec instanceof ISeq sl) {
@@ -3200,7 +3246,9 @@ public class Analyzer {
                         Class<?> clazz = loadClass(fqn);
                         context.setVar(className, clazz);
                     } catch (ClassNotFoundException e) {
-                        throw new RuntimeException("import: class not found: " + fqn);
+                        if (!tryImportDeftype(fqn)) {
+                            throw new RuntimeException("import: class not found: " + fqn);
+                        }
                     }
                 }
             }

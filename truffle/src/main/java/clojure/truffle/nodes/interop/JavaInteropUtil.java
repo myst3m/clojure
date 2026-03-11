@@ -65,13 +65,22 @@ public class JavaInteropUtil {
     public static Class<?> resolveClass(String name) {
         Class<?> cached = CLASS_CACHE.get(name);
         if (cached != null) return cached;
+        ClassLoader cl = Thread.currentThread().getContextClassLoader();
         try {
-            // Use thread context classloader (includes -cp entries)
-            ClassLoader cl = Thread.currentThread().getContextClassLoader();
             Class<?> clz = cl != null ? Class.forName(name, true, cl) : Class.forName(name);
             CLASS_CACHE.put(name, clz);
             return clz;
         } catch (ClassNotFoundException e) {
+            // Try java.lang. prefix for simple class names (e.g. ThreadLocal → java.lang.ThreadLocal)
+            if (!name.contains(".")) {
+                try {
+                    Class<?> clz = cl != null
+                            ? Class.forName("java.lang." + name, true, cl)
+                            : Class.forName("java.lang." + name);
+                    CLASS_CACHE.put(name, clz);
+                    return clz;
+                } catch (ClassNotFoundException ignored) {}
+            }
             throw new RuntimeException("Class not found: " + name);
         }
     }

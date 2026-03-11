@@ -198,6 +198,8 @@ public class ClojureContext {
         ClojureNamespace ns = namespaces.get(currentNamespace);
         if (ns != null) {
             ns.intern("__macro__" + name, fn);
+            // Also intern under the plain name so it can be referred/resolved normally
+            ns.intern(name, fn);
         }
     }
 
@@ -298,7 +300,7 @@ public class ClojureContext {
         if (!loadingNamespaces.add(nsName))
             throw new RuntimeException("Circular require detected: " + nsName);
         try {
-            String basePath = nsName.replace('.', '/');
+            String basePath = nsName.replace('.', '/').replace('-', '_');
             String path = basePath + ".clj";
             java.io.InputStream is = findResource(path);
             if (is == null) {
@@ -396,10 +398,21 @@ public class ClojureContext {
                 "*print-length*", "*print-level*", "*print-dup*", "*print-readably*",
                 "*print-namespace-maps*", "*data-readers*", "*default-data-reader-fn*",
                 "*read-eval*", "*command-line-args*", "*compile-path*",
-                "*compile-files*", "*assert*", "*math-context*"}) {
+                "*compile-files*", "*assert*", "*math-context*", "*file*"}) {
             globalVars.put(v, false);
             dynamicVars.add(v);
         }
+        // *clojure-version* - version map
+        clojure.lang.IPersistentMap versionMap = clojure.lang.RT.map(
+                clojure.lang.Keyword.intern("major"), 1L,
+                clojure.lang.Keyword.intern("minor"), 12L,
+                clojure.lang.Keyword.intern("incremental"), 0L,
+                clojure.lang.Keyword.intern("qualifier"), ClojureNil.INSTANCE);
+        globalVars.put("*clojure-version*", versionMap);
+        dynamicVars.add("*clojure-version*");
+        // Macro special vars: &env and &form (nil by default, set during macro expansion)
+        globalVars.put("&env", ClojureNil.INSTANCE);
+        globalVars.put("&form", ClojureNil.INSTANCE);
         // Arithmetic
         defBuiltin("+", args -> {
             if (args.length == 0) return 0L;
@@ -2976,13 +2989,17 @@ public class ClojureContext {
         // --- Phase 9: Atom watchers & validators ---
         defBuiltin("add-watch", args -> {
             checkArity(args, 3, "add-watch");
-            ClojureAtom atom = (ClojureAtom) args[0];
-            atom.addWatch(args[1], args[2]);
-            return atom;
+            if (args[0] instanceof ClojureAtom atom) {
+                atom.addWatch(args[1], args[2]);
+                return atom;
+            }
+            // For Vars and other reference types, silently accept (no-op)
+            return args[0];
         });
 
         defBuiltin("remove-watch", args -> {
             checkArity(args, 2, "remove-watch");
+            if (!(args[0] instanceof ClojureAtom)) return args[0];
             ClojureAtom atom = (ClojureAtom) args[0];
             atom.removeWatch(args[1]);
             return atom;
@@ -4768,17 +4785,48 @@ public class ClojureContext {
         // alter-meta!
         defBuiltin("alter-meta!", args -> {
             if (args.length < 2) throw new RuntimeException("alter-meta!: expected at least 2 args");
-            // For atoms and other reference types
+            Object f = args[1];
+            Object[] fArgs = new Object[args.length - 1];
+            System.arraycopy(args, 2, fArgs, 1, args.length - 2);
             if (args[0] instanceof clojure.truffle.runtime.ClojureAtom atom) {
-                Object f = args[1];
-                Object[] fArgs = new Object[args.length - 1];
                 fArgs[0] = atom.getMeta();
-                System.arraycopy(args, 2, fArgs, 1, args.length - 2);
                 Object newMeta = callFunction(f, fArgs);
                 atom.setMeta(newMeta);
                 return newMeta;
             }
-            throw new RuntimeException("alter-meta!: unsupported reference type");
+            if (args[0] instanceof clojure.truffle.runtime.ClojureVar cvar) {
+                fArgs[0] = cvar.getMeta();
+                if (fArgs[0] == null || fArgs[0] instanceof ClojureNil) {
+                    fArgs[0] = clojure.lang.PersistentArrayMap.EMPTY;
+                }
+                Object newMeta = callFunction(f, fArgs);
+                if (newMeta instanceof clojure.lang.IPersistentMap m) {
+                    cvar.setMeta(m);
+                }
+                return newMeta;
+            }
+            if (args[0] instanceof clojure.truffle.runtime.ClojureFunction cfn) {
+                fArgs[0] = cfn.getMeta();
+                if (fArgs[0] == null || fArgs[0] instanceof ClojureNil) {
+                    fArgs[0] = clojure.lang.PersistentArrayMap.EMPTY;
+                }
+                Object newMeta = callFunction(f, fArgs);
+                if (newMeta instanceof clojure.lang.IPersistentMap m) {
+                    cfn.setMeta(m);
+                }
+                return newMeta;
+            }
+            // For other IObj types, try with-meta approach
+            if (args[0] instanceof clojure.lang.IObj iobj) {
+                fArgs[0] = iobj.meta();
+                if (fArgs[0] == null) fArgs[0] = clojure.lang.PersistentArrayMap.EMPTY;
+                Object newMeta = callFunction(f, fArgs);
+                if (newMeta instanceof clojure.lang.IPersistentMap m) {
+                    // Can't mutate IObj, just return the result
+                    return newMeta;
+                }
+            }
+            throw new RuntimeException("alter-meta!: unsupported reference type: " + args[0].getClass().getName());
         });
 
         // pmap
@@ -5020,7 +5068,11 @@ public class ClojureContext {
         defBuiltin("num", args -> { checkArity(args, 1, "num"); return args[0]; });
         defBuiltin("long", args -> { checkArity(args, 1, "long"); return ((Number) args[0]).longValue(); });
         defBuiltin("double", args -> { checkArity(args, 1, "double"); return ((Number) args[0]).doubleValue(); });
-        defBuiltin("int", args -> { checkArity(args, 1, "int"); return (long)((Number) args[0]).intValue(); });
+        defBuiltin("int", args -> {
+            checkArity(args, 1, "int");
+            if (args[0] instanceof Character c) return (long) (int) c;
+            return (long)((Number) args[0]).intValue();
+        });
         defBuiltin("short", args -> { checkArity(args, 1, "short"); return (long)((Number) args[0]).shortValue(); });
         defBuiltin("byte", args -> { checkArity(args, 1, "byte"); return (long)((Number) args[0]).byteValue(); });
         defBuiltin("float", args -> { checkArity(args, 1, "float"); return (double)((Number) args[0]).floatValue(); });
@@ -5380,8 +5432,16 @@ public class ClojureContext {
         });
 
         defBuiltin("resolve", args -> {
-            checkArity(args, 1, "resolve");
-            String symName = nsNameFromArg(args[0]);
+            // (resolve sym) or (resolve env sym) — env is ignored in our implementation
+            if (args.length < 1 || args.length > 2) throw new RuntimeException("resolve: expected 1 or 2 args, got " + args.length);
+            Object symArg = args.length == 2 ? args[1] : args[0];
+            String symName;
+            if (symArg instanceof clojure.lang.Symbol sym) {
+                // Preserve namespace qualifier: taoensso.truss/have -> "taoensso.truss/have"
+                symName = sym.getNamespace() != null ? sym.getNamespace() + "/" + sym.getName() : sym.getName();
+            } else {
+                symName = nsNameFromArg(symArg);
+            }
             Object val = getVarWithBindings(symName);
             if (val == null) return ClojureNil.INSTANCE;
             return new clojure.truffle.runtime.ClojureVar(this, currentNamespace, symName);
@@ -6172,9 +6232,16 @@ public class ClojureContext {
 
     private static Object clojureConj(Object[] args) {
         Object coll = args[0];
+        // (conj nil x) => (list x) — Clojure treats nil as empty list
+        if (coll == null || coll instanceof ClojureNil) {
+            coll = clojure.lang.PersistentList.EMPTY;
+        }
         for (int i = 1; i < args.length; i++) {
+            Object val = args[i];
+            // (conj coll nil) is a no-op in Clojure
+            if (val == null || val instanceof ClojureNil) continue;
             if (coll instanceof clojure.lang.IPersistentCollection pc) {
-                coll = pc.cons(args[i]);
+                coll = pc.cons(val);
             } else {
                 throw new RuntimeException("conj: not a collection: " + coll);
             }
