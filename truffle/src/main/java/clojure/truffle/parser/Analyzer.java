@@ -529,6 +529,12 @@ public class Analyzer {
                 argForms = argForms.next();
             }
             Object expanded = context.callFunction(macro, rawArgs.toArray());
+            if (ClojureContext.DEBUG) {
+                String macroDesc = macro instanceof ClojureFunction cf ? cf.getName() :
+                    macro instanceof MultiArityFunction maf ? "MultiArityFunction" : macro.getClass().getSimpleName();
+                System.err.println("[MACRO-EXPAND] " + macroDesc + " => " +
+                    (expanded != null ? expanded.toString().substring(0, Math.min(300, expanded.toString().length())) : "nil"));
+            }
             return analyze(expanded);
         } finally {
             macroDepth--;
@@ -2576,8 +2582,28 @@ public class Analyzer {
                 Object varParam = params.nth(i);
                 if (varParam instanceof Symbol varSym) {
                     varSlot = currentScope.addLocal(varSym.getName());
+                } else if (varParam instanceof IPersistentMap) {
+                    // & {:keys [...]} — keyword argument destructuring
+                    // Rest args arrive as a seq like (:req-un [:a] :opt [:b])
+                    // Must convert to map via (apply hash-map seq) before map destructuring
+                    String tmpName = "__var_rest_" + i;
+                    varSlot = currentScope.addLocal(tmpName);
+                    if (destructSlots != null) {
+                        String mapTmpName = "__var_map_" + i;
+                        int mapSlot = currentScope.addLocal(mapTmpName);
+                        // (apply hash-map __var_rest_N)
+                        ExpressionNode applyHashMap = new InvokeNode(
+                                new SymbolNode(context, "apply"),
+                                new ExpressionNode[]{
+                                        new SymbolNode(context, "hash-map"),
+                                        new ReadLocalNode(varSlot)
+                                });
+                        destructSlots.add(mapSlot);
+                        destructValues.add(applyHashMap);
+                        expandMapDestructuring((IPersistentMap) varParam, mapSlot, destructSlots, destructValues);
+                    }
                 } else {
-                    // Destructured variadic param
+                    // Destructured variadic param (vector pattern)
                     String tmpName = "__var_destructure_" + i;
                     varSlot = currentScope.addLocal(tmpName);
                     if (destructSlots != null) {
