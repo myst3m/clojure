@@ -40,7 +40,11 @@ public class InvokeNode extends ExpressionNode {
             System.arraycopy(argValues, 0, callArgs, 1, argValues.length);
             return callNode.call(fn.getCallTarget(), callArgs);
         } else if (function instanceof ClojureContext.BuiltinFunction builtin) {
-            return builtin.execute(argValues);
+            try {
+                return builtin.execute(argValues);
+            } catch (Exception e) {
+                throw new RuntimeException("in builtin '" + builtin.name() + "': " + e.getMessage(), e);
+            }
         } else if (function instanceof ClojureMultiMethod mm) {
             return mm.invoke(argValues);
         } else if (function instanceof clojure.lang.Keyword kw) {

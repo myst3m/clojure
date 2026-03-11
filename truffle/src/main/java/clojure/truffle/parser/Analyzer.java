@@ -154,27 +154,27 @@ public class Analyzer {
                 Object form = LispReader.read(reader, false, EOF, false, READ_OPTS);
                 if (form == EOF) {
                     if (context != null && "clojure.spec.alpha".equals(context.getCurrentNamespace())) {
-                        System.err.println("[LOAD-EOF] after " + formCount + " forms, source length=" + source.length());
+                        if (ClojureContext.DEBUG) System.err.println("[LOAD-EOF] after " + formCount + " forms, source length=" + source.length());
                     }
                     break;
                 }
                 String formStr = form.toString();
                 if (formStr.length() > 80) formStr = formStr.substring(0, 80) + "...";
                 if (context != null && "clojure.spec.alpha".equals(context.getCurrentNamespace())) {
-                    System.err.println("[LOAD-FORM #" + formCount + "] " + formStr);
+                    if (ClojureContext.DEBUG) System.err.println("[LOAD-FORM #" + formCount + "] " + formStr);
                 }
                 formCount++;
                 ExpressionNode node;
                 try {
                     node = analyze(form);
                 } catch (StackOverflowError soe2) {
-                    System.err.println("[ANALYZE-SOE] form=" + formStr);
+                    if (ClojureContext.DEBUG) System.err.println("[ANALYZE-SOE] form=" + formStr);
                     // Print stack trace pattern to identify recursion
                     StackTraceElement[] st = soe2.getStackTrace();
-                    System.err.println("[ANALYZE-SOE] Stack depth: " + st.length);
+                    if (ClojureContext.DEBUG) System.err.println("[ANALYZE-SOE] Stack depth: " + st.length);
                     // Print first 30 frames
                     for (int si = 0; si < Math.min(30, st.length); si++) {
-                        System.err.println("[ST] " + si + ": " + st[si]);
+                        if (ClojureContext.DEBUG) System.err.println("[ST] " + si + ": " + st[si]);
                     }
                     // Find repeating pattern
                     java.util.Map<String, Integer> counts = new java.util.LinkedHashMap<>();
@@ -182,7 +182,7 @@ public class Analyzer {
                         String key = e.getClassName() + "." + e.getMethodName() + ":" + e.getLineNumber();
                         counts.merge(key, 1, Integer::sum);
                     }
-                    System.err.println("[ANALYZE-SOE] Top repeated frames:");
+                    if (ClojureContext.DEBUG) System.err.println("[ANALYZE-SOE] Top repeated frames:");
                     counts.entrySet().stream()
                         .sorted((a, b) -> b.getValue() - a.getValue())
                         .limit(15)
@@ -190,7 +190,7 @@ public class Analyzer {
                     throw soe2;
                 } catch (Exception ae) {
                     if (context != null && "clojure.spec.alpha".equals(context.getCurrentNamespace())) {
-                        System.err.println("[ANALYZE-ERROR] " + ae.getMessage() + " form=" + formStr);
+                        if (ClojureContext.DEBUG) System.err.println("[ANALYZE-ERROR] " + ae.getMessage() + " form=" + formStr);
                     }
                     throw ae;
                 }
@@ -202,11 +202,11 @@ public class Analyzer {
                 try {
                     root.getCallTarget().call();
                 } catch (StackOverflowError soe) {
-                    System.err.println("[SOE] in ns=" + (context != null ? context.getCurrentNamespace() : "?") + " form=" + form.toString().substring(0, Math.min(200, form.toString().length())));
+                    if (ClojureContext.DEBUG) System.err.println("[SOE] in ns=" + (context != null ? context.getCurrentNamespace() : "?") + " form=" + form.toString().substring(0, Math.min(200, form.toString().length())));
                     throw soe;
                 } catch (Exception ex) {
                     if (ex.getMessage() != null && ex.getMessage().contains("Stack overflow")) {
-                        System.err.println("[SOE-EX] in ns=" + (context != null ? context.getCurrentNamespace() : "?") + " form=" + form.toString().substring(0, Math.min(200, form.toString().length())));
+                        if (ClojureContext.DEBUG) System.err.println("[SOE-EX] in ns=" + (context != null ? context.getCurrentNamespace() : "?") + " form=" + form.toString().substring(0, Math.min(200, form.toString().length())));
                     }
                     throw ex;
                 }
@@ -514,7 +514,7 @@ public class Analyzer {
         if (macroDepth > 5) {
             String macroDesc = macro instanceof ClojureFunction cf ? cf.getName() :
                 macro instanceof MultiArityFunction ? "MultiArityFunction" : macro.getClass().getSimpleName();
-            System.err.println("[MACRO depth=" + macroDepth + "] macro=" + macroDesc + " args=" + argForms);
+            if (ClojureContext.DEBUG) System.err.println("[MACRO depth=" + macroDepth + "] macro=" + macroDesc + " args=" + argForms);
         }
         if (macroDepth > 50) {
             String macroDesc = macro instanceof ClojureFunction cf ? cf.getName() :
@@ -1194,15 +1194,21 @@ public class Analyzer {
                 context.setVar(protoName, proto);
                 // Create dispatch functions for each method
                 for (String methodName : capturedMethodNames) {
-                    context.setVar(methodName, (ClojureContext.BuiltinFunction) fnArgs -> {
+                    context.setVar(methodName, new ClojureContext.NamedBuiltin(
+                            protoName + "/" + methodName, fnArgs -> {
                         if (fnArgs.length < 1)
-                            throw new RuntimeException(methodName + ": missing target (this)");
-                        Object fn = proto.findMethod(methodName, fnArgs[0]);
-                        if (fn == null)
-                            throw new RuntimeException("No implementation of " + protoName +
-                                    "." + methodName + " for " + fnArgs[0].getClass().getName());
+                            throw new RuntimeException(protoName + "/" + methodName + ": missing target (this)");
+                        Object target = fnArgs[0];
+                        Object fn = proto.findMethod(methodName, target);
+                        if (fn == null) {
+                            String targetType = target instanceof clojure.truffle.runtime.ClojureReified r
+                                    ? "ClojureReified{" + String.join(",", r.getMethods().keySet()) + "}"
+                                    : target.getClass().getName();
+                            throw new RuntimeException("No implementation of protocol " + protoName +
+                                    " method " + methodName + " for type: " + targetType);
+                        }
                         return context.callFunction(fn, fnArgs);
-                    });
+                    }));
                 }
                 return proto;
             }
