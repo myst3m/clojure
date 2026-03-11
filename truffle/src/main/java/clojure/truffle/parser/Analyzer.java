@@ -2265,11 +2265,11 @@ public class Analyzer {
         }
     }
 
-    // Helper: (nth source index)
+    // Helper: (nth source index nil) — returns nil for out-of-bounds (safe for destructuring)
     private ExpressionNode makeNthNode(int sourceSlot, int index) {
         return new InvokeNode(
                 new SymbolNode(context, "nth"),
-                new ExpressionNode[]{new ReadLocalNode(sourceSlot), new LongLiteralNode(index)});
+                new ExpressionNode[]{new ReadLocalNode(sourceSlot), new LongLiteralNode(index), new NilNode()});
     }
 
     // Helper: (nthnext source index) - returns nil when no elements remain

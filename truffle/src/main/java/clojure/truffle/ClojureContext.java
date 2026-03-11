@@ -2288,6 +2288,11 @@ public class ClojureContext {
                             return ((clojure.lang.IPersistentMap) rArgs[0]).assoc(iv.nth(0), iv.nth(1));
                         if (item instanceof clojure.lang.MapEntry me)
                             return ((clojure.lang.IPersistentMap) rArgs[0]).assoc(me.key(), me.val());
+                        if (item instanceof clojure.lang.Seqable) {
+                            clojure.lang.ISeq s = clojure.lang.RT.seq(item);
+                            if (s != null && s.next() != null && s.next().next() == null)
+                                return ((clojure.lang.IPersistentMap) rArgs[0]).assoc(s.first(), s.next().first());
+                        }
                         throw new RuntimeException("into: map expects [k v] pairs");
                     };
                 } else if (to instanceof clojure.lang.IPersistentSet) {
@@ -2316,8 +2321,16 @@ public class ClojureContext {
                         to = m.assoc(me.key(), me.val());
                     } else if (item instanceof clojure.lang.IPersistentVector iv && iv.count() == 2) {
                         to = m.assoc(iv.nth(0), iv.nth(1));
+                    } else if (item instanceof clojure.lang.Seqable) {
+                        // Support lists, lazy-seqs as [k v] pairs
+                        clojure.lang.ISeq s = clojure.lang.RT.seq(item);
+                        if (s != null && s.next() != null && s.next().next() == null) {
+                            to = m.assoc(s.first(), s.next().first());
+                        } else {
+                            throw new RuntimeException("into: map expects [k v] pairs, got: " + item);
+                        }
                     } else {
-                        throw new RuntimeException("into: map expects [k v] pairs");
+                        throw new RuntimeException("into: map expects [k v] pairs, got: " + item.getClass().getName());
                     }
                 } else if (to instanceof clojure.lang.IPersistentSet s) {
                     to = s.cons(item);
@@ -3541,7 +3554,7 @@ public class ClojureContext {
             if (coll instanceof clojure.lang.Indexed indexed) {
                 if (idx < 0 || idx >= indexed.count()) {
                     if (notFound != null) return notFound;
-                    throw new IndexOutOfBoundsException("Index " + idx);
+                    throw new IndexOutOfBoundsException("Index " + idx + " on " + coll.getClass().getName() + " (count=" + indexed.count() + ")");
                 }
                 return indexed.nth(idx);
             }
@@ -3550,7 +3563,7 @@ public class ClojureContext {
             for (int i = 0; i < idx && seq != null; i++) seq = seq.next();
             if (seq == null) {
                 if (notFound != null) return notFound;
-                throw new IndexOutOfBoundsException("Index " + idx);
+                throw new IndexOutOfBoundsException("Index " + idx + " on " + coll.getClass().getName());
             }
             return seq.first();
         });
@@ -4297,20 +4310,7 @@ public class ClojureContext {
             checkArity(args, 2, "satisfies?");
             if (!(args[0] instanceof clojure.truffle.runtime.ClojureProtocol proto))
                 throw new RuntimeException("satisfies?: first arg must be a protocol");
-            Object obj = args[1];
-            String typeKey;
-            if (obj instanceof clojure.truffle.runtime.ClojureDeftypeInstance dti) {
-                typeKey = dti.getTypeName();
-            } else if (obj instanceof ClojureNil) {
-                typeKey = "nil";
-            } else {
-                typeKey = obj.getClass().getName();
-            }
-            // Check if any method of the protocol is implemented for this type
-            for (String methodName : proto.getMethodNames()) {
-                if (proto.resolve(methodName, typeKey) != null) return true;
-            }
-            return false;
+            return proto.hasImplementation(args[1]);
         });
 
         defBuiltin("prefer-method", args -> {
