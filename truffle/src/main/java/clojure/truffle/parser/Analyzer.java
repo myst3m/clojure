@@ -132,6 +132,7 @@ public class Analyzer {
         if (form instanceof ISeq seq) return analyzeList(seq);
         if (form instanceof IPersistentVector vec) return analyzeVector(vec);
         if (form instanceof IPersistentMap map) return analyzeMap(map);
+        if (form instanceof clojure.lang.IPersistentSet set) return analyzeSet(set);
         return new QuoteNode(form);
     }
 
@@ -153,7 +154,11 @@ public class Analyzer {
                 Class<?> clazz = JavaInteropUtil.resolveClass(ns);
                 return new JavaStaticFieldNode(clazz, name);
             } catch (RuntimeException ignored) {
-                // Not a Java class, fall through to var lookup
+                // Check imported classes
+                Object varVal = context.getVar(ns);
+                if (varVal instanceof Class<?> c) {
+                    return new JavaStaticFieldNode(c, name);
+                }
             }
         }
         // Try resolving as a Java class (e.g. String, Long, java.util.ArrayList)
@@ -273,6 +278,16 @@ public class Analyzer {
                     case "future":      return analyzeFuture(seq);
                     case "locking":     return analyzeLocking(seq);
                     case "dosync":      return analyzeDo(seq); // simplified: just execute body
+                    case "var":         return analyzeVar(seq);
+                    case "set!":        return analyzeSetBang(seq);
+                    case "macroexpand-1": return analyzeMacroexpand1(seq);
+                    case "when-first":  return analyzeWhenFirst(seq);
+                    case "assert":      return analyzeAssert(seq);
+                    case "time":        return analyzeTime(seq);
+                    case "with-in-str": return analyzeWithInStr(seq);
+                    case "with-redefs": return analyzeWithRedefs(seq);
+                    case "memfn":       return analyzeMemfn(seq);
+                    case "import":      return analyzeImport(seq);
                 }
             }
             // Static method call: (Class/method args...)
@@ -322,6 +337,219 @@ public class Analyzer {
         return analyze(args.first());
     }
 
+    private ExpressionNode analyzeMacroexpand1(ISeq seq) {
+        // (macroexpand-1 '(macro-form ...)) -> single expansion step
+        ISeq args = seq.next();
+        if (args == null) throw err("macroexpand-1: missing form");
+        Object form = args.first();
+        // Evaluate the quoted form to get the actual form
+        ExpressionNode formNode = analyze(form);
+        // macroexpand-1 is registered as a function in ClojureContext
+        return new InvokeNode(new SymbolNode(context, "macroexpand-1"),
+                new ExpressionNode[]{formNode});
+    }
+
+    // --- Var / Set! ---
+
+    private ExpressionNode analyzeVar(ISeq seq) {
+        // (var symbol) -> returns the Var object for the symbol
+        ISeq args = seq.next();
+        if (args == null) throw err("var: missing symbol");
+        Object sym = args.first();
+        if (!(sym instanceof Symbol s)) throw err("var: argument must be a symbol");
+        String varName = s.getNamespace() != null ? s.getNamespace() + "/" + s.getName() : s.getName();
+        return new VarNode(context, varName);
+    }
+
+    private ExpressionNode analyzeSetBang(ISeq seq) {
+        // (set! *var* value) -> sets dynamic var's thread-local binding
+        ISeq args = seq.next();
+        if (args == null) throw err("set!: missing var");
+        Object target = args.first();
+        args = args.next();
+        if (args == null) throw err("set!: missing value");
+        ExpressionNode valueNode = analyze(args.first());
+
+        if (target instanceof Symbol s) {
+            String varName = s.getName();
+            return new SetBangNode(context, varName, valueNode);
+        }
+        throw err("set!: target must be a symbol");
+    }
+
+    // --- when-first ---
+
+    private ExpressionNode analyzeWhenFirst(ISeq seq) {
+        // (when-first [x coll] body...) => (let [s (seq coll)] (when s (let [x (first s)] body...)))
+        ISeq args = seq.next();
+        if (args == null) throw err("when-first: missing binding");
+        IPersistentVector bindings = (IPersistentVector) args.first();
+        if (bindings.count() != 2) throw err("when-first: binding must have 2 forms");
+        Symbol sym = (Symbol) bindings.nth(0);
+        Object coll = bindings.nth(1);
+        ISeq body = args.next();
+
+        // Build: (let [s__temp (seq coll)] (when s__temp (let [sym (first s__temp)] body...)))
+        Symbol tempSym = Symbol.intern("__when-first-temp__" + System.nanoTime());
+        // (seq coll)
+        Object seqCall = RT.list(Symbol.intern("seq"), coll);
+        // (first s__temp)
+        Object firstCall = RT.list(Symbol.intern("first"), tempSym);
+        // (let [sym (first s__temp)] body...)
+        List<Object> innerLetForms = new ArrayList<>();
+        innerLetForms.add(Symbol.intern("let"));
+        innerLetForms.add(PersistentVector.create(sym, firstCall));
+        while (body != null) { innerLetForms.add(body.first()); body = body.next(); }
+        Object innerLet = PersistentList.create(innerLetForms);
+        // (when s__temp innerLet)
+        Object whenForm = RT.list(Symbol.intern("when"), tempSym, innerLet);
+        // (let [s__temp (seq coll)] whenForm)
+        Object outerLet = RT.list(Symbol.intern("let"),
+                PersistentVector.create(tempSym, seqCall), whenForm);
+        return analyze(outerLet);
+    }
+
+    // --- assert ---
+
+    private ExpressionNode analyzeAssert(ISeq seq) {
+        // (assert expr) or (assert expr message)
+        ISeq args = seq.next();
+        if (args == null) throw err("assert: missing expression");
+        ExpressionNode testNode = analyze(args.first());
+        args = args.next();
+        String message = args != null ? args.first().toString() : "Assert failed: " + seq.next().first();
+
+        // Build directly: if (not test) throw new AssertionError(message)
+        ExpressionNode throwNode = new ThrowNode(
+                new InvokeNode(new SymbolNode(context, "new-assertion-error"),
+                        new ExpressionNode[]{new StringLiteralNode(message)}));
+        return new IfNode(testNode, new NilNode(), throwNode);
+    }
+
+    // --- time ---
+
+    private ExpressionNode analyzeTime(ISeq seq) {
+        // (time expr) -> prints elapsed time, returns value
+        ISeq args = seq.next();
+        if (args == null) throw err("time: missing expression");
+        // Build as function call to time builtin
+        return new InvokeNode(new SymbolNode(context, "time*"),
+                new ExpressionNode[]{analyzeLambdaThunk(args)});
+    }
+
+    private ExpressionNode analyzeLambdaThunk(ISeq body) {
+        // Wrap body in (fn* [] body...)
+        ISeq fnForm = RT.cons(Symbol.intern("fn*"),
+                RT.cons(PersistentVector.EMPTY, body));
+        return analyzeFn(fnForm);
+    }
+
+    // --- with-in-str ---
+
+    private ExpressionNode analyzeWithInStr(ISeq seq) {
+        // (with-in-str s body...) -> bind *in* to StringReader of s, execute body
+        ISeq args = seq.next();
+        if (args == null) throw err("with-in-str: missing string");
+        ExpressionNode strNode = analyze(args.first());
+        ExpressionNode thunkNode = analyzeLambdaThunk(args.next());
+        return new InvokeNode(new SymbolNode(context, "with-in-str*"),
+                new ExpressionNode[]{strNode, thunkNode});
+    }
+
+    // --- with-redefs ---
+
+    private ExpressionNode analyzeWithRedefs(ISeq seq) {
+        // (with-redefs [var val ...] body...) -> temporarily redefine vars
+        ISeq args = seq.next();
+        if (args == null) throw err("with-redefs: missing bindings");
+        IPersistentVector bindings = (IPersistentVector) args.first();
+        if (bindings.count() % 2 != 0) throw err("with-redefs: bindings must have even number of forms");
+
+        // Build as: save old vals, set new vals, try body finally restore old vals
+        // Use binding mechanism (treat as dynamic for the duration)
+        int numBindings = bindings.count() / 2;
+        String[] varNames = new String[numBindings];
+        ExpressionNode[] valueNodes = new ExpressionNode[numBindings];
+        for (int i = 0; i < numBindings; i++) {
+            Symbol sym = (Symbol) bindings.nth(i * 2);
+            varNames[i] = sym.getName();
+            valueNodes[i] = analyze(bindings.nth(i * 2 + 1));
+        }
+        ISeq bodyArgs = args.next();
+        List<ExpressionNode> body = new ArrayList<>();
+        while (bodyArgs != null) { body.add(analyze(bodyArgs.first())); bodyArgs = bodyArgs.next(); }
+        return new clojure.truffle.nodes.WithRedefsNode(context, varNames, valueNodes,
+                body.toArray(new ExpressionNode[0]));
+    }
+
+    // --- memfn ---
+
+    private ExpressionNode analyzeMemfn(ISeq seq) {
+        // (memfn method-name arg1 arg2 ...) -> (fn [target arg1 arg2 ...] (.method-name target arg1 arg2 ...))
+        ISeq args = seq.next();
+        if (args == null) throw err("memfn: missing method name");
+        String methodName = ((Symbol) args.first()).getName();
+        args = args.next();
+        List<Symbol> params = new ArrayList<>();
+        params.add(Symbol.intern("target__"));
+        while (args != null) {
+            params.add((Symbol) args.first());
+            args = args.next();
+        }
+        // Build (.methodName target__ arg1 arg2 ...)
+        List<Object> callForms = new ArrayList<>();
+        callForms.add(Symbol.intern("." + methodName));
+        for (Symbol p : params) callForms.add(p);
+        Object callForm = PersistentList.create(callForms);
+        // Build (fn [target__ arg1 ...] (.methodName target__ arg1 ...))
+        Object fnForm = RT.list(Symbol.intern("fn"),
+                PersistentVector.create(params.toArray()), callForm);
+        return analyze(fnForm);
+    }
+
+    // --- import ---
+
+    private ExpressionNode analyzeImport(ISeq seq) {
+        // (import java.util.ArrayList) or (import (java.util ArrayList HashMap))
+        ISeq args = seq.next();
+        List<ExpressionNode> nodes = new ArrayList<>();
+        while (args != null) {
+            Object form = args.first();
+            if (form instanceof Symbol sym) {
+                // Simple: (import java.util.ArrayList)
+                String fqn = sym.getName();
+                String simpleName = fqn.substring(fqn.lastIndexOf('.') + 1);
+                Class<?> clazz = resolveClassSafe(fqn);
+                // Register immediately so subsequent analysis can resolve the class
+                context.setVar(simpleName, clazz);
+                nodes.add(new DefNode(context, simpleName, new QuoteNode(clazz)));
+            } else if (form instanceof ISeq importList) {
+                // Package-prefixed: (import (java.util ArrayList HashMap))
+                String pkg = ((Symbol) importList.first()).getName();
+                ISeq classes = importList.next();
+                while (classes != null) {
+                    String className = ((Symbol) classes.first()).getName();
+                    String fqn = pkg + "." + className;
+                    Class<?> clazz = resolveClassSafe(fqn);
+                    context.setVar(className, clazz);
+                    nodes.add(new DefNode(context, className, new QuoteNode(clazz)));
+                    classes = classes.next();
+                }
+            }
+            args = args.next();
+        }
+        if (nodes.isEmpty()) return new NilNode();
+        return new DoNode(nodes.toArray(new ExpressionNode[0]));
+    }
+
+    private Class<?> resolveClassSafe(String fqn) {
+        try {
+            return Class.forName(fqn);
+        } catch (ClassNotFoundException e) {
+            throw new RuntimeException("import: class not found: " + fqn);
+        }
+    }
+
     // --- Lazy Seq ---
 
     private ExpressionNode analyzeLazySeq(ISeq seq) {
@@ -369,7 +597,18 @@ public class Analyzer {
     }
 
     private ExpressionNode analyzeStaticCall(String className, String memberName, ISeq args) {
-        Class<?> clazz = JavaInteropUtil.resolveClass(className);
+        Class<?> clazz;
+        try {
+            clazz = JavaInteropUtil.resolveClass(className);
+        } catch (RuntimeException e) {
+            // Check if it's an imported class stored as a var
+            Object varVal = context.getVar(className);
+            if (varVal instanceof Class<?> c) {
+                clazz = c;
+            } else {
+                throw e;
+            }
+        }
         List<ExpressionNode> argList = new ArrayList<>();
         while (args != null) { argList.add(analyze(args.first())); args = args.next(); }
         if (argList.isEmpty()) {
@@ -386,20 +625,27 @@ public class Analyzer {
 
     private ExpressionNode analyzeConstructor(String className, ISeq args) {
         // Try Java class first
+        Class<?> clazz = null;
         try {
-            Class<?> clazz = JavaInteropUtil.resolveClass(className);
+            clazz = JavaInteropUtil.resolveClass(className);
+        } catch (RuntimeException e) {
+            // Check if it's an imported class stored as a var
+            Object varVal = context.getVar(className);
+            if (varVal instanceof Class<?> c) {
+                clazz = c;
+            }
+        }
+        if (clazz != null) {
             List<ExpressionNode> argList = new ArrayList<>();
             while (args != null) { argList.add(analyze(args.first())); args = args.next(); }
             return new JavaConstructorNode(clazz, argList.toArray(new ExpressionNode[0]));
-        } catch (RuntimeException e) {
-            // Not a Java class, try deftype constructor (->TypeName)
-            List<ExpressionNode> argList = new ArrayList<>();
-            while (args != null) { argList.add(analyze(args.first())); args = args.next(); }
-            // Look up ->ClassName constructor function
-            String ctorName = "->" + className;
-            return new InvokeNode(new SymbolNode(context, ctorName),
-                    argList.toArray(new ExpressionNode[0]));
         }
+        // Not a Java class, try deftype constructor (->TypeName)
+        List<ExpressionNode> argList = new ArrayList<>();
+        while (args != null) { argList.add(analyze(args.first())); args = args.next(); }
+        String ctorName = "->" + className;
+        return new InvokeNode(new SymbolNode(context, ctorName),
+                argList.toArray(new ExpressionNode[0]));
     }
 
     private ExpressionNode analyzeNew(ISeq seq) {
@@ -1409,6 +1655,7 @@ public class Analyzer {
         // or {localName :mapKey, ...}
         Object keysVec = pattern.valAt(Keyword.intern("keys"));
         Object strsVec = pattern.valAt(Keyword.intern("strs"));
+        Object symsVec = pattern.valAt(Keyword.intern("syms"));
         Object orMap = pattern.valAt(Keyword.intern("or"));
         Object asName = pattern.valAt(Keyword.intern("as"));
         IPersistentMap defaults = (orMap instanceof IPersistentMap m) ? m : null;
@@ -1430,6 +1677,18 @@ public class Analyzer {
                 Symbol sym = (Symbol) sv.nth(i);
                 String key = sym.getName();
                 ExpressionNode getExpr = makeGetNodeStr(sourceSlot, key, defaults, sym);
+                slots.add(currentScope.addLocal(sym.getName()));
+                values.add(getExpr);
+            }
+        }
+
+        // :syms [a b] -> bind a to ('a source), b to ('b source)
+        if (symsVec instanceof IPersistentVector yv) {
+            for (int i = 0; i < yv.count(); i++) {
+                Symbol sym = (Symbol) yv.nth(i);
+                Symbol key = Symbol.intern(sym.getName());
+                // Use QuoteNode directly so the symbol is treated as a literal value, not a var reference
+                ExpressionNode getExpr = makeGetNodeQuoted(sourceSlot, key, defaults, sym);
                 slots.add(currentScope.addLocal(sym.getName()));
                 values.add(getExpr);
             }
@@ -1505,6 +1764,19 @@ public class Analyzer {
         } else {
             getArgs = new ExpressionNode[]{
                     new ReadLocalNode(sourceSlot), new StringLiteralNode(key)};
+        }
+        return new InvokeNode(new SymbolNode(context, "get"), getArgs);
+    }
+
+    private ExpressionNode makeGetNodeQuoted(int sourceSlot, Object key, IPersistentMap defaults, Symbol sym) {
+        ExpressionNode[] getArgs;
+        Object defaultVal = defaults != null ? defaults.valAt(sym) : null;
+        if (defaultVal != null) {
+            getArgs = new ExpressionNode[]{
+                    new ReadLocalNode(sourceSlot), new QuoteNode(key), analyze(defaultVal)};
+        } else {
+            getArgs = new ExpressionNode[]{
+                    new ReadLocalNode(sourceSlot), new QuoteNode(key)};
         }
         return new InvokeNode(new SymbolNode(context, "get"), getArgs);
     }
@@ -1934,6 +2206,14 @@ public class Analyzer {
             kvNodes.add(analyze(entry.val()));
         }
         return new MapNode(kvNodes.toArray(new ExpressionNode[0]));
+    }
+
+    private ExpressionNode analyzeSet(clojure.lang.IPersistentSet set) {
+        List<ExpressionNode> elements = new ArrayList<>();
+        for (ISeq s = set.seq(); s != null; s = s.next()) {
+            elements.add(analyze(s.first()));
+        }
+        return new SetLiteralNode(elements.toArray(new ExpressionNode[0]));
     }
 
     // --- Helpers ---
