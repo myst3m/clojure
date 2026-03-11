@@ -525,6 +525,41 @@ public class ClojureContext {
             return ClojureNil.INSTANCE;
         });
 
+        // print-method multimethod: dispatches on (class x)
+        BuiltinFunction printMethodDispatch = args -> {
+            if (args.length < 1) return ClojureNil.INSTANCE;
+            Object x = args[0];
+            if (x == null || x instanceof ClojureNil) return Void.class;
+            return x.getClass();
+        };
+        var printMethodMM = new ClojureMultiMethod("print-method", printMethodDispatch, this);
+        // Default method: write the standard printString representation
+        printMethodMM.addMethod(clojure.lang.Keyword.intern("default"), (BuiltinFunction) args -> {
+            if (args.length < 2) throw new RuntimeException("print-method: expected 2 args [object writer]");
+            Object obj = args[0];
+            Object writer = args[1];
+            String s = printString(obj, true);
+            if (writer instanceof java.io.Writer w) {
+                try { w.write(s); } catch (java.io.IOException e) { throw new RuntimeException(e); }
+            }
+            return ClojureNil.INSTANCE;
+        });
+        globalVars.put("print-method", printMethodMM);
+
+        // print-dup multimethod
+        var printDupMM = new ClojureMultiMethod("print-dup", printMethodDispatch, this);
+        printDupMM.addMethod(clojure.lang.Keyword.intern("default"), (BuiltinFunction) args -> {
+            if (args.length < 2) throw new RuntimeException("print-dup: expected 2 args [object writer]");
+            Object obj = args[0];
+            Object writer = args[1];
+            String s = printString(obj, true);
+            if (writer instanceof java.io.Writer w) {
+                try { w.write(s); } catch (java.io.IOException e) { throw new RuntimeException(e); }
+            }
+            return ClojureNil.INSTANCE;
+        });
+        globalVars.put("print-dup", printDupMM);
+
         defBuiltin("newline", args -> {
             writeOut("\n");
             return ClojureNil.INSTANCE;
