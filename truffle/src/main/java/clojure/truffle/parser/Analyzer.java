@@ -288,6 +288,9 @@ public class Analyzer {
                     case "with-redefs": return analyzeWithRedefs(seq);
                     case "memfn":       return analyzeMemfn(seq);
                     case "import":      return analyzeImport(seq);
+                    case "use":         return analyzeUse(seq);
+                    case "refer":       return analyzeRefer(seq);
+                    case "refer-clojure": return analyzeReferClojure(seq);
                 }
             }
             // Static method call: (Class/method args...)
@@ -548,6 +551,174 @@ public class Analyzer {
         } catch (ClassNotFoundException e) {
             throw new RuntimeException("import: class not found: " + fqn);
         }
+    }
+
+    // --- use / refer ---
+
+    private ExpressionNode analyzeUse(ISeq seq) {
+        // (use 'some.ns) or (use '[some.ns :only [foo bar]])
+        ISeq args = seq.next();
+        List<Object> specs = new ArrayList<>();
+        while (args != null) {
+            specs.add(args.first());
+            args = args.next();
+        }
+        List<Object> capturedSpecs = List.copyOf(specs);
+        return new ExpressionNode() {
+            @Override
+            public Object executeGeneric(com.oracle.truffle.api.frame.VirtualFrame frame) {
+                for (Object spec : capturedSpecs) processUseSpec(spec);
+                return ClojureNil.INSTANCE;
+            }
+        };
+    }
+
+    private void processUseSpec(Object spec) {
+        // Unwrap quote
+        if (spec instanceof ISeq qs) {
+            Object first = qs.first();
+            if (first instanceof Symbol s && s.getName().equals("quote")) {
+                spec = qs.next().first();
+            }
+        }
+        if (spec instanceof Symbol sym) {
+            // Simple: (use 'some.ns) -> load + refer all
+            String nsName = sym.getName();
+            context.loadNamespace(nsName);
+            ClojureNamespace reqNs = context.getNamespace(nsName);
+            ClojureNamespace currentNs = context.getNamespace(context.getCurrentNamespace());
+            if (reqNs != null && currentNs != null) currentNs.referAll(reqNs);
+        } else if (spec instanceof IPersistentVector v) {
+            // [some.ns :only [foo bar]] or [some.ns :rename {old new}]
+            if (v.count() == 0) return;
+            String nsName = ((Symbol) v.nth(0)).getName();
+            context.loadNamespace(nsName);
+            ClojureNamespace reqNs = context.getNamespace(nsName);
+            ClojureNamespace currentNs = context.getNamespace(context.getCurrentNamespace());
+            if (reqNs == null || currentNs == null) return;
+
+            List<String> onlySyms = null;
+            java.util.Set<String> excludeSyms = null;
+            java.util.Map<String, String> renames = null;
+
+            for (int i = 1; i < v.count(); i += 2) {
+                if (v.nth(i) instanceof Keyword kw && i + 1 < v.count()) {
+                    switch (kw.getName()) {
+                        case "only":
+                            onlySyms = extractSymbolNames((IPersistentVector) v.nth(i + 1));
+                            break;
+                        case "exclude":
+                            excludeSyms = new java.util.HashSet<>(extractSymbolNames((IPersistentVector) v.nth(i + 1)));
+                            break;
+                        case "rename":
+                            renames = extractRenameMap((IPersistentMap) v.nth(i + 1));
+                            break;
+                        case "as":
+                            String alias = ((Symbol) v.nth(i + 1)).getName();
+                            currentNs.alias(alias, reqNs);
+                            break;
+                    }
+                }
+            }
+
+            if (onlySyms != null) {
+                currentNs.referOnly(reqNs, onlySyms);
+            } else if (excludeSyms != null) {
+                currentNs.referWithExclude(reqNs, excludeSyms);
+            } else if (renames != null) {
+                currentNs.referWithRename(reqNs, renames);
+            } else {
+                currentNs.referAll(reqNs);
+            }
+        }
+    }
+
+    private ExpressionNode analyzeRefer(ISeq seq) {
+        // (refer 'some.ns) or (refer 'some.ns :only '[foo bar])
+        ISeq args = seq.next();
+        List<Object> capturedArgs = new ArrayList<>();
+        while (args != null) { capturedArgs.add(args.first()); args = args.next(); }
+        return new ExpressionNode() {
+            @Override
+            public Object executeGeneric(com.oracle.truffle.api.frame.VirtualFrame frame) {
+                if (capturedArgs.isEmpty()) return ClojureNil.INSTANCE;
+                Object nsArg = capturedArgs.get(0);
+                // Unwrap quote
+                if (nsArg instanceof ISeq qs && qs.first() instanceof Symbol s && s.getName().equals("quote")) {
+                    nsArg = qs.next().first();
+                }
+                String nsName;
+                if (nsArg instanceof Symbol sym) nsName = sym.getName();
+                else nsName = nsArg.toString();
+                ClojureNamespace reqNs = context.getNamespace(nsName);
+                ClojureNamespace currentNs = context.getNamespace(context.getCurrentNamespace());
+                if (reqNs == null || currentNs == null) return ClojureNil.INSTANCE;
+
+                // Check for :only filter
+                if (capturedArgs.size() >= 3) {
+                    Object filterKey = capturedArgs.get(1);
+                    if (filterKey instanceof Keyword kw && kw.getName().equals("only")) {
+                        Object symsArg = capturedArgs.get(2);
+                        // Unwrap quote
+                        if (symsArg instanceof ISeq qs2 && qs2.first() instanceof Symbol s2 && s2.getName().equals("quote")) {
+                            symsArg = qs2.next().first();
+                        }
+                        if (symsArg instanceof IPersistentVector pv) {
+                            currentNs.referOnly(reqNs, extractSymbolNames(pv));
+                            return ClojureNil.INSTANCE;
+                        }
+                    }
+                }
+                currentNs.referAll(reqNs);
+                return ClojureNil.INSTANCE;
+            }
+        };
+    }
+
+    private ExpressionNode analyzeReferClojure(ISeq seq) {
+        // (refer-clojure :exclude [symbol1 symbol2])
+        ISeq args = seq.next();
+        java.util.Set<String> excludes = new java.util.HashSet<>();
+        while (args != null) {
+            if (args.first() instanceof Keyword kw && kw.getName().equals("exclude")) {
+                args = args.next();
+                if (args != null && args.first() instanceof IPersistentVector v) {
+                    for (int i = 0; i < v.count(); i++) {
+                        excludes.add(((Symbol) v.nth(i)).getName());
+                    }
+                }
+            }
+            if (args != null) args = args.next();
+        }
+        java.util.Set<String> capturedExcludes = java.util.Set.copyOf(excludes);
+        return new ExpressionNode() {
+            @Override
+            public Object executeGeneric(com.oracle.truffle.api.frame.VirtualFrame frame) {
+                ClojureNamespace core = context.getNamespace("clojure.core");
+                ClojureNamespace currentNs = context.getNamespace(context.getCurrentNamespace());
+                if (core != null && currentNs != null) {
+                    currentNs.referWithExclude(core, capturedExcludes);
+                }
+                return ClojureNil.INSTANCE;
+            }
+        };
+    }
+
+    private List<String> extractSymbolNames(IPersistentVector v) {
+        List<String> names = new ArrayList<>();
+        for (int i = 0; i < v.count(); i++) {
+            names.add(((Symbol) v.nth(i)).getName());
+        }
+        return names;
+    }
+
+    private java.util.Map<String, String> extractRenameMap(IPersistentMap m) {
+        java.util.Map<String, String> map = new java.util.HashMap<>();
+        for (ISeq s = m.seq(); s != null; s = s.next()) {
+            IMapEntry entry = (IMapEntry) s.first();
+            map.put(((Symbol) entry.key()).getName(), ((Symbol) entry.val()).getName());
+        }
+        return map;
     }
 
     // --- Lazy Seq ---
@@ -1461,52 +1632,88 @@ public class Analyzer {
     // --- Namespace ---
 
     private ExpressionNode analyzeNs(ISeq seq) {
-        // (ns my.ns (:require [some.ns :as s]) (:require [other.ns :refer [foo]]))
+        // (ns my.ns
+        //   (:require [some.ns :as s] [other.ns :refer [foo]])
+        //   (:use [lib.ns :only [bar]])
+        //   (:import [java.util ArrayList HashMap])
+        //   (:refer-clojure :exclude [get]))
         ISeq args = seq.next();
         if (args == null) throw err("ns: missing name");
         if (!(args.first() instanceof Symbol nsSym)) throw err("ns: name must be a symbol");
         String nsName = nsSym.getName();
         args = args.next();
 
-        // Collect require and import directives
+        // Collect directives
         List<Object> requireSpecs = new ArrayList<>();
+        List<Object> useSpecs = new ArrayList<>();
         List<Object> importSpecs = new ArrayList<>();
+        java.util.Set<String> referClojureExcludes = new java.util.HashSet<>();
+        boolean hasReferClojure = false;
+
         while (args != null) {
             Object directive = args.first();
             if (directive instanceof ISeq ds) {
                 Object head = ds.first();
                 if (head instanceof Keyword kw) {
-                    if (kw.getName().equals("require")) {
-                        for (ISeq specs = ds.next(); specs != null; specs = specs.next())
-                            requireSpecs.add(specs.first());
-                    } else if (kw.getName().equals("import")) {
-                        for (ISeq specs = ds.next(); specs != null; specs = specs.next())
-                            importSpecs.add(specs.first());
+                    switch (kw.getName()) {
+                        case "require":
+                            for (ISeq specs = ds.next(); specs != null; specs = specs.next())
+                                requireSpecs.add(specs.first());
+                            break;
+                        case "use":
+                            for (ISeq specs = ds.next(); specs != null; specs = specs.next())
+                                useSpecs.add(specs.first());
+                            break;
+                        case "import":
+                            for (ISeq specs = ds.next(); specs != null; specs = specs.next())
+                                importSpecs.add(specs.first());
+                            break;
+                        case "refer-clojure":
+                            hasReferClojure = true;
+                            for (ISeq rc = ds.next(); rc != null; rc = rc.next()) {
+                                if (rc.first() instanceof Keyword ek && ek.getName().equals("exclude")) {
+                                    rc = rc.next();
+                                    if (rc != null && rc.first() instanceof IPersistentVector ev) {
+                                        for (int i = 0; i < ev.count(); i++)
+                                            referClojureExcludes.add(((Symbol) ev.nth(i)).getName());
+                                    }
+                                }
+                            }
+                            break;
                     }
                 }
             }
+            // Skip docstrings and metadata maps
             args = args.next();
         }
 
-        List<Object> capturedSpecs = List.copyOf(requireSpecs);
+        List<Object> capturedRequires = List.copyOf(requireSpecs);
+        List<Object> capturedUses = List.copyOf(useSpecs);
         List<Object> capturedImports = List.copyOf(importSpecs);
+        java.util.Set<String> capturedExcludes = java.util.Set.copyOf(referClojureExcludes);
+        boolean capturedHasReferClojure = hasReferClojure;
+
         return new ExpressionNode() {
             @Override
             public Object executeGeneric(com.oracle.truffle.api.frame.VirtualFrame frame) {
                 context.getOrCreateNamespace(nsName);
                 context.setCurrentNamespace(nsName);
-                // Refer all of clojure.core
                 ClojureNamespace ns = context.getNamespace(nsName);
                 ClojureNamespace core = context.getNamespace("clojure.core");
-                if (core != null) ns.referAll(core);
+                // Refer clojure.core (with optional exclusions)
+                if (core != null) {
+                    if (capturedHasReferClojure && !capturedExcludes.isEmpty()) {
+                        ns.referWithExclude(core, capturedExcludes);
+                    } else {
+                        ns.referAll(core);
+                    }
+                }
                 // Process requires
-                for (Object spec : capturedSpecs) {
-                    processRequireSpec(spec);
-                }
-                // Process imports: (:import [java.util ArrayList HashMap])
-                for (Object spec : capturedImports) {
-                    processImportSpec(spec);
-                }
+                for (Object spec : capturedRequires) processRequireSpec(spec);
+                // Process uses
+                for (Object spec : capturedUses) processUseSpec(spec);
+                // Process imports
+                for (Object spec : capturedImports) processImportSpec(spec);
                 return ClojureNil.INSTANCE;
             }
         };
@@ -1568,22 +1775,37 @@ public class Analyzer {
             ClojureNamespace currentNs = context.getNamespace(context.getCurrentNamespace());
             if (reqNs == null || currentNs == null) return;
 
+            // First pass: collect all options
+            String alias = null;
+            Object referSpec = null;
+            java.util.Map<String, String> renames = null;
             for (int i = 1; i < v.count(); i += 2) {
                 Object key = v.nth(i);
-                if (key instanceof Keyword kw) {
-                    if (kw.getName().equals("as") && i + 1 < v.count()) {
-                        String alias = ((Symbol) v.nth(i + 1)).getName();
-                        currentNs.alias(alias, reqNs);
-                    } else if (kw.getName().equals("refer") && i + 1 < v.count()) {
-                        Object referSpec = v.nth(i + 1);
-                        if (referSpec instanceof Keyword rk && rk.getName().equals("all")) {
-                            currentNs.referAll(reqNs);
-                        } else if (referSpec instanceof IPersistentVector rv) {
-                            for (int j = 0; j < rv.count(); j++) {
-                                String symName = ((Symbol) rv.nth(j)).getName();
-                                Object val = reqNs.resolve(symName);
-                                if (val != null) currentNs.refer(symName, val);
-                            }
+                if (key instanceof Keyword kw && i + 1 < v.count()) {
+                    switch (kw.getName()) {
+                        case "as": alias = ((Symbol) v.nth(i + 1)).getName(); break;
+                        case "refer": referSpec = v.nth(i + 1); break;
+                        case "rename": renames = extractRenameMap((IPersistentMap) v.nth(i + 1)); break;
+                    }
+                }
+            }
+            // Second pass: apply
+            if (alias != null) currentNs.alias(alias, reqNs);
+            if (referSpec != null) {
+                if (referSpec instanceof Keyword rk && rk.getName().equals("all")) {
+                    if (renames != null) {
+                        currentNs.referWithRename(reqNs, renames);
+                    } else {
+                        currentNs.referAll(reqNs);
+                    }
+                } else if (referSpec instanceof IPersistentVector rv) {
+                    for (int j = 0; j < rv.count(); j++) {
+                        String symName = ((Symbol) rv.nth(j)).getName();
+                        Object val = reqNs.resolve(symName);
+                        if (val != null) {
+                            String targetName = (renames != null && renames.containsKey(symName))
+                                    ? renames.get(symName) : symName;
+                            currentNs.refer(targetName, val);
                         }
                     }
                 }

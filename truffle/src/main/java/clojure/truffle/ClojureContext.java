@@ -1319,28 +1319,6 @@ public class ClojureContext {
             return result;
         });
 
-        // --- Namespace builtins ---
-
-        globalVars.put("*ns*", "user");
-
-        globalVars.put("ns-name", (BuiltinFunction) args -> {
-            checkArity(args, 1, "ns-name");
-            if (args[0] instanceof ClojureNamespace ns) return clojure.lang.Symbol.intern(ns.getName());
-            return clojure.lang.Symbol.intern(currentNamespace);
-        });
-
-        globalVars.put("find-ns", (BuiltinFunction) args -> {
-            checkArity(args, 1, "find-ns");
-            String name = args[0].toString();
-            ClojureNamespace ns = namespaces.get(name);
-            return ns == null ? ClojureNil.INSTANCE : ns;
-        });
-
-        globalVars.put("all-ns", (BuiltinFunction) args -> {
-            java.util.List<Object> nsList = new ArrayList<>(namespaces.values());
-            return clojure.lang.PersistentVector.create(nsList);
-        });
-
         // --- Additional core functions ---
 
         globalVars.put("name", (BuiltinFunction) args -> {
@@ -4966,19 +4944,18 @@ public class ClojureContext {
             return p.matcher((String) args[1]);
         });
 
-        // namespace functions
+        // --- Phase 17: Namespace system ---
+
         globalVars.put("ns-name", (BuiltinFunction) args -> {
             checkArity(args, 1, "ns-name");
-            if (args[0] instanceof String s) return clojure.lang.Symbol.intern(s);
-            if (args[0] instanceof ClojureNamespace ns) return clojure.lang.Symbol.intern(ns.getName());
-            return clojure.lang.Symbol.intern(args[0].toString());
+            ClojureNamespace ns = resolveNsArg(args[0]);
+            return clojure.lang.Symbol.intern(ns.getName());
         });
 
         globalVars.put("the-ns", (BuiltinFunction) args -> {
             checkArity(args, 1, "the-ns");
-            String nsName;
-            if (args[0] instanceof clojure.lang.Symbol sym) nsName = sym.getName();
-            else nsName = args[0].toString();
+            if (args[0] instanceof ClojureNamespace ns) return ns;
+            String nsName = nsNameFromArg(args[0]);
             ClojureNamespace ns = getNamespace(nsName);
             if (ns == null) throw new RuntimeException("No namespace: " + nsName + " found");
             return ns;
@@ -4986,49 +4963,116 @@ public class ClojureContext {
 
         globalVars.put("create-ns", (BuiltinFunction) args -> {
             checkArity(args, 1, "create-ns");
-            String nsName;
-            if (args[0] instanceof clojure.lang.Symbol sym) nsName = sym.getName();
-            else nsName = args[0].toString();
-            return getOrCreateNamespace(nsName);
+            return getOrCreateNamespace(nsNameFromArg(args[0]));
+        });
+
+        globalVars.put("remove-ns", (BuiltinFunction) args -> {
+            checkArity(args, 1, "remove-ns");
+            String nsName = nsNameFromArg(args[0]);
+            ClojureNamespace removed = namespaces.remove(nsName);
+            return removed == null ? ClojureNil.INSTANCE : removed;
         });
 
         globalVars.put("find-ns", (BuiltinFunction) args -> {
             checkArity(args, 1, "find-ns");
-            String nsName;
-            if (args[0] instanceof clojure.lang.Symbol sym) nsName = sym.getName();
-            else nsName = args[0].toString();
-            ClojureNamespace ns = getNamespace(nsName);
+            ClojureNamespace ns = getNamespace(nsNameFromArg(args[0]));
             return ns == null ? ClojureNil.INSTANCE : ns;
         });
 
         globalVars.put("all-ns", (BuiltinFunction) args -> {
-            java.util.List<Object> result = new java.util.ArrayList<>(namespaces.values());
-            return clojure.lang.PersistentList.create(result);
+            return clojure.lang.PersistentList.create(new java.util.ArrayList<>(namespaces.values()));
+        });
+
+        globalVars.put("ns-publics", (BuiltinFunction) args -> {
+            checkArity(args, 1, "ns-publics");
+            ClojureNamespace ns = resolveNsArg(args[0]);
+            return nsMapToClojure(ns.getInterns());
+        });
+
+        globalVars.put("ns-interns", (BuiltinFunction) args -> {
+            checkArity(args, 1, "ns-interns");
+            ClojureNamespace ns = resolveNsArg(args[0]);
+            return nsMapToClojure(ns.getInterns());
+        });
+
+        globalVars.put("ns-refers", (BuiltinFunction) args -> {
+            checkArity(args, 1, "ns-refers");
+            ClojureNamespace ns = resolveNsArg(args[0]);
+            return nsMapToClojure(ns.getRefers());
+        });
+
+        globalVars.put("ns-imports", (BuiltinFunction) args -> {
+            checkArity(args, 1, "ns-imports");
+            ClojureNamespace ns = resolveNsArg(args[0]);
+            clojure.lang.IPersistentMap result = clojure.lang.PersistentArrayMap.EMPTY;
+            for (var entry : ns.getImports().entrySet()) {
+                result = result.assoc(clojure.lang.Symbol.intern(entry.getKey()), entry.getValue());
+            }
+            return result;
+        });
+
+        globalVars.put("ns-aliases", (BuiltinFunction) args -> {
+            checkArity(args, 1, "ns-aliases");
+            ClojureNamespace ns = resolveNsArg(args[0]);
+            clojure.lang.IPersistentMap result = clojure.lang.PersistentArrayMap.EMPTY;
+            for (var entry : ns.getAliases().entrySet()) {
+                result = result.assoc(clojure.lang.Symbol.intern(entry.getKey()), entry.getValue());
+            }
+            return result;
+        });
+
+        globalVars.put("ns-unalias", (BuiltinFunction) args -> {
+            checkArity(args, 2, "ns-unalias");
+            ClojureNamespace ns = resolveNsArg(args[0]);
+            String alias = nsNameFromArg(args[1]);
+            ns.unalias(alias);
+            return ClojureNil.INSTANCE;
+        });
+
+        globalVars.put("ns-map", (BuiltinFunction) args -> {
+            checkArity(args, 1, "ns-map");
+            ClojureNamespace ns = resolveNsArg(args[0]);
+            return nsMapToClojure(ns.getMap());
         });
 
         globalVars.put("ns-resolve", (BuiltinFunction) args -> {
             if (args.length < 2) throw new RuntimeException("ns-resolve: expected 2 args");
-            String nsName;
-            if (args[0] instanceof clojure.lang.Symbol sym) nsName = sym.getName();
-            else if (args[0] instanceof ClojureNamespace ns) nsName = ns.getName();
-            else nsName = args[0].toString();
-            String symName;
-            if (args[1] instanceof clojure.lang.Symbol sym) symName = sym.getName();
-            else symName = args[1].toString();
-            ClojureNamespace ns = getNamespace(nsName);
-            if (ns == null) return ClojureNil.INSTANCE;
+            ClojureNamespace ns = resolveNsArg(args[0]);
+            String symName = nsNameFromArg(args[1]);
             Object val = ns.resolve(symName);
-            return val == null ? ClojureNil.INSTANCE : new clojure.truffle.runtime.ClojureVar(this, nsName, symName);
+            return val == null ? ClojureNil.INSTANCE : new clojure.truffle.runtime.ClojureVar(this, ns.getName(), symName);
         });
 
         globalVars.put("resolve", (BuiltinFunction) args -> {
             checkArity(args, 1, "resolve");
-            String symName;
-            if (args[0] instanceof clojure.lang.Symbol sym) symName = sym.getName();
-            else symName = args[0].toString();
+            String symName = nsNameFromArg(args[0]);
             Object val = getVarWithBindings(symName);
             if (val == null) return ClojureNil.INSTANCE;
             return new clojure.truffle.runtime.ClojureVar(this, currentNamespace, symName);
+        });
+
+        globalVars.put("intern", (BuiltinFunction) args -> {
+            if (args.length < 2 || args.length > 3) throw new RuntimeException("intern: expected 2-3 args");
+            ClojureNamespace ns = resolveNsArg(args[0]);
+            String symName = nsNameFromArg(args[1]);
+            if (args.length == 3) {
+                ns.intern(symName, args[2]);
+            }
+            return new clojure.truffle.runtime.ClojureVar(this, ns.getName(), symName);
+        });
+
+        globalVars.put("*ns*", ClojureNil.INSTANCE); // placeholder, resolved dynamically
+        globalVars.put("namespace", (BuiltinFunction) args -> {
+            checkArity(args, 1, "namespace");
+            if (args[0] instanceof clojure.lang.Symbol sym) {
+                String ns = sym.getNamespace();
+                return ns == null ? ClojureNil.INSTANCE : ns;
+            }
+            if (args[0] instanceof clojure.lang.Keyword kw) {
+                String ns = kw.getNamespace();
+                return ns == null ? ClojureNil.INSTANCE : ns;
+            }
+            return ClojureNil.INSTANCE;
         });
 
         // Copy all builtins into clojure.core namespace
@@ -5695,6 +5739,28 @@ public class ClojureContext {
     private Object lazyCycle(java.util.List<Object> items, int idx) {
         return new clojure.lang.Cons(items.get(idx),
                 new LazySeq(() -> lazyCycle(items, (idx + 1) % items.size())));
+    }
+
+    private ClojureNamespace resolveNsArg(Object arg) {
+        if (arg instanceof ClojureNamespace ns) return ns;
+        String nsName = nsNameFromArg(arg);
+        ClojureNamespace ns = getNamespace(nsName);
+        if (ns == null) throw new RuntimeException("No namespace: " + nsName + " found");
+        return ns;
+    }
+
+    private String nsNameFromArg(Object arg) {
+        if (arg instanceof clojure.lang.Symbol sym) return sym.getName();
+        if (arg instanceof ClojureNamespace ns) return ns.getName();
+        return arg.toString();
+    }
+
+    private clojure.lang.IPersistentMap nsMapToClojure(java.util.Map<String, Object> map) {
+        clojure.lang.IPersistentMap result = clojure.lang.PersistentArrayMap.EMPTY;
+        for (var entry : map.entrySet()) {
+            result = result.assoc(clojure.lang.Symbol.intern(entry.getKey()), entry.getValue());
+        }
+        return result;
     }
 
     private static void checkArity(Object[] args, int expected, String name) {
