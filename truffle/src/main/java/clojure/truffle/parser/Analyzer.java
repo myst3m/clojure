@@ -1289,6 +1289,9 @@ public class Analyzer {
                     return new ClojureDeftypeInstance(typeName, ctorArgs.clone(), fieldIdx);
                 });
 
+                // Register type name as a var (for extend, extend-protocol references)
+                context.setVar(typeName, typeName);
+
                 // Register protocol implementations
                 for (var entry : capturedProtoMethods.entrySet()) {
                     String protoName = entry.getKey();
@@ -1365,6 +1368,9 @@ public class Analyzer {
                                 capturedFieldNames.size() + " args");
                     return new ClojureDeftypeInstance(typeName, ctorArgs.clone(), fieldIdx);
                 });
+
+                // Register type name as a var (for extend, extend-protocol references)
+                context.setVar(typeName, typeName);
 
                 // Register map->TypeName map-based constructor
                 context.setVar("map->" + typeName, (ClojureContext.BuiltinFunction) ctorArgs -> {
@@ -3045,19 +3051,7 @@ public class Analyzer {
         args = args.next();
 
         // For deftype types (symbols that aren't Java classes), use the type name as string key
-        ExpressionNode typeNode;
-        if (typeForm instanceof Symbol typeSym) {
-            // Try Java class first
-            try {
-                Class<?> clazz = JavaInteropUtil.resolveClass(typeSym.getName());
-                typeNode = new QuoteNode(clazz);
-            } catch (RuntimeException e) {
-                // Not a Java class - use type name string (for deftype types)
-                typeNode = new QuoteNode(typeSym.getName());
-            }
-        } else {
-            typeNode = analyze(typeForm);
-        }
+        ExpressionNode typeNode = resolveTypeNode(typeForm);
 
         List<ExpressionNode> nodes = new ArrayList<>();
         while (args != null) {
@@ -3066,15 +3060,10 @@ public class Analyzer {
             args = args.next();
             // Collect methods until next symbol (protocol) or end
             java.util.Map<String, Object> methodForms = new java.util.LinkedHashMap<>();
-            while (args != null && args.first() instanceof ISeq) {
+            while (args != null && isMethodDef(args.first())) {
                 ISeq methodDef = (ISeq) args.first();
                 String methodName = ((Symbol) methodDef.first()).getName();
-                // Build fn form
-                List<Object> fnParts = new ArrayList<>();
-                fnParts.add(Symbol.intern("fn"));
-                ISeq rest = methodDef.next();
-                while (rest != null) { fnParts.add(rest.first()); rest = rest.next(); }
-                methodForms.put(methodName, PersistentList.create(fnParts));
+                methodForms.put(methodName, buildMethodFn(methodDef));
                 args = args.next();
             }
             nodes.add(new ExtendTypeNode(context, typeNode, analyze(protoForm),
@@ -3097,34 +3086,73 @@ public class Analyzer {
             Object typeForm = args.first();
             args = args.next();
             java.util.Map<String, Object> methodForms = new java.util.LinkedHashMap<>();
-            while (args != null && args.first() instanceof ISeq) {
+            while (args != null && isMethodDef(args.first())) {
                 ISeq methodDef = (ISeq) args.first();
                 String methodName = ((Symbol) methodDef.first()).getName();
-                List<Object> fnParts = new ArrayList<>();
-                fnParts.add(Symbol.intern("fn"));
-                ISeq rest = methodDef.next();
-                while (rest != null) { fnParts.add(rest.first()); rest = rest.next(); }
-                methodForms.put(methodName, PersistentList.create(fnParts));
+                methodForms.put(methodName, buildMethodFn(methodDef));
                 args = args.next();
             }
-            // Resolve type: Java class or deftype name string
-            ExpressionNode typeNode;
-            if (typeForm instanceof Symbol typeSym) {
-                try {
-                    Class<?> clazz = JavaInteropUtil.resolveClass(typeSym.getName());
-                    typeNode = new QuoteNode(clazz);
-                } catch (RuntimeException e) {
-                    typeNode = new QuoteNode(typeSym.getName());
-                }
-            } else {
-                typeNode = analyze(typeForm);
-            }
+            // Resolve type: Java class, nil, or deftype name string
+            ExpressionNode typeNode = resolveTypeNode(typeForm);
             nodes.add(new ExtendTypeNode(context, typeNode, analyze(protoForm),
                     methodForms, this));
         }
         if (nodes.isEmpty()) return new NilNode();
         if (nodes.size() == 1) return nodes.get(0);
         return new DoNode(nodes.toArray(new ExpressionNode[0]));
+    }
+
+    /**
+     * Check if form is a method definition:
+     *   Single arity: (methodName [params...] body...)  — second is vector
+     *   Multi arity:  (methodName ([p1] body1) ([p2 p3] body2)) — second is list starting with vector
+     * Distinguishes from type expressions like (Class/forName "[B") where second is a string.
+     */
+    private boolean isMethodDef(Object form) {
+        if (!(form instanceof ISeq seq)) return false;
+        if (!(seq.first() instanceof Symbol)) return false;
+        Object second = seq.next() != null ? seq.next().first() : null;
+        if (second instanceof IPersistentVector) return true;
+        // Multi-arity: second element is a list whose first element is a vector
+        if (second instanceof ISeq innerSeq) {
+            return innerSeq.first() instanceof IPersistentVector;
+        }
+        return false;
+    }
+
+    /**
+     * Build a fn form from a method definition.
+     * Single arity: (methodName [params] body) -> (fn [params] body)
+     * Multi arity: (methodName ([p1] b1) ([p2 p3] b2)) -> (fn ([p1] b1) ([p2 p3] b2))
+     */
+    private Object buildMethodFn(ISeq methodDef) {
+        List<Object> fnParts = new ArrayList<>();
+        fnParts.add(Symbol.intern("fn"));
+        ISeq rest = methodDef.next();
+        while (rest != null) { fnParts.add(rest.first()); rest = rest.next(); }
+        return PersistentList.create(fnParts);
+    }
+
+    private ExpressionNode resolveTypeNode(Object typeForm) {
+        if (typeForm == null) {
+            // nil literal maps to Void.class for protocol dispatch
+            return new QuoteNode(Void.class);
+        }
+        if (typeForm instanceof Symbol typeSym) {
+            String name = typeSym.getName();
+            if ("nil".equals(name)) {
+                return new QuoteNode(Void.class);
+            }
+            try {
+                Class<?> clazz = JavaInteropUtil.resolveClass(name);
+                return new QuoteNode(clazz);
+            } catch (RuntimeException e) {
+                // Not a Java class - use type name string (for deftype types)
+                return new QuoteNode(name);
+            }
+        } else {
+            return analyze(typeForm);
+        }
     }
 
     private void processImportSpec(Object spec) {

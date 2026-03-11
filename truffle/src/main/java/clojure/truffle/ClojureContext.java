@@ -4201,6 +4201,48 @@ public class ClojureContext {
             throw new RuntimeException("extend-type should be handled by analyzer");
         });
 
+        // (extend atype & proto+mmaps)
+        // (extend Type Protocol {:method-name fn} Protocol2 {:method fn} ...)
+        defBuiltin("extend", args -> {
+            if (args.length < 3 || (args.length - 1) % 2 != 0)
+                throw new RuntimeException("extend: expects type followed by protocol/map pairs");
+            Object typeArg = args[0];
+            // Resolve type key: nil -> Void.class for protocol dispatch
+            Object typeKey;
+            if (typeArg == null || typeArg instanceof clojure.truffle.runtime.ClojureNil) {
+                typeKey = Void.class;
+            } else if (typeArg instanceof Class<?> clazz) {
+                typeKey = clazz;
+            } else if (typeArg instanceof String s) {
+                typeKey = s;
+            } else {
+                typeKey = typeArg;
+            }
+            for (int i = 1; i < args.length; i += 2) {
+                Object protoArg = args[i];
+                Object mapArg = args[i + 1];
+                if (!(protoArg instanceof clojure.truffle.runtime.ClojureProtocol proto))
+                    throw new RuntimeException("extend: expected protocol, got: " + protoArg + " (" + (protoArg == null ? "null" : protoArg.getClass().getName()) + ")");
+                if (!(mapArg instanceof clojure.lang.IPersistentMap pmap))
+                    throw new RuntimeException("extend: expected map of methods, got: " + mapArg);
+                java.util.Map<String, Object> methods = new java.util.HashMap<>();
+                for (var entry : (Iterable<java.util.Map.Entry<Object, Object>>) (Iterable) pmap) {
+                    Object key = entry.getKey();
+                    String methodName;
+                    if (key instanceof clojure.lang.Keyword kw) {
+                        methodName = kw.getName();
+                    } else if (key instanceof String s) {
+                        methodName = s;
+                    } else {
+                        methodName = key.toString();
+                    }
+                    methods.put(methodName, entry.getValue());
+                }
+                proto.extend(typeKey, methods);
+            }
+            return clojure.truffle.runtime.ClojureNil.INSTANCE;
+        });
+
         defBuiltin("satisfies?", args -> {
             checkArity(args, 2, "satisfies?");
             if (!(args[0] instanceof clojure.truffle.runtime.ClojureProtocol proto))
@@ -6268,6 +6310,247 @@ public class ClojureContext {
             java.io.File parent = f.getParentFile();
             return parent != null && parent.mkdirs();
         });
+
+        ns.intern("copy", (BuiltinFunction) args -> {
+            if (args.length < 2) throw new RuntimeException("copy: expected at least 2 args");
+            Object input = args[0];
+            Object output = args[1];
+            try {
+                java.io.InputStream in = null;
+                boolean closeIn = false;
+                if (input instanceof java.io.InputStream is) { in = is; }
+                else if (input instanceof java.io.File f) { in = new java.io.FileInputStream(f); closeIn = true; }
+                else if (input instanceof String s) { in = new java.io.FileInputStream(s); closeIn = true; }
+                else if (input instanceof byte[] b) { in = new java.io.ByteArrayInputStream(b); }
+                if (in != null) {
+                    try {
+                        if (output instanceof java.io.OutputStream os) {
+                            in.transferTo(os);
+                        } else if (output instanceof java.io.File f) {
+                            try (var os = new java.io.FileOutputStream(f)) { in.transferTo(os); }
+                        } else if (output instanceof String s) {
+                            try (var os = new java.io.FileOutputStream(s)) { in.transferTo(os); }
+                        } else {
+                            throw new RuntimeException("copy: unsupported output type: " + output.getClass().getName());
+                        }
+                    } finally { if (closeIn) in.close(); }
+                    return clojure.truffle.runtime.ClojureNil.INSTANCE;
+                }
+                throw new RuntimeException("copy: unsupported input type: " + input.getClass().getName());
+            } catch (java.io.IOException e) {
+                throw new RuntimeException("copy: " + e.getMessage(), e);
+            }
+        });
+
+        ns.intern("resource", (BuiltinFunction) args -> {
+            if (args.length < 1) throw new RuntimeException("resource: expected at least 1 arg");
+            String name = args[0].toString();
+            ClassLoader loader = args.length > 1 && args[1] instanceof ClassLoader cl
+                    ? cl : Thread.currentThread().getContextClassLoader();
+            java.net.URL url = loader.getResource(name);
+            return url != null ? url : clojure.truffle.runtime.ClojureNil.INSTANCE;
+        });
+
+        ns.intern("as-file", (BuiltinFunction) args -> {
+            checkArity(args, 1, "as-file");
+            Object x = args[0];
+            if (x == null || x instanceof clojure.truffle.runtime.ClojureNil) return clojure.truffle.runtime.ClojureNil.INSTANCE;
+            if (x instanceof java.io.File f) return f;
+            return new java.io.File(x.toString());
+        });
+
+        ns.intern("as-url", (BuiltinFunction) args -> {
+            checkArity(args, 1, "as-url");
+            Object x = args[0];
+            if (x == null || x instanceof clojure.truffle.runtime.ClojureNil) return clojure.truffle.runtime.ClojureNil.INSTANCE;
+            if (x instanceof java.net.URL u) return u;
+            try {
+                return new java.net.URI(x.toString()).toURL();
+            } catch (Exception e) {
+                throw new RuntimeException("as-url: " + e.getMessage(), e);
+            }
+        });
+
+        ns.intern("as-relative-path", (BuiltinFunction) args -> {
+            checkArity(args, 1, "as-relative-path");
+            java.io.File f = (args[0] instanceof java.io.File) ?
+                    (java.io.File) args[0] : new java.io.File(args[0].toString());
+            if (f.isAbsolute()) throw new RuntimeException(f + " is not a relative path");
+            return f.getPath();
+        });
+
+        // IOFactory protocol and default-streams-impl
+        var ioProto = new clojure.truffle.runtime.ClojureProtocol("IOFactory",
+                java.util.List.of("make-reader", "make-writer", "make-input-stream", "make-output-stream"));
+        ns.intern("IOFactory", ioProto);
+
+        // make-reader, make-writer, make-input-stream, make-output-stream protocol dispatch functions
+        ns.intern("make-reader", new NamedBuiltin("clojure.java.io/make-reader", fnArgs -> {
+            if (fnArgs.length < 2) throw new RuntimeException("make-reader: expected 2 args");
+            Object fn = ioProto.findMethod("make-reader", fnArgs[0]);
+            if (fn == null) throw new RuntimeException("make-reader: no implementation for " +
+                    (fnArgs[0] == null ? "nil" : fnArgs[0].getClass().getName()));
+            return callFunction(fn, fnArgs);
+        }));
+        ns.intern("make-writer", new NamedBuiltin("clojure.java.io/make-writer", fnArgs -> {
+            if (fnArgs.length < 2) throw new RuntimeException("make-writer: expected 2 args");
+            Object fn = ioProto.findMethod("make-writer", fnArgs[0]);
+            if (fn == null) throw new RuntimeException("make-writer: no implementation for " +
+                    (fnArgs[0] == null ? "nil" : fnArgs[0].getClass().getName()));
+            return callFunction(fn, fnArgs);
+        }));
+        ns.intern("make-input-stream", new NamedBuiltin("clojure.java.io/make-input-stream", fnArgs -> {
+            if (fnArgs.length < 2) throw new RuntimeException("make-input-stream: expected 2 args");
+            Object fn = ioProto.findMethod("make-input-stream", fnArgs[0]);
+            if (fn == null) throw new RuntimeException("make-input-stream: no implementation for " +
+                    (fnArgs[0] == null ? "nil" : fnArgs[0].getClass().getName()));
+            return callFunction(fn, fnArgs);
+        }));
+        ns.intern("make-output-stream", new NamedBuiltin("clojure.java.io/make-output-stream", fnArgs -> {
+            if (fnArgs.length < 2) throw new RuntimeException("make-output-stream: expected 2 args");
+            Object fn = ioProto.findMethod("make-output-stream", fnArgs[0]);
+            if (fn == null) throw new RuntimeException("make-output-stream: no implementation for " +
+                    (fnArgs[0] == null ? "nil" : fnArgs[0].getClass().getName()));
+            return callFunction(fn, fnArgs);
+        }));
+
+        // default-streams-impl map
+        BuiltinFunction makeReaderDefault = fnArgs -> {
+            Object is = ioProto.findMethod("make-input-stream", fnArgs[0]);
+            if (is == null) throw new RuntimeException("Cannot open as InputStream: " + fnArgs[0]);
+            Object stream = callFunction(is, fnArgs);
+            Object readerFn = ioProto.findMethod("make-reader", stream);
+            if (readerFn != null) return callFunction(readerFn, new Object[]{stream, fnArgs.length > 1 ? fnArgs[1] : null});
+            return new java.io.BufferedReader(new java.io.InputStreamReader(
+                    (java.io.InputStream) stream, java.nio.charset.StandardCharsets.UTF_8));
+        };
+        BuiltinFunction makeWriterDefault = fnArgs -> {
+            Object os = ioProto.findMethod("make-output-stream", fnArgs[0]);
+            if (os == null) throw new RuntimeException("Cannot open as OutputStream: " + fnArgs[0]);
+            Object stream = callFunction(os, fnArgs);
+            Object writerFn = ioProto.findMethod("make-writer", stream);
+            if (writerFn != null) return callFunction(writerFn, new Object[]{stream, fnArgs.length > 1 ? fnArgs[1] : null});
+            return new java.io.BufferedWriter(new java.io.OutputStreamWriter(
+                    (java.io.OutputStream) stream, java.nio.charset.StandardCharsets.UTF_8));
+        };
+        BuiltinFunction makeInputStreamDefault = fnArgs -> {
+            throw new RuntimeException("Cannot open <" + fnArgs[0] + "> as an InputStream.");
+        };
+        BuiltinFunction makeOutputStreamDefault = fnArgs -> {
+            throw new RuntimeException("Cannot open <" + fnArgs[0] + "> as an OutputStream.");
+        };
+
+        clojure.lang.IPersistentMap defaultImpl = clojure.lang.PersistentHashMap.create(
+                clojure.lang.Keyword.intern("make-reader"), makeReaderDefault,
+                clojure.lang.Keyword.intern("make-writer"), makeWriterDefault,
+                clojure.lang.Keyword.intern("make-input-stream"), makeInputStreamDefault,
+                clojure.lang.Keyword.intern("make-output-stream"), makeOutputStreamDefault
+        );
+        ns.intern("default-streams-impl", defaultImpl);
+
+        // Register IOFactory implementations for common types
+        // InputStream
+        ioProto.extend(java.io.InputStream.class, java.util.Map.of(
+                "make-input-stream", (BuiltinFunction) a -> new java.io.BufferedInputStream((java.io.InputStream) a[0]),
+                "make-reader", (BuiltinFunction) a -> {
+                    String enc = "UTF-8";
+                    if (a.length > 1 && a[1] instanceof clojure.lang.IPersistentMap m) {
+                        Object e = m.valAt(clojure.lang.Keyword.intern("encoding"));
+                        if (e instanceof String s) enc = s;
+                    }
+                    return new java.io.BufferedReader(new java.io.InputStreamReader((java.io.InputStream) a[0], java.nio.charset.Charset.forName(enc)));
+                }
+        ));
+        // BufferedInputStream
+        ioProto.extend(java.io.BufferedInputStream.class, java.util.Map.of(
+                "make-input-stream", (BuiltinFunction) a -> a[0],
+                "make-reader", (BuiltinFunction) a -> {
+                    String enc = "UTF-8";
+                    if (a.length > 1 && a[1] instanceof clojure.lang.IPersistentMap m) {
+                        Object e = m.valAt(clojure.lang.Keyword.intern("encoding"));
+                        if (e instanceof String s) enc = s;
+                    }
+                    return new java.io.BufferedReader(new java.io.InputStreamReader((java.io.InputStream) a[0], java.nio.charset.Charset.forName(enc)));
+                }
+        ));
+        // Reader
+        ioProto.extend(java.io.Reader.class, java.util.Map.of(
+                "make-reader", (BuiltinFunction) a -> new java.io.BufferedReader((java.io.Reader) a[0])
+        ));
+        // BufferedReader
+        ioProto.extend(java.io.BufferedReader.class, java.util.Map.of(
+                "make-reader", (BuiltinFunction) a -> a[0]
+        ));
+        // Writer
+        ioProto.extend(java.io.Writer.class, java.util.Map.of(
+                "make-writer", (BuiltinFunction) a -> new java.io.BufferedWriter((java.io.Writer) a[0])
+        ));
+        // BufferedWriter
+        ioProto.extend(java.io.BufferedWriter.class, java.util.Map.of(
+                "make-writer", (BuiltinFunction) a -> a[0]
+        ));
+        // OutputStream
+        ioProto.extend(java.io.OutputStream.class, java.util.Map.of(
+                "make-output-stream", (BuiltinFunction) a -> new java.io.BufferedOutputStream((java.io.OutputStream) a[0]),
+                "make-writer", (BuiltinFunction) a -> {
+                    String enc = "UTF-8";
+                    if (a.length > 1 && a[1] instanceof clojure.lang.IPersistentMap m) {
+                        Object e = m.valAt(clojure.lang.Keyword.intern("encoding"));
+                        if (e instanceof String s) enc = s;
+                    }
+                    return new java.io.BufferedWriter(new java.io.OutputStreamWriter((java.io.OutputStream) a[0], java.nio.charset.Charset.forName(enc)));
+                }
+        ));
+        // BufferedOutputStream
+        ioProto.extend(java.io.BufferedOutputStream.class, java.util.Map.of(
+                "make-output-stream", (BuiltinFunction) a -> a[0],
+                "make-writer", (BuiltinFunction) a -> {
+                    String enc = "UTF-8";
+                    if (a.length > 1 && a[1] instanceof clojure.lang.IPersistentMap m) {
+                        Object e = m.valAt(clojure.lang.Keyword.intern("encoding"));
+                        if (e instanceof String s) enc = s;
+                    }
+                    return new java.io.BufferedWriter(new java.io.OutputStreamWriter((java.io.OutputStream) a[0], java.nio.charset.Charset.forName(enc)));
+                }
+        ));
+        // File
+        ioProto.extend(java.io.File.class, java.util.Map.of(
+                "make-input-stream", (BuiltinFunction) a -> {
+                    try { return new java.io.BufferedInputStream(new java.io.FileInputStream((java.io.File) a[0])); }
+                    catch (java.io.FileNotFoundException e) { throw new RuntimeException(e.getMessage(), e); }
+                },
+                "make-output-stream", (BuiltinFunction) a -> {
+                    try {
+                        boolean append = false;
+                        if (a.length > 1 && a[1] instanceof clojure.lang.IPersistentMap m) {
+                            Object ap = m.valAt(clojure.lang.Keyword.intern("append"));
+                            append = isTruthy(ap);
+                        }
+                        return new java.io.BufferedOutputStream(new java.io.FileOutputStream((java.io.File) a[0], append));
+                    } catch (java.io.FileNotFoundException e) { throw new RuntimeException(e.getMessage(), e); }
+                }
+        ));
+        // String
+        ioProto.extend(String.class, java.util.Map.of(
+                "make-input-stream", (BuiltinFunction) a -> {
+                    try { return new java.io.BufferedInputStream(new java.io.FileInputStream(a[0].toString())); }
+                    catch (java.io.FileNotFoundException e) { throw new RuntimeException(e.getMessage(), e); }
+                },
+                "make-output-stream", (BuiltinFunction) a -> {
+                    try {
+                        boolean append = false;
+                        if (a.length > 1 && a[1] instanceof clojure.lang.IPersistentMap m) {
+                            Object ap = m.valAt(clojure.lang.Keyword.intern("append"));
+                            append = isTruthy(ap);
+                        }
+                        return new java.io.BufferedOutputStream(new java.io.FileOutputStream(a[0].toString(), append));
+                    } catch (java.io.FileNotFoundException e) { throw new RuntimeException(e.getMessage(), e); }
+                }
+        ));
+        // byte[]
+        ioProto.extend(byte[].class, java.util.Map.of(
+                "make-input-stream", (BuiltinFunction) a -> new java.io.BufferedInputStream(new java.io.ByteArrayInputStream((byte[]) a[0]))
+        ));
     }
 
     private static java.util.Set<Class<?>> clojure_allInterfaces(Class<?> clazz) {

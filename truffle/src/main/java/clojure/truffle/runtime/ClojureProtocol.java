@@ -36,8 +36,8 @@ public class ClojureProtocol {
                 if (fn != null) return fn;
             }
         }
-        // Try by Java class
-        Class<?> clazz = target == null ? Void.class : target.getClass();
+        // Try by Java class (ClojureNil maps to Void.class like null)
+        Class<?> clazz = (target == null || target instanceof ClojureNil) ? Void.class : target.getClass();
         while (clazz != null) {
             Map<String, Object> methods = implementations.get(clazz);
             if (methods != null) {
@@ -74,7 +74,7 @@ public class ClojureProtocol {
         if (target instanceof ClojureDeftypeInstance inst) {
             return implementations.containsKey(inst.getTypeName());
         }
-        Class<?> clazz = target == null ? Void.class : target.getClass();
+        Class<?> clazz = (target == null || target instanceof ClojureNil) ? Void.class : target.getClass();
         while (clazz != null) {
             if (implementations.containsKey(clazz)) return true;
             for (Class<?> iface : clazz.getInterfaces()) {
