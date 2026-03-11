@@ -9,6 +9,10 @@ public class MultiArityFunction {
         this.arities = arities;
         this.functions = functions;
         this.variadicIndex = variadicIndex;
+        // Set parent reference so self-calls in fn bodies dispatch through MultiArityFunction
+        for (ClojureFunction fn : functions) {
+            if (fn != null) fn.setMultiArityParent(this);
+        }
     }
 
     public ClojureFunction resolve(int argCount) {

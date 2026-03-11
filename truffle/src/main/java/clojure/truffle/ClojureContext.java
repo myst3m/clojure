@@ -41,6 +41,8 @@ public class ClojureContext {
             ThreadLocal.withInitial(java.util.HashMap::new);
     // Thread-local output writer override for with-out-str
     private final ThreadLocal<java.io.Writer> outOverride = new ThreadLocal<>();
+    // Classpath entries for -cp option (JAR files and directories)
+    private final java.util.List<String> classpathEntries = new java.util.ArrayList<>();
 
     @FunctionalInterface
     public interface BuiltinFunction {
@@ -50,10 +52,42 @@ public class ClojureContext {
     public ClojureContext(ClojureTruffleLanguage language, TruffleLanguage.Env env) {
         this.language = language;
         this.env = env;
+        // Parse classpath from system property
+        String cp = System.getProperty("clojure.truffle.classpath");
+        if (cp != null && !cp.isEmpty()) {
+            for (String entry : cp.split(java.io.File.pathSeparator)) {
+                String resolved = entry;
+                // Expand glob: "dir/*" -> all JARs in dir
+                if (entry.endsWith("/*")) {
+                    String dir = entry.substring(0, entry.length() - 2);
+                    java.io.File dirFile = new java.io.File(dir);
+                    if (dirFile.isDirectory()) {
+                        java.io.File[] jars = dirFile.listFiles((d, name) ->
+                                name.endsWith(".jar") || name.endsWith(".JAR"));
+                        if (jars != null) {
+                            for (java.io.File jar : jars) {
+                                classpathEntries.add(jar.getAbsolutePath());
+                            }
+                        }
+                    }
+                    continue;
+                }
+                classpathEntries.add(resolved);
+            }
+        }
         // Create clojure.core and user namespaces
         namespaces.put("clojure.core", new ClojureNamespace("clojure.core"));
         namespaces.put("user", new ClojureNamespace("user"));
         registerBuiltins();
+        // Intern all builtins into clojure.core Truffle namespace
+        // so that qualified references like clojure.core/seq work
+        ClojureNamespace coreNs = namespaces.get("clojure.core");
+        for (var entry : globalVars.entrySet()) {
+            coreNs.intern(entry.getKey(), entry.getValue());
+        }
+        // Register all builtins as Vars in Clojure's clojure.core namespace
+        // so that LispReader's syntax-quote can resolve them properly
+        registerClojureCoreVars();
         // User namespace refers all of clojure.core
         namespaces.get("user").referAll(namespaces.get("clojure.core"));
     }
@@ -67,8 +101,12 @@ public class ClojureContext {
     }
 
     public void setVar(String name, Object value) {
-        globalVars.put(name, value);
-        // Also intern in current namespace
+        // Only put into globalVars if we're in clojure.core (or no namespace yet)
+        // Otherwise, namespace-local defs should NOT pollute the global scope
+        if (currentNamespace == null || "clojure.core".equals(currentNamespace) || "user".equals(currentNamespace)) {
+            globalVars.put(name, value);
+        }
+        // Always intern in current namespace
         ClojureNamespace ns = namespaces.get(currentNamespace);
         if (ns != null) ns.intern(name, value);
     }
@@ -95,16 +133,14 @@ public class ClojureContext {
                 if (val != null) return val;
             }
         }
-        // Flat lookup (backwards compat + core builtins)
-        Object val = globalVars.get(name);
-        if (val != null) return val;
-        // Check current namespace
+        // Check current namespace first (includes refers from clojure.core)
         ClojureNamespace ns = namespaces.get(currentNamespace);
         if (ns != null) {
-            val = ns.resolve(name);
+            Object val = ns.resolve(name);
             if (val != null) return val;
         }
-        return null;
+        // Fall back to global builtins
+        return globalVars.get(name);
     }
 
     public clojure.truffle.runtime.ClojureVar getOrCreateVar(String name) {
@@ -119,11 +155,48 @@ public class ClojureContext {
     }
 
     public void setMacro(String name, Object fn) {
-        macros.put(name, fn);
+        // Only put into global macros map for core/user namespaces
+        if (currentNamespace == null || "clojure.core".equals(currentNamespace) || "user".equals(currentNamespace)) {
+            macros.put(name, fn);
+        }
+        // Always register in the current namespace so ns-qualified macro calls work
+        ClojureNamespace ns = namespaces.get(currentNamespace);
+        if (ns != null) {
+            ns.intern("__macro__" + name, fn);
+        }
     }
 
     public Object getMacro(String name) {
+        // Check current namespace's macros first, then fall back to global
+        ClojureNamespace ns = namespaces.get(currentNamespace);
+        if (ns != null) {
+            // Check refers (from use/refer) for macros
+            Object referred = ns.resolve("__macro__" + name);
+            if (referred != null) return referred;
+        }
         return macros.get(name);
+    }
+
+    /**
+     * Get a macro from a specific namespace (for ns-qualified macro calls like s/def).
+     */
+    public Object getMacroFromNs(String nsName, String macroName) {
+        // Resolve namespace alias
+        ClojureNamespace currentNs = namespaces.get(currentNamespace);
+        String resolvedNs = nsName;
+        if (currentNs != null) {
+            ClojureNamespace aliased = currentNs.resolveAlias(nsName);
+            if (aliased != null) resolvedNs = aliased.getName();
+        }
+        ClojureNamespace targetNs = namespaces.get(resolvedNs);
+        if (targetNs != null) {
+            Object macro = targetNs.resolve("__macro__" + macroName);
+            if (macro != null) {
+                System.err.println("[MACRO-NS] Found " + nsName + "/" + macroName + " in " + resolvedNs);
+                return macro;
+            }
+        }
+        return null;
     }
 
     public String getCurrentNamespace() { return currentNamespace; }
@@ -167,7 +240,8 @@ public class ClojureContext {
     }
 
     public void loadNamespace(String nsName) {
-        if (namespaces.containsKey(nsName)) return; // already loaded
+        if (namespaces.containsKey(nsName)) { System.err.println("[NS] skip (cached): " + nsName); return; }
+        System.err.println("[NS] loading: " + nsName + " (current=" + currentNamespace + ")");
         // Built-in pseudo-namespaces
         if (nsName.equals("clojure.string")) {
             registerStringNamespace();
@@ -177,10 +251,7 @@ public class ClojureContext {
             registerSetNamespace();
             return;
         }
-        if (nsName.equals("clojure.walk")) {
-            registerWalkNamespace();
-            return;
-        }
+        // clojure.walk: load from source (JAR)
         if (nsName.equals("clojure.edn")) {
             registerEdnNamespace();
             return;
@@ -192,32 +263,42 @@ public class ClojureContext {
         if (!loadingNamespaces.add(nsName))
             throw new RuntimeException("Circular require detected: " + nsName);
         try {
-            String path = nsName.replace('.', '/') + ".clj";
-            java.io.InputStream is = getClass().getClassLoader().getResourceAsStream(path);
+            String basePath = nsName.replace('.', '/');
+            String path = basePath + ".clj";
+            java.io.InputStream is = findResource(path);
             if (is == null) {
-                // Try file system
-                java.io.File file = new java.io.File(path);
-                if (!file.exists()) {
-                    // Also try relative to current dir
-                    file = new java.io.File("src/" + path);
-                }
-                if (file.exists()) {
-                    is = new java.io.FileInputStream(file);
-                }
+                path = basePath + ".cljc";
+                is = findResource(path);
             }
             if (is == null) {
-                throw new RuntimeException("Cannot find namespace: " + nsName + " (searched: " + path + ")");
+                throw new RuntimeException("Cannot find namespace: " + nsName + " (searched: " + basePath + ".clj/.cljc)");
             }
-            String source = new String(is.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+            byte[] rawBytes = is.readAllBytes();
             is.close();
+            String source = new String(rawBytes, java.nio.charset.StandardCharsets.UTF_8);
+            if (nsName.equals("clojure.spec.alpha")) {
+                System.err.println("[NS-DEBUG] spec.alpha: rawBytes=" + rawBytes.length + " source.length=" + source.length());
+            }
             String prevNs = currentNamespace;
             getOrCreateNamespace(nsName);
             currentNamespace = nsName;
-            Analyzer analyzer = new Analyzer(language);
-            analyzer.setContext(this);
-            ExpressionNode[] nodes = analyzer.analyzeProgram(source);
-            EvalRootNode root = new EvalRootNode(language, analyzer.getFrameDescriptor(), nodes);
-            root.getCallTarget().call();
+            // Set Clojure's *ns* so LispReader can resolve ::alias/keyword
+            clojure.lang.Var nsVar = clojure.lang.RT.var("clojure.core", "*ns*");
+            Object prevClojureNs = nsVar.deref();
+            clojure.lang.Namespace clojureNs = clojure.lang.Namespace.findOrCreate(
+                    clojure.lang.Symbol.intern(nsName));
+            // Refer all clojure.core vars so syntax-quote resolves symbols properly
+            referClojureCoreVars(clojureNs);
+            clojure.lang.Var.pushThreadBindings(clojure.lang.RT.map(nsVar, clojureNs));
+            try {
+                Analyzer analyzer = new Analyzer(language);
+                analyzer.setContext(this);
+                // Use incremental read-eval so ns/require side effects
+                // take effect before reading subsequent forms (needed for ::alias/keyword)
+                analyzer.loadSource(source, language);
+            } finally {
+                clojure.lang.Var.popThreadBindings();
+            }
             currentNamespace = prevNs;
         } catch (java.io.IOException e) {
             throw new RuntimeException("Error loading namespace: " + nsName, e);
@@ -226,7 +307,64 @@ public class ClojureContext {
         }
     }
 
+    private void referClojureCoreVars(clojure.lang.Namespace targetNs) {
+        clojure.lang.Namespace coreNs = clojure.lang.Namespace.findOrCreate(
+                clojure.lang.Symbol.intern("clojure.core"));
+        // Copy all clojure.core mappings as refers into the target namespace
+        for (Object entry : coreNs.getMappings()) {
+            if (entry instanceof java.util.Map.Entry<?,?> e) {
+                Object key = e.getKey();
+                Object val = e.getValue();
+                if (key instanceof clojure.lang.Symbol sym && val instanceof clojure.lang.Var v) {
+                    try {
+                        targetNs.refer(sym, v);
+                    } catch (Exception ignored) {}
+                }
+            }
+        }
+    }
+
+    private void registerClojureCoreVars() {
+        // Register all builtin names as interned Vars in Clojure's clojure.core namespace.
+        // This enables LispReader's syntax-quote to resolve symbols like `defn` to
+        // clojure.core/defn instead of the current namespace.
+        clojure.lang.Namespace coreNs = clojure.lang.Namespace.findOrCreate(
+                clojure.lang.Symbol.intern("clojure.core"));
+        java.util.Set<String> allNames = new java.util.HashSet<>(globalVars.keySet());
+        // Also register special forms that aren't in globalVars
+        allNames.addAll(java.util.List.of("if", "do", "def", "let*", "fn*", "quote", "recur",
+                "loop*", "try", "throw", "new", "set!", "var", ".", "monitor-enter", "monitor-exit",
+                "let", "fn", "loop", "and", "or", "when", "cond", "defn", "defn-",
+                "defmacro", "lazy-seq", "delay", "future", "binding",
+                "for", "doseq", "dotimes", "case", "condp", "while",
+                "if-let", "when-let", "if-some", "when-some", "when-not", "if-not",
+                "->", "->>", "as->", "some->", "some->>", "cond->", "cond->>",
+                "doto", "..", "comment", "declare", "defonce", "with-open",
+                "ns", "in-ns", "require", "import", "use", "refer", "refer-clojure",
+                "reify", "proxy", "extend-type", "extend-protocol",
+                "defmulti", "defmethod", "defprotocol", "deftype", "defrecord",
+                "locking", "dosync", "assert", "time", "letfn"));
+        for (String name : allNames) {
+            try {
+                clojure.lang.Symbol sym = clojure.lang.Symbol.intern(name);
+                // Only intern if not already mapped (avoid overwriting existing RT vars)
+                if (coreNs.findInternedVar(sym) == null) {
+                    coreNs.intern(sym);
+                }
+            } catch (Exception ignored) {}
+        }
+    }
+
     private void registerBuiltins() {
+        // Compiler hint vars (no-op but must be settable)
+        for (String v : new String[]{"*warn-on-reflection*", "*unchecked-math*", "*print-meta*",
+                "*print-length*", "*print-level*", "*print-dup*", "*print-readably*",
+                "*print-namespace-maps*", "*data-readers*", "*default-data-reader-fn*",
+                "*read-eval*", "*command-line-args*", "*compile-path*",
+                "*compile-files*", "*assert*", "*math-context*"}) {
+            globalVars.put(v, false);
+            dynamicVars.add(v);
+        }
         // Arithmetic
         globalVars.put("+", (BuiltinFunction) args -> {
             if (args.length == 0) return 0L;
@@ -367,6 +505,19 @@ public class ClojureContext {
             return ClojureNil.INSTANCE;
         });
 
+        globalVars.put("newline", (BuiltinFunction) args -> {
+            writeOut("\n");
+            return ClojureNil.INSTANCE;
+        });
+
+        globalVars.put("flush", (BuiltinFunction) args -> {
+            try {
+                java.io.Writer out = (java.io.Writer) getVar("*out*");
+                if (out != null) out.flush();
+            } catch (Exception ignored) {}
+            return ClojureNil.INSTANCE;
+        });
+
         // Collections
         globalVars.put("list", (BuiltinFunction) args -> {
             clojure.lang.IPersistentList list = clojure.lang.PersistentList.EMPTY;
@@ -406,8 +557,8 @@ public class ClojureContext {
         });
 
         globalVars.put("conj", (BuiltinFunction) args -> {
-            if (args.length < 2)
-                throw new RuntimeException("conj: expected at least 2 args");
+            if (args.length == 0) return clojure.lang.PersistentVector.EMPTY;
+            if (args.length == 1) return args[0];
             return clojureConj(args);
         });
 
@@ -852,6 +1003,26 @@ public class ClojureContext {
                 items.add(s.first());
             }
             return clojure.lang.PersistentVector.create(items);
+        });
+
+        globalVars.put("nthnext", (BuiltinFunction) args -> {
+            checkArity(args, 2, "nthnext");
+            Object coll = args[0];
+            if (coll == null || coll instanceof ClojureNil) return ClojureNil.INSTANCE;
+            int n = ((Number) args[1]).intValue();
+            clojure.lang.ISeq s = seqOf(coll);
+            for (int i = 0; i < n && s != null; i++) s = s.next();
+            return s == null ? ClojureNil.INSTANCE : (Object) s;
+        });
+
+        globalVars.put("nthrest", (BuiltinFunction) args -> {
+            checkArity(args, 2, "nthrest");
+            Object coll = args[0];
+            if (coll == null || coll instanceof ClojureNil) return clojure.lang.PersistentList.EMPTY;
+            int n = ((Number) args[1]).intValue();
+            clojure.lang.ISeq s = seqOf(coll);
+            for (int i = 0; i < n && s != null; i++) s = s.next();
+            return s == null ? (Object) clojure.lang.PersistentList.EMPTY : s;
         });
 
         globalVars.put("drop", (BuiltinFunction) args -> {
@@ -2057,6 +2228,7 @@ public class ClojureContext {
                 // Apply transducer: xform is a function that takes rf and returns rf'
                 Object xrf = callFunction(xform, new Object[]{rf});
                 Object acc = to;
+                if (from instanceof ClojureNil) return to;
                 for (clojure.lang.ISeq seq = clojure.lang.RT.seq(from); seq != null; seq = seq.next()) {
                     acc = callFunction(xrf, new Object[]{acc, seq.first()});
                     if (acc instanceof Reduced r) { acc = r.value; break; }
@@ -2064,6 +2236,7 @@ public class ClojureContext {
                 return acc;
             }
             from = args[1];
+            if (from instanceof ClojureNil) return to;
             for (clojure.lang.ISeq seq = clojure.lang.RT.seq(from); seq != null; seq = seq.next()) {
                 Object item = seq.first();
                 if (to instanceof clojure.lang.IPersistentVector v) {
@@ -2379,6 +2552,24 @@ public class ClojureContext {
             return new StringBuilder(args[0].toString()).reverse().toString();
         });
 
+        globalVars.put("str/escape", (BuiltinFunction) args -> {
+            checkArity(args, 2, "str/escape");
+            String s = args[0].toString();
+            Object cmap = args[1];
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < s.length(); i++) {
+                char c = s.charAt(i);
+                Object replacement = clojure.lang.RT.get(cmap, c);
+                if (replacement != null) {
+                    sb.append(replacement);
+                } else {
+                    sb.append(c);
+                }
+            }
+            return sb.toString();
+        });
+        globalVars.put("clojure.string/escape", globalVars.get("str/escape"));
+
         globalVars.put("subs", (BuiltinFunction) args -> {
             if (args.length < 2) throw new RuntimeException("subs: expected 2-3 args");
             String s = args[0].toString();
@@ -2506,8 +2697,12 @@ public class ClojureContext {
 
         globalVars.put("instance?", (BuiltinFunction) args -> {
             checkArity(args, 2, "instance?");
+            if (args[0] instanceof ClojureProtocol proto) {
+                if (args[1] instanceof ClojureNil) return false;
+                return proto.hasImplementation(args[1]);
+            }
             if (!(args[0] instanceof Class<?> clazz))
-                throw new RuntimeException("instance?: first arg must be a Class");
+                throw new RuntimeException("instance?: first arg must be a Class, got " + args[0].getClass().getName());
             if (args[1] instanceof ClojureNil) return false;
             return clazz.isInstance(args[1]);
         });
@@ -3269,6 +3464,10 @@ public class ClojureContext {
             Object notFound = args.length > 2 ? args[2] : null;
             int idx = ((Number) args[1]).intValue();
             Object coll = args[0];
+            if (coll == null || coll instanceof ClojureNil) {
+                if (notFound != null) return notFound;
+                return ClojureNil.INSTANCE;
+            }
             if (coll instanceof clojure.lang.Indexed indexed) {
                 if (idx < 0 || idx >= indexed.count()) {
                     if (notFound != null) return notFound;
@@ -3304,9 +3503,21 @@ public class ClojureContext {
         });
 
         // Improved apply: (apply f x y [z1 z2]) spreads last arg
+        java.util.concurrent.atomic.AtomicInteger applyDepth = new java.util.concurrent.atomic.AtomicInteger(0);
         globalVars.put("apply", (BuiltinFunction) args -> {
             if (args.length < 2) throw new RuntimeException("apply: expected at least 2 args");
             Object fn = args[0];
+            int depth = applyDepth.incrementAndGet();
+            if (depth > 50) {
+                System.err.println("[APPLY-DEEP] depth=" + depth + " fn=" + fn + " fnType=" + fn.getClass().getSimpleName());
+                if (fn instanceof ClojureFunction cf) {
+                    System.err.println("[APPLY-DEEP] callTarget=" + cf.getCallTarget());
+                }
+                if (depth > 100) {
+                    applyDepth.decrementAndGet();
+                    throw new RuntimeException("[APPLY-DEEP] depth exceeded 100, aborting");
+                }
+            }
             // Last arg must be seqable
             Object lastArg = args[args.length - 1];
             java.util.List<Object> allArgs = new ArrayList<>();
@@ -3322,7 +3533,11 @@ public class ClojureContext {
                     allArgs.add(seq.first());
                 }
             }
-            return callFunction(fn, allArgs.toArray(new Object[0]));
+            try {
+                return callFunction(fn, allArgs.toArray(new Object[0]));
+            } finally {
+                applyDepth.decrementAndGet();
+            }
         });
 
         // sort (no-arg comparator)
@@ -3858,32 +4073,21 @@ public class ClojureContext {
             // that takes a thunk (fn of no args)
             checkArity(args, 1, "delay");
             Object thunk = args[0];
-            return new Object() {
-                private volatile Object value;
-                private volatile boolean realized = false;
-                public synchronized Object deref() {
-                    if (!realized) {
-                        value = callFunction(thunk, new Object[0]);
-                        realized = true;
-                    }
-                    return value;
+            ClojureContext ctx = this;
+            return new clojure.lang.Delay(new clojure.lang.AFn() {
+                @Override
+                public Object invoke() {
+                    return ctx.callFunction(thunk, new Object[0]);
                 }
-                public boolean isRealized() { return realized; }
-                @Override public String toString() {
-                    return realized ? "#delay[" + value + "]" : "#delay[:pending]";
-                }
-            };
+            });
         });
 
         globalVars.put("force", (BuiltinFunction) args -> {
             checkArity(args, 1, "force");
             Object x = args[0];
-            try {
-                java.lang.reflect.Method m = x.getClass().getMethod("deref");
-                return m.invoke(x);
-            } catch (Exception e) {
-                return x; // If not a delay, return as-is
-            }
+            if (x instanceof clojure.lang.Delay d) return d.deref();
+            if (x instanceof clojure.lang.IDeref d) return d.deref();
+            return x; // If not a delay, return as-is
         });
 
         // --- Phase 12: Java array interop ---
@@ -4726,11 +4930,6 @@ public class ClojureContext {
             checkArity(args, 1, "realized?");
             if (args[0] instanceof clojure.lang.IPending p) return p.isRealized();
             if (args[0] instanceof java.util.concurrent.Future<?> f) return f.isDone();
-            // Check for our anonymous delay objects that have isRealized()
-            try {
-                java.lang.reflect.Method m = args[0].getClass().getMethod("isRealized");
-                return (boolean) m.invoke(args[0]);
-            } catch (Exception ignored) {}
             return true; // regular values are always "realized"
         });
 
@@ -5029,6 +5228,31 @@ public class ClojureContext {
             return ClojureNil.INSTANCE;
         });
 
+        globalVars.put("alias", (BuiltinFunction) args -> {
+            checkArity(args, 2, "alias");
+            String aliasName = nsNameFromArg(args[0]);
+            String nsName = nsNameFromArg(args[1]);
+            ClojureNamespace currentNs = getOrCreateNamespace(currentNamespace);
+            currentNs.alias(aliasName, getOrCreateNamespace(nsName));
+            // Also register in Clojure's namespace system for LispReader
+            try {
+                clojure.lang.Namespace clojureCurrentNs = clojure.lang.Namespace.findOrCreate(
+                        clojure.lang.Symbol.intern(currentNamespace));
+                clojure.lang.Namespace clojureTargetNs = clojure.lang.Namespace.findOrCreate(
+                        clojure.lang.Symbol.intern(nsName));
+                clojureCurrentNs.addAlias(clojure.lang.Symbol.intern(aliasName), clojureTargetNs);
+            } catch (Exception ignored) {}
+            return ClojureNil.INSTANCE;
+        });
+
+        globalVars.put("ns-unmap", (BuiltinFunction) args -> {
+            checkArity(args, 2, "ns-unmap");
+            ClojureNamespace ns = resolveNsArg(args[0]);
+            String sym = nsNameFromArg(args[1]);
+            ns.unmap(sym);
+            return ClojureNil.INSTANCE;
+        });
+
         globalVars.put("ns-map", (BuiltinFunction) args -> {
             checkArity(args, 1, "ns-map");
             ClojureNamespace ns = resolveNsArg(args[0]);
@@ -5049,6 +5273,29 @@ public class ClojureContext {
             Object val = getVarWithBindings(symName);
             if (val == null) return ClojureNil.INSTANCE;
             return new clojure.truffle.runtime.ClojureVar(this, currentNamespace, symName);
+        });
+
+        globalVars.put("requiring-resolve", (BuiltinFunction) args -> {
+            checkArity(args, 1, "requiring-resolve");
+            if (!(args[0] instanceof clojure.lang.Symbol sym)) {
+                throw new RuntimeException("requiring-resolve: expected a qualified symbol");
+            }
+            String ns = sym.getNamespace();
+            if (ns == null) {
+                throw new RuntimeException("requiring-resolve: symbol must be namespace-qualified: " + sym);
+            }
+            try {
+                loadNamespace(ns);
+            } catch (Exception ignored) {}
+            // Resolve the var from the namespace
+            ClojureNamespace targetNs = namespaces.get(ns);
+            if (targetNs != null) {
+                Object val = targetNs.resolve(sym.getName());
+                if (val != null) {
+                    return new clojure.truffle.runtime.ClojureVar(this, ns, sym.getName());
+                }
+            }
+            return ClojureNil.INSTANCE;
         });
 
         globalVars.put("intern", (BuiltinFunction) args -> {
@@ -5075,11 +5322,373 @@ public class ClojureContext {
             return ClojureNil.INSTANCE;
         });
 
+        // --- Phase 19: Missing builtin functions ---
+
+        globalVars.put("parse-long", (BuiltinFunction) args -> {
+            checkArity(args, 1, "parse-long");
+            if (args[0] instanceof String s) {
+                try { return Long.parseLong(s.trim()); }
+                catch (NumberFormatException e) { return ClojureNil.INSTANCE; }
+            }
+            return ClojureNil.INSTANCE;
+        });
+
+        globalVars.put("parse-double", (BuiltinFunction) args -> {
+            checkArity(args, 1, "parse-double");
+            if (args[0] instanceof String s) {
+                try { return Double.parseDouble(s.trim()); }
+                catch (NumberFormatException e) { return ClojureNil.INSTANCE; }
+            }
+            return ClojureNil.INSTANCE;
+        });
+
+        globalVars.put("parse-boolean", (BuiltinFunction) args -> {
+            checkArity(args, 1, "parse-boolean");
+            if (args[0] instanceof String s) {
+                if ("true".equals(s)) return Boolean.TRUE;
+                if ("false".equals(s)) return Boolean.FALSE;
+                return ClojureNil.INSTANCE;
+            }
+            return ClojureNil.INSTANCE;
+        });
+
+        globalVars.put("parse-uuid", (BuiltinFunction) args -> {
+            checkArity(args, 1, "parse-uuid");
+            if (args[0] instanceof String s) {
+                try { return java.util.UUID.fromString(s.trim()); }
+                catch (IllegalArgumentException e) { return ClojureNil.INSTANCE; }
+            }
+            return ClojureNil.INSTANCE;
+        });
+
+        globalVars.put("random-uuid", (BuiltinFunction) args -> {
+            checkArity(args, 0, "random-uuid");
+            return java.util.UUID.randomUUID();
+        });
+
+        globalVars.put("print-str", (BuiltinFunction) args -> {
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < args.length; i++) {
+                if (i > 0) sb.append(' ');
+                Object v = args[i];
+                if (v == null || v instanceof ClojureNil) sb.append("nil");
+                else sb.append(v);
+            }
+            return sb.toString();
+        });
+
+        globalVars.put("println-str", (BuiltinFunction) args -> {
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < args.length; i++) {
+                if (i > 0) sb.append(' ');
+                Object v = args[i];
+                if (v == null || v instanceof ClojureNil) sb.append("nil");
+                else sb.append(v);
+            }
+            sb.append('\n');
+            return sb.toString();
+        });
+
+        globalVars.put("printf", (BuiltinFunction) args -> {
+            if (args.length < 1) throw new RuntimeException("printf: expected at least 1 arg");
+            String fmt = args[0].toString();
+            Object[] fmtArgs = new Object[args.length - 1];
+            for (int i = 1; i < args.length; i++) {
+                Object a = args[i];
+                if (a instanceof ClojureNil) fmtArgs[i - 1] = null;
+                else fmtArgs[i - 1] = a;
+            }
+            writeOut(String.format(fmt, fmtArgs));
+            return ClojureNil.INSTANCE;
+        });
+
+        globalVars.put("rational?", (BuiltinFunction) args -> {
+            checkArity(args, 1, "rational?");
+            return args[0] instanceof Long || args[0] instanceof Integer
+                    || args[0] instanceof Short || args[0] instanceof Byte
+                    || args[0] instanceof clojure.lang.Ratio
+                    || args[0] instanceof java.math.BigInteger
+                    || args[0] instanceof java.math.BigDecimal
+                    || args[0] instanceof clojure.lang.BigInt;
+        });
+
+        globalVars.put("decimal?", (BuiltinFunction) args -> {
+            checkArity(args, 1, "decimal?");
+            return args[0] instanceof java.math.BigDecimal;
+        });
+
+        globalVars.put("ident?", (BuiltinFunction) args -> {
+            checkArity(args, 1, "ident?");
+            return args[0] instanceof clojure.lang.Keyword || args[0] instanceof clojure.lang.Symbol;
+        });
+
+        globalVars.put("simple-ident?", (BuiltinFunction) args -> {
+            checkArity(args, 1, "simple-ident?");
+            if (args[0] instanceof clojure.lang.Keyword kw) return kw.getNamespace() == null;
+            if (args[0] instanceof clojure.lang.Symbol sym) return sym.getNamespace() == null;
+            return false;
+        });
+
+        globalVars.put("qualified-ident?", (BuiltinFunction) args -> {
+            checkArity(args, 1, "qualified-ident?");
+            if (args[0] instanceof clojure.lang.Keyword kw) return kw.getNamespace() != null;
+            if (args[0] instanceof clojure.lang.Symbol sym) return sym.getNamespace() != null;
+            return false;
+        });
+
+        globalVars.put("simple-keyword?", (BuiltinFunction) args -> {
+            checkArity(args, 1, "simple-keyword?");
+            if (args[0] instanceof clojure.lang.Keyword kw) return kw.getNamespace() == null;
+            return false;
+        });
+
+        globalVars.put("qualified-keyword?", (BuiltinFunction) args -> {
+            checkArity(args, 1, "qualified-keyword?");
+            if (args[0] instanceof clojure.lang.Keyword kw) return kw.getNamespace() != null;
+            return false;
+        });
+
+        globalVars.put("simple-symbol?", (BuiltinFunction) args -> {
+            checkArity(args, 1, "simple-symbol?");
+            if (args[0] instanceof clojure.lang.Symbol sym) return sym.getNamespace() == null;
+            return false;
+        });
+
+        globalVars.put("qualified-symbol?", (BuiltinFunction) args -> {
+            checkArity(args, 1, "qualified-symbol?");
+            if (args[0] instanceof clojure.lang.Symbol sym) return sym.getNamespace() != null;
+            return false;
+        });
+
+        globalVars.put("inst?", (BuiltinFunction) args -> {
+            checkArity(args, 1, "inst?");
+            return args[0] instanceof java.util.Date;
+        });
+
+        globalVars.put("uuid?", (BuiltinFunction) args -> {
+            checkArity(args, 1, "uuid?");
+            return args[0] instanceof java.util.UUID;
+        });
+
+        globalVars.put("uri?", (BuiltinFunction) args -> {
+            checkArity(args, 1, "uri?");
+            return args[0] instanceof java.net.URI;
+        });
+
+        globalVars.put("any?", (BuiltinFunction) args -> {
+            checkArity(args, 1, "any?");
+            return true;
+        });
+
+        globalVars.put("NaN?", (BuiltinFunction) args -> {
+            checkArity(args, 1, "NaN?");
+            if (args[0] instanceof Double d) return Double.isNaN(d);
+            if (args[0] instanceof Float f) return Float.isNaN(f);
+            return false;
+        });
+
+        globalVars.put("infinite?", (BuiltinFunction) args -> {
+            checkArity(args, 1, "infinite?");
+            if (args[0] instanceof Double d) return Double.isInfinite(d);
+            if (args[0] instanceof Float f) return Float.isInfinite(f);
+            return false;
+        });
+
+        globalVars.put("pos-int?", (BuiltinFunction) args -> {
+            checkArity(args, 1, "pos-int?");
+            if (args[0] instanceof Long l) return l > 0;
+            if (args[0] instanceof Integer i) return i > 0;
+            return false;
+        });
+
+        globalVars.put("neg-int?", (BuiltinFunction) args -> {
+            checkArity(args, 1, "neg-int?");
+            if (args[0] instanceof Long l) return l < 0;
+            if (args[0] instanceof Integer i) return i < 0;
+            return false;
+        });
+
+        globalVars.put("nat-int?", (BuiltinFunction) args -> {
+            checkArity(args, 1, "nat-int?");
+            if (args[0] instanceof Long l) return l >= 0;
+            if (args[0] instanceof Integer i) return i >= 0;
+            return false;
+        });
+
+        globalVars.put("bytes?", (BuiltinFunction) args -> {
+            checkArity(args, 1, "bytes?");
+            return args[0] instanceof byte[];
+        });
+
+        globalVars.put("indexed?", (BuiltinFunction) args -> {
+            checkArity(args, 1, "indexed?");
+            return args[0] instanceof clojure.lang.Indexed;
+        });
+
+        globalVars.put("seqable?", (BuiltinFunction) args -> {
+            checkArity(args, 1, "seqable?");
+            if (args[0] == null || args[0] instanceof ClojureNil) return true;
+            return args[0] instanceof clojure.lang.Seqable
+                    || args[0] instanceof Iterable
+                    || args[0] instanceof CharSequence
+                    || args[0] instanceof java.util.Map
+                    || args[0].getClass().isArray();
+        });
+
+        // --- Phase 21: Missing predicates & functions ---
+
+        globalVars.put("byte?", (BuiltinFunction) args -> {
+            checkArity(args, 1, "byte?");
+            return args[0] instanceof Byte;
+        });
+
+        globalVars.put("short?", (BuiltinFunction) args -> {
+            checkArity(args, 1, "short?");
+            return args[0] instanceof Short;
+        });
+
+        globalVars.put("extends?", (BuiltinFunction) args -> {
+            checkArity(args, 2, "extends?");
+            if (!(args[0] instanceof clojure.truffle.runtime.ClojureProtocol proto))
+                throw new RuntimeException("extends?: first arg must be a protocol");
+            return proto.hasImplementationForType(args[1]);
+        });
+
+        globalVars.put("get-method", (BuiltinFunction) args -> {
+            checkArity(args, 2, "get-method");
+            if (!(args[0] instanceof clojure.truffle.runtime.ClojureMultiMethod mm))
+                throw new RuntimeException("get-method: first arg must be a multimethod");
+            Object result = mm.getMethod(args[1]);
+            return result == null ? ClojureNil.INSTANCE : result;
+        });
+
+        globalVars.put("replace", (BuiltinFunction) args -> {
+            checkArity(args, 2, "replace");
+            Object smap = args[0];
+            Object coll = args[1];
+            if (coll instanceof clojure.lang.IPersistentVector v) {
+                java.util.List<Object> result = new java.util.ArrayList<>();
+                for (int i = 0; i < v.count(); i++) {
+                    Object item = v.nth(i);
+                    Object replacement = clojure.lang.RT.get(smap, item);
+                    result.add(replacement != null ? replacement : item);
+                }
+                return clojure.lang.PersistentVector.create(result);
+            }
+            // For seqs
+            clojure.lang.ISeq s = clojure.lang.RT.seq(coll);
+            java.util.List<Object> result = new java.util.ArrayList<>();
+            while (s != null) {
+                Object item = s.first();
+                Object replacement = clojure.lang.RT.get(smap, item);
+                result.add(replacement != null ? replacement : item);
+                s = s.next();
+            }
+            return clojure.lang.PersistentList.create(result);
+        });
+
+        globalVars.put("halt-when", (BuiltinFunction) args -> {
+            if (args.length < 1 || args.length > 2) throw new RuntimeException("halt-when: 1-2 args");
+            Object pred = args[0];
+            Object retf = args.length == 2 ? args[1] : null;
+            final Object finalRetf = retf;
+            ClojureContext ctx = this;
+            return (BuiltinFunction) xfArgs -> {
+                checkArity(xfArgs, 1, "halt-when xform");
+                Object rf = xfArgs[0];
+                return (BuiltinFunction) stepArgs -> {
+                    if (stepArgs.length == 0) return ctx.callFunction(rf, new Object[0]);
+                    if (stepArgs.length == 1) return ctx.callFunction(rf, stepArgs);
+                    Object result = stepArgs[0];
+                    Object input = stepArgs[1];
+                    if (isTruthy(ctx.callFunction(pred, new Object[]{input}))) {
+                        Object haltVal = finalRetf != null
+                                ? ctx.callFunction(finalRetf, new Object[]{result, input})
+                                : input;
+                        return new Reduced(haltVal);
+                    }
+                    return ctx.callFunction(rf, stepArgs);
+                };
+            };
+        });
+
+        // --- Phase 22: monitor-enter/monitor-exit & ensure ---
+
+        globalVars.put("monitor-enter", (BuiltinFunction) args -> {
+            checkArity(args, 1, "monitor-enter");
+            // In practice, monitor-enter/exit are handled by locking macro
+            // This is a no-op placeholder for compatibility
+            return ClojureNil.INSTANCE;
+        });
+
+        globalVars.put("monitor-exit", (BuiltinFunction) args -> {
+            checkArity(args, 1, "monitor-exit");
+            return ClojureNil.INSTANCE;
+        });
+
+        globalVars.put("ensure", (BuiltinFunction) args -> {
+            checkArity(args, 1, "ensure");
+            // In simplified STM, ensure just returns current ref value
+            if (args[0] instanceof clojure.truffle.runtime.ClojureRef ref) {
+                return ref.deref();
+            }
+            throw new RuntimeException("ensure: arg must be a ref");
+        });
+
         // Copy all builtins into clojure.core namespace
         ClojureNamespace core = namespaces.get("clojure.core");
         if (core != null) {
             globalVars.forEach(core::intern);
         }
+    }
+
+    /**
+     * Search for a resource (.clj file) in classpath entries, then classloader, then filesystem.
+     */
+    private java.io.InputStream findResource(String path) {
+        // 1. Search -cp classpath entries (JARs and directories)
+        for (String entry : classpathEntries) {
+            java.io.File f = new java.io.File(entry);
+            if (f.isDirectory()) {
+                java.io.File target = new java.io.File(f, path);
+                if (target.exists()) {
+                    if (path.contains("spec/alpha")) System.err.println("[FIND] dir hit: " + target + " size=" + target.length());
+                    try { return new java.io.FileInputStream(target); }
+                    catch (java.io.FileNotFoundException e) { /* continue */ }
+                }
+            } else if (f.isFile() && f.getName().endsWith(".jar")) {
+                try {
+                    java.util.jar.JarFile jar = new java.util.jar.JarFile(f);
+                    java.util.jar.JarEntry je = jar.getJarEntry(path);
+                    if (je != null) {
+                        if (path.contains("spec/alpha")) System.err.println("[FIND] jar hit: " + f + " entry=" + je.getName() + " size=" + je.getSize() + " compSize=" + je.getCompressedSize());
+                        // Read into byte array so we can close the JarFile
+                        java.io.InputStream jis = jar.getInputStream(je);
+                        java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
+                        byte[] buf = new byte[8192];
+                        int n;
+                        while ((n = jis.read(buf)) != -1) {
+                            baos.write(buf, 0, n);
+                        }
+                        jis.close();
+                        jar.close();
+                        return new java.io.ByteArrayInputStream(baos.toByteArray());
+                    }
+                    jar.close();
+                } catch (java.io.IOException e) { /* continue */ }
+            }
+        }
+        // 2. Classloader (for classes bundled in the binary)
+        java.io.InputStream is = getClass().getClassLoader().getResourceAsStream(path);
+        if (is != null) return is;
+        // 3. Filesystem (current dir, src/)
+        java.io.File file = new java.io.File(path);
+        if (!file.exists()) file = new java.io.File("src/" + path);
+        if (file.exists()) {
+            try { return new java.io.FileInputStream(file); }
+            catch (java.io.FileNotFoundException e) { /* fall through */ }
+        }
+        return null;
     }
 
     /** Write text to current output (respects with-out-str override) */
@@ -5094,33 +5703,33 @@ public class ClojureContext {
 
     public Object callFunction(Object fn, Object[] args) {
         if (fn instanceof ClojureFunction clf) {
-            Object[] callArgs = new Object[args.length + 1];
-            callArgs[0] = clf;
-            System.arraycopy(args, 0, callArgs, 1, args.length);
-            return clf.getCallTarget().call(callArgs);
-        } else if (fn instanceof MultiArityFunction maf) {
-            ClojureFunction clf = maf.resolve(args.length);
-            Object[] callArgs = new Object[args.length + 1];
-            callArgs[0] = clf;
-            System.arraycopy(args, 0, callArgs, 1, args.length);
-            return clf.getCallTarget().call(callArgs);
-        } else if (fn instanceof BuiltinFunction builtin) {
-            return builtin.execute(args);
-        } else if (fn instanceof ClojureMultiMethod mm) {
-            return mm.invoke(args);
-        } else if (fn instanceof clojure.lang.Keyword kw) {
-            // Keyword as function: (:key map) → (get map :key)
-            if (args.length < 1 || args.length > 2)
-                throw new RuntimeException("Keyword lookup expects 1 or 2 args");
-            Object map = args[0];
-            if (map instanceof clojure.lang.ILookup lookup) {
-                Object notFound = args.length == 2 ? args[1] : ClojureNil.INSTANCE;
-                Object val = lookup.valAt(kw, notFound);
-                return val == null ? ClojureNil.INSTANCE : val;
+                Object[] callArgs = new Object[args.length + 1];
+                callArgs[0] = clf;
+                System.arraycopy(args, 0, callArgs, 1, args.length);
+                return clf.getCallTarget().call(callArgs);
+            } else if (fn instanceof MultiArityFunction maf) {
+                ClojureFunction clf = maf.resolve(args.length);
+                Object[] callArgs = new Object[args.length + 1];
+                callArgs[0] = clf;
+                System.arraycopy(args, 0, callArgs, 1, args.length);
+                return clf.getCallTarget().call(callArgs);
+            } else if (fn instanceof BuiltinFunction builtin) {
+                return builtin.execute(args);
+            } else if (fn instanceof ClojureMultiMethod mm) {
+                return mm.invoke(args);
+            } else if (fn instanceof clojure.lang.Keyword kw) {
+                // Keyword as function: (:key map) → (get map :key)
+                if (args.length < 1 || args.length > 2)
+                    throw new RuntimeException("Keyword lookup expects 1 or 2 args");
+                Object map = args[0];
+                if (map instanceof clojure.lang.ILookup lookup) {
+                    Object notFound = args.length == 2 ? args[1] : ClojureNil.INSTANCE;
+                    Object val = lookup.valAt(kw, notFound);
+                    return val == null ? ClojureNil.INSTANCE : val;
+                }
+                return args.length == 2 ? args[1] : ClojureNil.INSTANCE;
             }
-            return args.length == 2 ? args[1] : ClojureNil.INSTANCE;
-        }
-        throw new RuntimeException("Not a function: " + fn);
+            throw new RuntimeException("Not a function: " + fn);
     }
 
     // --- eval ---

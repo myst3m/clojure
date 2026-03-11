@@ -27,6 +27,13 @@ public class JavaInstanceMethodNode extends ExpressionNode {
 
         Class<?> clazz = target.getClass();
         Method method = JavaInteropUtil.findMethod(clazz, methodName, args, false);
+        // For Proxy objects, search interfaces if method not found on proxy class
+        if (method == null && java.lang.reflect.Proxy.isProxyClass(clazz)) {
+            for (Class<?> iface : clazz.getInterfaces()) {
+                method = JavaInteropUtil.findMethod(iface, methodName, args, false);
+                if (method != null) break;
+            }
+        }
         if (method == null) {
             throw new RuntimeException("No such method: " + clazz.getName() + "." + methodName
                     + " with " + args.length + " args");

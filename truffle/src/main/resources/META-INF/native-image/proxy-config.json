@@ -1,0 +1,10 @@
+[
+  {"interfaces": ["java.lang.Runnable"]},
+  {"interfaces": ["java.lang.Comparable"]},
+  {"interfaces": ["java.util.concurrent.Callable"]},
+  {"interfaces": ["java.lang.Runnable", "java.util.concurrent.Callable"]},
+  {"interfaces": ["java.lang.AutoCloseable"]},
+  {"interfaces": ["java.lang.Iterable"]},
+  {"interfaces": ["java.util.Comparator"]},
+  {"interfaces": ["java.util.Iterator"]}
+]

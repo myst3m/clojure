@@ -43,6 +43,12 @@ public class JavaInteropUtil {
                 CLASS_CACHE.put(simpleName, Class.forName("java.util." + name));
             } catch (ClassNotFoundException ignored) {}
         }
+        // java.math.*
+        for (String name : new String[]{"BigDecimal", "BigInteger"}) {
+            try {
+                CLASS_CACHE.put(name, Class.forName("java.math." + name));
+            } catch (ClassNotFoundException ignored) {}
+        }
         // java.io.*
         for (String name : new String[]{
                 "File", "InputStream", "OutputStream", "Reader", "Writer",

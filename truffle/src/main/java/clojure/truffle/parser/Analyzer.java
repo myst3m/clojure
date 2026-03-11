@@ -28,6 +28,20 @@ public class Analyzer {
 
     private static final Object EOF = new Object();
 
+    private boolean isSideEffectForm(Object form) {
+        if (form instanceof clojure.lang.ISeq seq) {
+            Object head = seq.first();
+            if (head instanceof clojure.lang.Symbol sym) {
+                String name = sym.getName();
+                return "require".equals(name) || "ns".equals(name) ||
+                       "use".equals(name) || "import".equals(name) ||
+                       "refer-clojure".equals(name) || "in-ns".equals(name) ||
+                       "alias".equals(name);
+            }
+        }
+        return false;
+    }
+
     // --- Scope ---
 
     static class CaptureEntry {
@@ -86,12 +100,38 @@ public class Analyzer {
 
     public ExpressionNode[] analyzeProgram(String source) {
         currentScope = new Scope(null);
-        List<Object> forms = readAll(source);
-        ExpressionNode[] nodes = new ExpressionNode[forms.size()];
-        for (int i = 0; i < forms.size(); i++) {
-            nodes[i] = analyze(forms.get(i));
+        // Set *ns* for LispReader so ::keyword auto-qualification works
+        String currentNs = context != null ? context.getCurrentNamespace() : "user";
+        clojure.lang.Var nsVar = clojure.lang.RT.var("clojure.core", "*ns*");
+        clojure.lang.Namespace clojureNs = clojure.lang.Namespace.findOrCreate(
+                clojure.lang.Symbol.intern(currentNs));
+        clojure.lang.Var.pushThreadBindings(clojure.lang.RT.map(nsVar, clojureNs));
+        try {
+            // Read and analyze forms incrementally so that side-effect forms
+            // (require, ns, use, import) are executed before subsequent forms are analyzed
+            java.util.List<ExpressionNode> nodes = new java.util.ArrayList<>();
+            java.io.PushbackReader reader = new java.io.PushbackReader(new java.io.StringReader(source), 2);
+            while (true) {
+                Object form = clojure.lang.LispReader.read(reader, false, EOF, false, READ_OPTS);
+                if (form == EOF) break;
+                ExpressionNode node = analyze(form);
+                nodes.add(node);
+                // Execute side-effect forms immediately so aliases/vars are available
+                if (isSideEffectForm(form)) {
+                    EvalRootNode root = new EvalRootNode(language, currentScope.buildDescriptor(),
+                            new ExpressionNode[]{node});
+                    root.getCallTarget().call();
+                    // Replace the executed node with a no-op so it's not executed again
+                    nodes.set(nodes.size() - 1, new NilNode());
+                }
+            }
+            return nodes.toArray(new ExpressionNode[0]);
+        } catch (Exception e) {
+            if (e instanceof RuntimeException re) throw re;
+            throw new RuntimeException(e);
+        } finally {
+            clojure.lang.Var.popThreadBindings();
         }
-        return nodes;
     }
 
     public ExpressionNode analyzeForm(Object form) {
@@ -99,14 +139,96 @@ public class Analyzer {
         return analyze(form);
     }
 
+    /**
+     * Read and evaluate forms one at a time (incremental mode).
+     * This is needed for loading namespaces where ::alias/keyword
+     * depends on ns/require having been executed first.
+     */
+    private int formCount = 0;
+    public void loadSource(String source, ClojureTruffleLanguage lang) {
+        if (currentScope == null) currentScope = new Scope(null);
+        formCount = 0;
+        PushbackReader reader = new PushbackReader(new StringReader(source), 2);
+        try {
+            while (true) {
+                Object form = LispReader.read(reader, false, EOF, false, READ_OPTS);
+                if (form == EOF) {
+                    if (context != null && "clojure.spec.alpha".equals(context.getCurrentNamespace())) {
+                        System.err.println("[LOAD-EOF] after " + formCount + " forms, source length=" + source.length());
+                    }
+                    break;
+                }
+                String formStr = form.toString();
+                if (formStr.length() > 80) formStr = formStr.substring(0, 80) + "...";
+                if (context != null && "clojure.spec.alpha".equals(context.getCurrentNamespace())) {
+                    System.err.println("[LOAD-FORM #" + formCount + "] " + formStr);
+                }
+                formCount++;
+                ExpressionNode node;
+                try {
+                    node = analyze(form);
+                } catch (StackOverflowError soe2) {
+                    System.err.println("[ANALYZE-SOE] form=" + formStr);
+                    // Print stack trace pattern to identify recursion
+                    StackTraceElement[] st = soe2.getStackTrace();
+                    System.err.println("[ANALYZE-SOE] Stack depth: " + st.length);
+                    // Print first 30 frames
+                    for (int si = 0; si < Math.min(30, st.length); si++) {
+                        System.err.println("[ST] " + si + ": " + st[si]);
+                    }
+                    // Find repeating pattern
+                    java.util.Map<String, Integer> counts = new java.util.LinkedHashMap<>();
+                    for (StackTraceElement e : st) {
+                        String key = e.getClassName() + "." + e.getMethodName() + ":" + e.getLineNumber();
+                        counts.merge(key, 1, Integer::sum);
+                    }
+                    System.err.println("[ANALYZE-SOE] Top repeated frames:");
+                    counts.entrySet().stream()
+                        .sorted((a, b) -> b.getValue() - a.getValue())
+                        .limit(15)
+                        .forEach(e -> System.err.println("  " + e.getValue() + "x " + e.getKey()));
+                    throw soe2;
+                } catch (Exception ae) {
+                    if (context != null && "clojure.spec.alpha".equals(context.getCurrentNamespace())) {
+                        System.err.println("[ANALYZE-ERROR] " + ae.getMessage() + " form=" + formStr);
+                    }
+                    throw ae;
+                }
+                // Execute immediately so side effects (ns, require) take effect
+                // before reading the next form
+                Scope savedScope = currentScope;
+                EvalRootNode root = new EvalRootNode(lang, currentScope.buildDescriptor(),
+                        new ExpressionNode[]{node});
+                try {
+                    root.getCallTarget().call();
+                } catch (StackOverflowError soe) {
+                    System.err.println("[SOE] in ns=" + (context != null ? context.getCurrentNamespace() : "?") + " form=" + form.toString().substring(0, Math.min(200, form.toString().length())));
+                    throw soe;
+                } catch (Exception ex) {
+                    if (ex.getMessage() != null && ex.getMessage().contains("Stack overflow")) {
+                        System.err.println("[SOE-EX] in ns=" + (context != null ? context.getCurrentNamespace() : "?") + " form=" + form.toString().substring(0, Math.min(200, form.toString().length())));
+                    }
+                    throw ex;
+                }
+                currentScope = savedScope;
+            }
+        } catch (Exception e) {
+            String ns = context != null ? context.getCurrentNamespace() : "?";
+            throw new RuntimeException("Load error in " + ns + ": " + e.getMessage(), e);
+        }
+    }
+
     // --- Reader ---
+
+    private static final Object READ_OPTS = clojure.lang.RT.map(
+            LispReader.OPT_READ_COND, LispReader.COND_ALLOW);
 
     private List<Object> readAll(String source) {
         List<Object> forms = new ArrayList<>();
         PushbackReader reader = new PushbackReader(new StringReader(source), 2);
         try {
             while (true) {
-                Object form = LispReader.read(reader, false, EOF, false, null);
+                Object form = LispReader.read(reader, false, EOF, false, READ_OPTS);
                 if (form == EOF) break;
                 forms.add(form);
             }
@@ -166,40 +288,102 @@ public class Analyzer {
             // Simple class name starting with uppercase (String, Long) or
             // fully qualified (java.lang.Long, java.util.ArrayList)
             if (Character.isUpperCase(name.charAt(0)) || name.contains(".")) {
+                // Try as namespace.VarName first (e.g. clojure.spec.alpha.Spec → clojure.spec.alpha/Spec)
+                if (name.contains(".") && context != null) {
+                    int lastDot = name.lastIndexOf('.');
+                    if (lastDot > 0) {
+                        String possibleNs = name.substring(0, lastDot);
+                        String possibleVar = name.substring(lastDot + 1);
+                        if (context.getNamespace(possibleNs) != null) {
+                            return new SymbolNode(context, possibleNs + "/" + possibleVar);
+                        }
+                    }
+                }
                 try {
                     Class<?> clazz = JavaInteropUtil.resolveClass(name);
                     return new QuoteNode(clazz);
                 } catch (RuntimeException ignored) {}
             }
         } else if (ns != null) {
-            // Namespace-qualified: java.lang/Long → java.lang.Long
-            String fqn = ns + "." + name;
-            try {
-                Class<?> clazz = JavaInteropUtil.resolveClass(fqn);
-                return new QuoteNode(clazz);
-            } catch (RuntimeException ignored) {}
+            // Check if this is a known namespace var before trying Java class resolution
+            if (context != null && context.getNamespace(ns) != null) {
+                // ns is a known Clojure namespace — resolve as namespace var, not Java class
+                // Fall through to namespace alias resolution below
+            } else {
+                // Namespace-qualified: java.lang/Long → java.lang.Long
+                String fqn = ns + "." + name;
+                try {
+                    Class<?> clazz = JavaInteropUtil.resolveClass(fqn);
+                    return new QuoteNode(clazz);
+                } catch (RuntimeException ignored) {}
+            }
         }
-        String varName = ns != null ? ns + "/" + name : name;
+        // Resolve namespace alias at compile time to fully qualified name
+        String resolvedNs = ns;
+        if (ns != null && context != null) {
+            ClojureNamespace currentNsObj = context.getNamespace(context.getCurrentNamespace());
+            if (currentNsObj != null) {
+                ClojureNamespace aliased = currentNsObj.resolveAlias(ns);
+                if (aliased != null) resolvedNs = aliased.getName();
+            }
+        }
+        String varName = resolvedNs != null ? resolvedNs + "/" + name : name;
         return new SymbolNode(context, varName);
     }
+
+    // True JVM-level special forms that should always be recognized regardless of namespace.
+    // These match Clojure's Compiler.specials - forms that are never macros.
+    private static final java.util.Set<String> TRUE_SPECIAL_FORMS = java.util.Set.of(
+        "if", "do", "let*", "let", "fn*", "fn", "quote", "recur",
+        "loop*", "loop", "try", "throw", "new", "set!", "var",
+        "monitor-enter", "monitor-exit"
+    );
+
+    // Forms implemented as builtins in Truffle Clojure (macros/special forms in clojure.core)
+    // These are recognized when namespace-qualified to clojure.core or an alias thereof.
+    private static final java.util.Set<String> CORE_FORMS = java.util.Set.of(
+        "and", "or", "when", "cond", "defn", "defn-", "def",
+        "defmacro", "macroexpand", "lazy-seq",
+        "defmulti", "defmethod", "defprotocol", "deftype", "defrecord",
+        "ns", "in-ns", "require", "->", "->>", "as->", "some->", "some->>",
+        "cond->", "cond->>", "doto", "..", "if-let", "when-let", "if-some",
+        "when-some", "case", "for", "doseq", "dotimes", "letfn",
+        "binding", "when-not", "if-not", "condp", "while", "comment",
+        "declare", "defonce", "with-open", "with-out-str", "reify", "proxy",
+        "extend-type", "extend-protocol", "delay", "future", "locking",
+        "dosync", "macroexpand-1", "when-first", "assert",
+        "time", "with-in-str", "with-redefs", "memfn", "import", "use",
+        "refer", "refer-clojure"
+    );
 
     private ExpressionNode analyzeList(ISeq seq) {
         if (seq == null) return new QuoteNode(PersistentList.EMPTY);
         Object first = seq.first();
+        if (first == null && seq.next() == null) return new QuoteNode(PersistentList.EMPTY);
 
         if (first instanceof Symbol sym) {
             String name = sym.getName();
             String ns = sym.getNamespace();
 
-            // Check for macros first
-            if (ns == null && context != null) {
-                Object macro = context.getMacro(name);
-                if (macro != null) {
-                    return expandAndAnalyzeMacro(macro, seq.next());
+            // For namespace-qualified symbols, check if they resolve to a known form:
+            // 1. True special forms (if, do, let*, fn*, etc.) are always recognized by name
+            // 2. Core forms (defn, delay, etc.) only when qualified to clojure.core
+            boolean treatAsBuiltin = false;
+            if (ns != null && (TRUE_SPECIAL_FORMS.contains(name) || CORE_FORMS.contains(name))) {
+                // Only treat as builtin if the namespace resolves to clojure.core
+                String resolvedNs = ns;
+                if (context != null) {
+                    ClojureNamespace currentNsObj = context.getNamespace(context.getCurrentNamespace());
+                    if (currentNsObj != null) {
+                        ClojureNamespace aliasedNs = currentNsObj.resolveAlias(ns);
+                        if (aliasedNs != null) resolvedNs = aliasedNs.getName();
+                    }
+                }
+                if ("clojure.core".equals(resolvedNs)) {
+                    treatAsBuiltin = true;
                 }
             }
-
-            if (ns == null) {
+            if (ns == null || treatAsBuiltin) {
                 // Field access: (.-field obj)
                 if (name.startsWith(".-") && name.length() > 2) {
                     return analyzeFieldAccess(name.substring(2), seq.next());
@@ -226,7 +410,8 @@ public class Analyzer {
                     case "or":          return analyzeOr(seq);
                     case "when":        return analyzeWhen(seq);
                     case "cond":        return analyzeCond(seq);
-                    case "defn":        return analyzeDefn(seq);
+                    case "defn":        return analyzeDefn(seq, false);
+                    case "defn-":       return analyzeDefn(seq, true);
                     case "try":         return analyzeTry(seq);
                     case "throw":       return analyzeThrow(seq);
                     case "defmacro":    return analyzeDefmacro(seq);
@@ -297,20 +482,57 @@ public class Analyzer {
             if (ns != null && isJavaClassName(ns)) {
                 return analyzeStaticCall(ns, name, seq.next());
             }
+
+            // Check for macros AFTER builtin forms - macros should not shadow builtins
+            // Local variables and builtin forms take priority over macros
+            if (context != null) {
+                if (ns == null) {
+                    // Unqualified: check local vars first, then macros
+                    Integer localSlot = currentScope.findLocal(name);
+                    if (localSlot == null) {
+                        Object macro = context.getMacro(name);
+                        if (macro != null) {
+                            return expandAndAnalyzeMacro(macro, seq.next());
+                        }
+                    }
+                } else {
+                    // Namespace-qualified: check if it's a macro in the target namespace (e.g., s/def)
+                    Object macro = context.getMacroFromNs(ns, name);
+                    if (macro != null) {
+                        return expandAndAnalyzeMacro(macro, seq.next());
+                    }
+                }
+            }
         }
         return analyzeInvoke(seq);
     }
 
     // --- Macro expansion ---
 
+    private int macroDepth = 0;
     private ExpressionNode expandAndAnalyzeMacro(Object macro, ISeq argForms) {
-        List<Object> rawArgs = new ArrayList<>();
-        while (argForms != null) {
-            rawArgs.add(argForms.first());
-            argForms = argForms.next();
+        if (macroDepth > 5) {
+            String macroDesc = macro instanceof ClojureFunction cf ? cf.getName() :
+                macro instanceof MultiArityFunction ? "MultiArityFunction" : macro.getClass().getSimpleName();
+            System.err.println("[MACRO depth=" + macroDepth + "] macro=" + macroDesc + " args=" + argForms);
         }
-        Object expanded = context.callFunction(macro, rawArgs.toArray());
-        return analyze(expanded);
+        if (macroDepth > 50) {
+            String macroDesc = macro instanceof ClojureFunction cf ? cf.getName() :
+                macro instanceof MultiArityFunction ? "MultiArityFunction" : macro.getClass().getSimpleName();
+            throw new RuntimeException("Macro expansion depth exceeded (>50), macro=" + macroDesc + ", args=" + argForms);
+        }
+        macroDepth++;
+        try {
+            List<Object> rawArgs = new ArrayList<>();
+            while (argForms != null) {
+                rawArgs.add(argForms.first());
+                argForms = argForms.next();
+            }
+            Object expanded = context.callFunction(macro, rawArgs.toArray());
+            return analyze(expanded);
+        } finally {
+            macroDepth--;
+        }
     }
 
     private ExpressionNode analyzeDefmacro(ISeq seq) {
@@ -376,6 +598,40 @@ public class Analyzer {
         if (target instanceof Symbol s) {
             String varName = s.getName();
             return new SetBangNode(context, varName, valueNode);
+        }
+        // (set! (. Class field) value) → Java static field assignment
+        if (target instanceof ISeq targetSeq) {
+            Object head = targetSeq.first();
+            if (head instanceof Symbol dotSym && ".".equals(dotSym.getName())) {
+                Object classObj = RT.second(targetSeq);
+                Object fieldObj = RT.third(targetSeq);
+                if (classObj instanceof Symbol classSym && fieldObj instanceof Symbol fieldSym) {
+                    String className = classSym.getName();
+                    String fieldName = fieldSym.getName();
+                    ExpressionNode valNode = valueNode;
+                    return new ExpressionNode() {
+                        @Override
+                        public Object executeGeneric(com.oracle.truffle.api.frame.VirtualFrame frame) {
+                            try {
+                                Class<?> clazz = clojure.truffle.nodes.interop.JavaInteropUtil.resolveClass(className);
+                                java.lang.reflect.Field field = clazz.getField(fieldName);
+                                field.setAccessible(true);
+                                Object value = valNode.executeGeneric(frame);
+                                // Convert truthy/falsy to boolean if field is boolean
+                                if (field.getType() == boolean.class || field.getType() == Boolean.class) {
+                                    if (value instanceof Boolean b) field.set(null, b);
+                                    else field.set(null, value != null && !(value instanceof clojure.truffle.runtime.ClojureNil));
+                                } else {
+                                    field.set(null, value);
+                                }
+                                return value;
+                            } catch (Exception e) {
+                                throw new RuntimeException("set!: cannot set field " + className + "/" + fieldName + ": " + e.getMessage(), e);
+                            }
+                        }
+                    };
+                }
+            }
         }
         throw err("set!: target must be a symbol");
     }
@@ -1495,15 +1751,31 @@ public class Analyzer {
             return analyze(RT.list(Symbol.intern("let"), letBindings, innerForm));
         }
 
-        // Normal binding: sym coll
-        if (!(key instanceof Symbol bindSym)) throw err("for: binding must be a symbol");
+        // Normal binding: sym or destructuring pattern
         Object collForm = bindings.nth(pos + 1);
+        Object bindForm = key; // can be Symbol or destructuring vector/map
+
+        // For fn parameter, use a temp symbol if destructuring, then let-destructure inside
+        Symbol paramSym;
+        Object bodyWrapper;
+        if (bindForm instanceof Symbol) {
+            paramSym = (Symbol) bindForm;
+            bodyWrapper = null; // no wrapping needed
+        } else {
+            paramSym = Symbol.intern("__for_temp__" + System.nanoTime());
+            bodyWrapper = bindForm; // will wrap body with (let [pattern paramSym] ...)
+        }
 
         if (pos + 2 >= bindings.count()) {
             // Last binding: (map (fn [sym] body) coll)
+            Object bodyExpr = body.first();
+            if (bodyWrapper != null) {
+                bodyExpr = RT.list(Symbol.intern("let"),
+                        PersistentVector.create(java.util.List.of(bodyWrapper, paramSym)), bodyExpr);
+            }
             Object fnForm = RT.list(Symbol.intern("fn"),
-                    PersistentVector.create(java.util.List.of(bindSym)),
-                    body.first());
+                    PersistentVector.create(java.util.List.of(paramSym)),
+                    bodyExpr);
             return analyze(RT.list(Symbol.intern("map"), fnForm, collForm));
         } else {
             // Not last: (mapcat (fn [sym] (for [rest...] body)) coll)
@@ -1511,8 +1783,12 @@ public class Analyzer {
             for (int i = pos + 2; i < bindings.count(); i++)
                 restBindings = restBindings.cons(bindings.nth(i));
             Object innerFor = RT.list(Symbol.intern("for"), restBindings, body.first());
+            if (bodyWrapper != null) {
+                innerFor = RT.list(Symbol.intern("let"),
+                        PersistentVector.create(java.util.List.of(bodyWrapper, paramSym)), innerFor);
+            }
             Object fnForm = RT.list(Symbol.intern("fn"),
-                    PersistentVector.create(java.util.List.of(bindSym)), innerFor);
+                    PersistentVector.create(java.util.List.of(paramSym)), innerFor);
             return analyze(RT.list(Symbol.intern("mapcat"), fnForm, collForm));
         }
     }
@@ -1790,7 +2066,17 @@ public class Analyzer {
                 }
             }
             // Second pass: apply
-            if (alias != null) currentNs.alias(alias, reqNs);
+            if (alias != null) {
+                currentNs.alias(alias, reqNs);
+                // Also register in Clojure's namespace for ::alias/keyword reader support
+                try {
+                    clojure.lang.Namespace clojureCurrentNs = clojure.lang.Namespace.findOrCreate(
+                            clojure.lang.Symbol.intern(context.getCurrentNamespace()));
+                    clojure.lang.Namespace clojureReqNs = clojure.lang.Namespace.findOrCreate(
+                            clojure.lang.Symbol.intern(nsName));
+                    clojureCurrentNs.addAlias(clojure.lang.Symbol.intern(alias), clojureReqNs);
+                } catch (Exception ignored) {}
+            }
             if (referSpec != null) {
                 if (referSpec instanceof Keyword rk && rk.getName().equals("all")) {
                     if (renames != null) {
@@ -1882,13 +2168,23 @@ public class Analyzer {
         Object asName = pattern.valAt(Keyword.intern("as"));
         IPersistentMap defaults = (orMap instanceof IPersistentMap m) ? m : null;
 
-        // :keys [a b] -> bind a to (:a source), b to (:b source)
+        // :keys [a b] or :keys [:a :b] -> bind a to (:a source), b to (:b source)
         if (keysVec instanceof IPersistentVector kv) {
             for (int i = 0; i < kv.count(); i++) {
-                Symbol sym = (Symbol) kv.nth(i);
-                Keyword key = Keyword.intern(sym.getName());
-                ExpressionNode getExpr = makeGetNode(sourceSlot, key, defaults, sym);
-                slots.add(currentScope.addLocal(sym.getName()));
+                Object elem = kv.nth(i);
+                String localName;
+                Keyword key;
+                if (elem instanceof Symbol sym) {
+                    localName = sym.getName();
+                    key = Keyword.intern(localName);
+                } else if (elem instanceof Keyword kw) {
+                    localName = kw.getName();
+                    key = kw;
+                } else {
+                    throw err("Unsupported :keys element: " + elem);
+                }
+                ExpressionNode getExpr = makeGetNode(sourceSlot, key, defaults, Symbol.intern(localName));
+                slots.add(currentScope.addLocal(localName));
                 values.add(getExpr);
             }
         }
@@ -1956,11 +2252,11 @@ public class Analyzer {
                 new ExpressionNode[]{new ReadLocalNode(sourceSlot), new LongLiteralNode(index)});
     }
 
-    // Helper: (nthnext source index) or (drop index source)
+    // Helper: (nthnext source index) - returns nil when no elements remain
     private ExpressionNode makeNthnextNode(int sourceSlot, int index) {
         return new InvokeNode(
-                new SymbolNode(context, "drop"),
-                new ExpressionNode[]{new LongLiteralNode(index), new ReadLocalNode(sourceSlot)});
+                new SymbolNode(context, "nthnext"),
+                new ExpressionNode[]{new ReadLocalNode(sourceSlot), new LongLiteralNode(index)});
     }
 
     // Helper: (get source key) or (get source key default)
@@ -2043,9 +2339,41 @@ public class Analyzer {
         ISeq args = seq.next();
         if (args == null) throw err("def: missing name");
         if (!(args.first() instanceof Symbol)) throw err("def: name must be a symbol");
-        String name = ((Symbol) args.first()).getName();
+        Symbol sym = (Symbol) args.first();
+        String name = sym.getName();
+
+        // Extract metadata from the symbol (^:dynamic, ^:private, ^{...})
+        boolean isDynamic = false;
+        boolean isPrivate = false;
+        String docString = null;
+        clojure.lang.IPersistentMap meta = sym.meta();
+        if (meta != null) {
+            Object dynVal = meta.valAt(clojure.lang.Keyword.intern("dynamic"));
+            if (Boolean.TRUE.equals(dynVal)) isDynamic = true;
+            Object privVal = meta.valAt(clojure.lang.Keyword.intern("private"));
+            if (Boolean.TRUE.equals(privVal)) isPrivate = true;
+            Object docVal = meta.valAt(clojure.lang.Keyword.intern("doc"));
+            if (docVal instanceof String s) docString = s;
+        }
+        // Also detect dynamic vars by earmuff convention
+        if (name.startsWith("*") && name.endsWith("*") && name.length() > 2) {
+            isDynamic = true;
+        }
+
         args = args.next();
+
+        // Check for docstring before value: (def name "doc" value)
+        if (args != null && args.next() != null && args.first() instanceof String s) {
+            if (docString == null) docString = s;
+            args = args.next();
+        }
+
         ExpressionNode valueNode = (args != null) ? analyze(args.first()) : new NilNode();
+
+        if (isDynamic) {
+            context.declareDynamic(name);
+        }
+
         return new DefNode(context, name, valueNode);
     }
 
@@ -2056,6 +2384,9 @@ public class Analyzer {
             throw err("let*: bindings must be a vector");
         IPersistentVector bindings = (IPersistentVector) args.first();
         if (bindings.count() % 2 != 0) throw err("let*: odd number of binding forms");
+
+        // Save current locals to restore after let scope
+        Map<String, Integer> savedLocals = new LinkedHashMap<>(currentScope.locals);
 
         List<Integer> slotList = new ArrayList<>();
         List<ExpressionNode> valueList = new ArrayList<>();
@@ -2075,7 +2406,13 @@ public class Analyzer {
         }
         int[] slots = slotList.stream().mapToInt(Integer::intValue).toArray();
         ExpressionNode[] values = valueList.toArray(new ExpressionNode[0]);
-        return new LetNode(slots, values, analyzeBody(args.next()));
+        ExpressionNode body = analyzeBody(args.next());
+
+        // Restore locals (let bindings go out of scope)
+        currentScope.locals.clear();
+        currentScope.locals.putAll(savedLocals);
+
+        return new LetNode(slots, values, body);
     }
 
     private ExpressionNode analyzeFn(ISeq seq) {
@@ -2087,6 +2424,18 @@ public class Analyzer {
             fnName = ((Symbol) args.first()).getName();
             args = args.next();
             if (args == null) throw err("fn*: missing parameters after name");
+        }
+
+        // Skip docstring if present
+        if (args.first() instanceof String) {
+            args = args.next();
+            if (args == null) throw err("fn*: missing parameters after docstring");
+        }
+
+        // Skip metadata map if present (e.g., {:added "1.1"})
+        if (args.first() instanceof clojure.lang.IPersistentMap && !(args.first() instanceof clojure.lang.IPersistentVector)) {
+            args = args.next();
+            if (args == null) throw err("fn*: missing parameters after metadata map");
         }
 
         // Multi-arity: first arg is a list, not a vector
@@ -2268,12 +2617,53 @@ public class Analyzer {
         IPersistentVector bindings = (IPersistentVector) args.first();
         if (bindings.count() % 2 != 0) throw err("loop*: odd number of binding forms");
 
+        // Check for destructuring bindings - convert to simple bindings with let
+        boolean hasDestructuring = false;
         int count = bindings.count() / 2;
+        for (int i = 0; i < count; i++) {
+            if (!(bindings.nth(i * 2) instanceof Symbol)) {
+                hasDestructuring = true;
+                break;
+            }
+        }
+
+        if (hasDestructuring) {
+            // Convert destructuring loop to:
+            // (loop [temp1 init1 temp2 init2 ...]
+            //   (let [pattern1 temp1 pattern2 temp2 ...] body...))
+            IPersistentVector newBindings = PersistentVector.EMPTY;
+            IPersistentVector letBindings = PersistentVector.EMPTY;
+            for (int i = 0; i < count; i++) {
+                Object pattern = bindings.nth(i * 2);
+                Object init = bindings.nth(i * 2 + 1);
+                if (pattern instanceof Symbol) {
+                    newBindings = newBindings.cons(pattern);
+                    newBindings = newBindings.cons(init);
+                } else {
+                    Symbol temp = Symbol.intern("__loop_temp__" + i + "__" + System.nanoTime());
+                    newBindings = newBindings.cons(temp);
+                    newBindings = newBindings.cons(init);
+                    letBindings = letBindings.cons(pattern);
+                    letBindings = letBindings.cons(temp);
+                }
+            }
+            // Build (loop [temps...] (let [destructured...] body...))
+            List<Object> letForm = new ArrayList<>();
+            letForm.add(Symbol.intern("let"));
+            letForm.add(letBindings);
+            ISeq body = args.next();
+            while (body != null) {
+                letForm.add(body.first());
+                body = body.next();
+            }
+            ISeq newSeq = RT.list(Symbol.intern("loop"), newBindings,
+                    PersistentList.create(letForm));
+            return analyzeLoop(newSeq);
+        }
+
         int[] slots = new int[count];
         ExpressionNode[] values = new ExpressionNode[count];
         for (int i = 0; i < count; i++) {
-            if (!(bindings.nth(i * 2) instanceof Symbol))
-                throw err("loop*: binding name must be a symbol");
             slots[i] = currentScope.addLocal(((Symbol) bindings.nth(i * 2)).getName());
             values[i] = analyze(bindings.nth(i * 2 + 1));
         }
@@ -2309,14 +2699,30 @@ public class Analyzer {
         return new IfNode(analyze(test), thenNode, elseNode);
     }
 
-    private ExpressionNode analyzeDefn(ISeq seq) {
+    private ExpressionNode analyzeDefn(ISeq seq, boolean isPrivate) {
         ISeq args = seq.next();
         if (args == null) throw err("defn: missing name");
         if (!(args.first() instanceof Symbol)) throw err("defn: name must be a symbol");
         Symbol nameSym = (Symbol) args.first();
+        String name = nameSym.getName();
+
+        // Check metadata on the symbol
+        boolean isDynamic = false;
+        clojure.lang.IPersistentMap meta = nameSym.meta();
+        if (meta != null) {
+            Object dynVal = meta.valAt(clojure.lang.Keyword.intern("dynamic"));
+            if (Boolean.TRUE.equals(dynVal)) isDynamic = true;
+            Object privVal = meta.valAt(clojure.lang.Keyword.intern("private"));
+            if (Boolean.TRUE.equals(privVal)) isPrivate = true;
+        }
+
+        if (isDynamic) {
+            context.declareDynamic(name);
+        }
+
         ISeq fnForm = RT.cons(Symbol.intern("fn*"), args);
         ExpressionNode fnNode = analyzeFn(fnForm);
-        return new DefNode(context, nameSym.getName(), fnNode);
+        return new DefNode(context, name, fnNode);
     }
 
     // --- try/catch/throw ---
@@ -2573,12 +2979,12 @@ public class Analyzer {
 
     private ExpressionNode analyzeDeclare(ISeq seq) {
         // (declare name1 name2 ...) - forward declarations
+        // Always use core def, not any user-defined def macro
         ISeq args = seq.next();
         List<ExpressionNode> nodes = new ArrayList<>();
         while (args != null) {
             Symbol sym = (Symbol) args.first();
-            // Define as nil if not already defined
-            nodes.add(analyze(RT.list(Symbol.intern("def"), sym)));
+            nodes.add(analyzeDef(RT.list(Symbol.intern("def"), sym)));
             args = args.next();
         }
         if (nodes.isEmpty()) return new NilNode();
@@ -2814,6 +3220,7 @@ public class Analyzer {
         List<Class<?>> javaInterfaces = new ArrayList<>();
         List<Symbol> protocolNames = new ArrayList<>();
         java.util.Map<String, Object> methods = new java.util.LinkedHashMap<>();
+        java.util.Map<String, List<List<Object>>> methodArities = new java.util.LinkedHashMap<>();
 
         while (args != null) {
             Object item = args.first();
@@ -2837,12 +3244,40 @@ public class Analyzer {
             } else if (item instanceof ISeq methodDef) {
                 String methodName = ((Symbol) methodDef.first()).getName();
                 ISeq rest = methodDef.next();
-                List<Object> fnForm = new ArrayList<>();
-                fnForm.add(Symbol.intern("fn"));
-                while (rest != null) { fnForm.add(rest.first()); rest = rest.next(); }
-                methods.put(methodName, PersistentList.create(fnForm));
+                // Collect params and body as a single arity: ([params] body...)
+                List<Object> arityForm = new ArrayList<>();
+                while (rest != null) { arityForm.add(rest.first()); rest = rest.next(); }
+                if (methods.containsKey(methodName)) {
+                    // Multi-arity: existing must already be in multi-arity format
+                    @SuppressWarnings("unchecked")
+                    List<List<Object>> arities = (List<List<Object>>) methodArities.get(methodName);
+                    arities.add(arityForm);
+                } else {
+                    List<List<Object>> arities = new ArrayList<>();
+                    arities.add(arityForm);
+                    methodArities.put(methodName, arities);
+                    methods.put(methodName, null); // placeholder
+                }
             }
             args = args.next();
+        }
+
+        // Build fn forms from collected arities
+        for (var entry : methodArities.entrySet()) {
+            String mName = entry.getKey();
+            List<List<Object>> arities = entry.getValue();
+            List<Object> fnForm = new ArrayList<>();
+            fnForm.add(Symbol.intern("fn"));
+            if (arities.size() == 1) {
+                // Single arity: (fn [params] body...)
+                fnForm.addAll(arities.get(0));
+            } else {
+                // Multi-arity: (fn ([params1] body1...) ([params2] body2...))
+                for (List<Object> arity : arities) {
+                    fnForm.add(PersistentList.create(arity));
+                }
+            }
+            methods.put(mName, PersistentList.create(fnForm));
         }
 
         List<ExpressionNode> methodNodeList = new ArrayList<>();

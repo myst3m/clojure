@@ -80,6 +80,13 @@ public class ClojureMultiMethod {
         defaultMethod = null;
     }
 
+    public Object getMethod(Object dispatchVal) {
+        if (dispatchVal instanceof clojure.lang.Keyword kw && kw.getName().equals("default")) {
+            return defaultMethod;
+        }
+        return methods.get(dispatchVal);
+    }
+
     public String getName() { return name; }
 
     @Override

@@ -55,8 +55,10 @@ public class FnBodyNode extends RootNode {
         }
 
         // Write self-reference for named fns
+        // Use MultiArityFunction parent if available, so cross-arity self-calls work
         if (selfSlot >= 0) {
-            frame.setObject(selfSlot, self);
+            Object selfRef = self.getMultiArityParent();
+            frame.setObject(selfSlot, selfRef != null ? selfRef : self);
         }
 
         // Copy captured values

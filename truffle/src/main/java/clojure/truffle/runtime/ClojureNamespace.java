@@ -59,6 +59,12 @@ public class ClojureNamespace {
         }
     }
 
+    public void unmap(String sym) {
+        interns.remove(sym);
+        refers.remove(sym);
+        imports.remove(sym);
+    }
+
     public void unalias(String shortName) {
         aliases.remove(shortName);
     }

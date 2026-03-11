@@ -24,6 +24,11 @@ public class ClojureProtocol {
     }
 
     public Object findMethod(String methodName, Object target) {
+        // Reified objects carry their own method implementations
+        if (target instanceof ClojureReified reified) {
+            Object fn = reified.getMethod(methodName);
+            if (fn != null) return fn;
+        }
         if (target instanceof ClojureDeftypeInstance inst) {
             Map<String, Object> methods = implementations.get(inst.getTypeName());
             if (methods != null) {
@@ -59,6 +64,13 @@ public class ClojureProtocol {
     }
 
     public boolean hasImplementation(Object target) {
+        if (target instanceof ClojureReified reified) {
+            // Check if reified has any of this protocol's methods
+            for (String methodName : methodNames) {
+                if (reified.hasMethod(methodName)) return true;
+            }
+            return false;
+        }
         if (target instanceof ClojureDeftypeInstance inst) {
             return implementations.containsKey(inst.getTypeName());
         }
@@ -69,6 +81,23 @@ public class ClojureProtocol {
                 if (implementations.containsKey(iface)) return true;
             }
             clazz = clazz.getSuperclass();
+        }
+        return false;
+    }
+
+    public boolean hasImplementationForType(Object typeKey) {
+        if (implementations.containsKey(typeKey)) return true;
+        // If typeKey is a String (deftype name), check directly
+        if (typeKey instanceof String) return implementations.containsKey(typeKey);
+        // If typeKey is a Class, check class hierarchy
+        if (typeKey instanceof Class<?> clazz) {
+            while (clazz != null) {
+                if (implementations.containsKey(clazz)) return true;
+                for (Class<?> iface : clazz.getInterfaces()) {
+                    if (implementations.containsKey(iface)) return true;
+                }
+                clazz = clazz.getSuperclass();
+            }
         }
         return false;
     }

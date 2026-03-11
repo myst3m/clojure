@@ -7,19 +7,33 @@ import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 
 public class Main {
 
     public static void main(String[] args) throws Exception {
-        if (args.length > 0 && args[0].endsWith(".clj")) {
-            // Evaluate file
-            String code = Files.readString(Path.of(args[0]));
+        String classpath = null;
+        List<String> remaining = new ArrayList<>();
+        for (int i = 0; i < args.length; i++) {
+            if (("-cp".equals(args[i]) || "-classpath".equals(args[i])) && i + 1 < args.length) {
+                classpath = args[++i];
+            } else {
+                remaining.add(args[i]);
+            }
+        }
+
+        // Pass classpath via system property so ClojureContext can read it
+        if (classpath != null) {
+            System.setProperty("clojure.truffle.classpath", classpath);
+        }
+
+        if (remaining.size() > 0 && remaining.get(0).endsWith(".clj")) {
+            String code = Files.readString(Path.of(remaining.get(0)));
             evalAndPrint(code);
-        } else if (args.length > 0) {
-            // Evaluate expression from command line
-            evalAndPrint(args[0]);
+        } else if (remaining.size() > 0) {
+            evalAndPrint(remaining.get(0));
         } else {
-            // REPL mode
             repl();
         }
     }
@@ -35,7 +49,7 @@ public class Main {
     }
 
     private static void repl() throws Exception {
-        System.out.println("Clojure Truffle REPL (Phase 1)");
+        System.out.println("Clojure Truffle REPL");
         System.out.println("Type :quit to exit");
         System.out.println();
 
