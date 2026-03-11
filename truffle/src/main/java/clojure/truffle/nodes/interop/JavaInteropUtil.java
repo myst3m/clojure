@@ -66,12 +66,25 @@ public class JavaInteropUtil {
         Class<?> cached = CLASS_CACHE.get(name);
         if (cached != null) return cached;
         try {
-            Class<?> clz = Class.forName(name);
+            // Use thread context classloader (includes -cp entries)
+            ClassLoader cl = Thread.currentThread().getContextClassLoader();
+            Class<?> clz = cl != null ? Class.forName(name, true, cl) : Class.forName(name);
             CLASS_CACHE.put(name, clz);
             return clz;
         } catch (ClassNotFoundException e) {
             throw new RuntimeException("Class not found: " + name);
         }
+    }
+
+    public static java.util.Set<Class<?>> getAllInterfaces(Class<?> clazz) {
+        java.util.Set<Class<?>> result = new java.util.LinkedHashSet<>();
+        while (clazz != null) {
+            for (Class<?> iface : clazz.getInterfaces()) {
+                result.add(iface);
+            }
+            clazz = clazz.getSuperclass();
+        }
+        return result;
     }
 
     public static Method findMethod(Class<?> clazz, String name, Object[] args, boolean isStatic) {

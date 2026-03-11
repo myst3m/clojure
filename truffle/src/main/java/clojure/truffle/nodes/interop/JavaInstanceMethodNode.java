@@ -27,6 +27,15 @@ public class JavaInstanceMethodNode extends ExpressionNode {
 
         Class<?> clazz = target.getClass();
         Method method = JavaInteropUtil.findMethod(clazz, methodName, args, false);
+        // For non-public classes (e.g. Collections$UnmodifiableMap), search public interfaces
+        if (method == null || !java.lang.reflect.Modifier.isPublic(method.getDeclaringClass().getModifiers())) {
+            Method ifaceMethod = null;
+            for (Class<?> iface : JavaInteropUtil.getAllInterfaces(clazz)) {
+                ifaceMethod = JavaInteropUtil.findMethod(iface, methodName, args, false);
+                if (ifaceMethod != null) break;
+            }
+            if (ifaceMethod != null) method = ifaceMethod;
+        }
         // For Proxy objects, search interfaces if method not found on proxy class
         if (method == null && java.lang.reflect.Proxy.isProxyClass(clazz)) {
             for (Class<?> iface : clazz.getInterfaces()) {

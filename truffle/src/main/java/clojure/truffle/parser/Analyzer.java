@@ -809,7 +809,8 @@ public class Analyzer {
 
     private Class<?> resolveClassSafe(String fqn) {
         try {
-            return Class.forName(fqn);
+            ClassLoader cl = Thread.currentThread().getContextClassLoader();
+            return cl != null ? Class.forName(fqn, true, cl) : Class.forName(fqn);
         } catch (ClassNotFoundException e) {
             throw new RuntimeException("import: class not found: " + fqn);
         }
@@ -1009,7 +1010,8 @@ public class Analyzer {
                 if (name.startsWith("clojure.") || name.startsWith("user.")) return false;
                 // Try to resolve as Java class
                 try {
-                    Class.forName(name);
+                    ClassLoader cl = Thread.currentThread().getContextClassLoader();
+                    if (cl != null) Class.forName(name, false, cl); else Class.forName(name);
                     return true;
                 } catch (ClassNotFoundException e) {
                     return false;
@@ -2835,7 +2837,8 @@ public class Analyzer {
             case "IllegalArgumentException" -> IllegalArgumentException.class;
             default -> {
                 try {
-                    yield (Class<? extends Throwable>) Class.forName(className);
+                    ClassLoader cl = Thread.currentThread().getContextClassLoader();
+                    yield (Class<? extends Throwable>) (cl != null ? Class.forName(className, true, cl) : Class.forName(className));
                 } catch (ClassNotFoundException e) {
                     yield RuntimeException.class;
                 }
@@ -3155,12 +3158,17 @@ public class Analyzer {
         }
     }
 
+    private Class<?> loadClass(String fqn) throws ClassNotFoundException {
+        ClassLoader cl = Thread.currentThread().getContextClassLoader();
+        return cl != null ? Class.forName(fqn, true, cl) : Class.forName(fqn);
+    }
+
     private void processImportSpec(Object spec) {
         if (spec instanceof Symbol sym) {
             // (import java.util.ArrayList) - import single class
             String fqn = sym.getName();
             try {
-                Class<?> clazz = Class.forName(fqn);
+                Class<?> clazz = loadClass(fqn);
                 String simpleName = clazz.getSimpleName();
                 context.setVar(simpleName, clazz);
             } catch (ClassNotFoundException e) {
@@ -3174,7 +3182,7 @@ public class Analyzer {
                 String className = ((Symbol) v.nth(i)).getName();
                 String fqn = pkg + "." + className;
                 try {
-                    Class<?> clazz = Class.forName(fqn);
+                    Class<?> clazz = loadClass(fqn);
                     context.setVar(className, clazz);
                 } catch (ClassNotFoundException e) {
                     throw new RuntimeException("import: class not found: " + fqn);
@@ -3189,7 +3197,7 @@ public class Analyzer {
                     String className = ((Symbol) rest.first()).getName();
                     String fqn = pkg + "." + className;
                     try {
-                        Class<?> clazz = Class.forName(fqn);
+                        Class<?> clazz = loadClass(fqn);
                         context.setVar(className, clazz);
                     } catch (ClassNotFoundException e) {
                         throw new RuntimeException("import: class not found: " + fqn);

@@ -44,6 +44,8 @@ public class ClojureContext {
     private final ThreadLocal<java.io.Writer> outOverride = new ThreadLocal<>();
     // Classpath entries for -cp option (JAR files and directories)
     private final java.util.List<String> classpathEntries = new java.util.ArrayList<>();
+    // ClassLoader for -cp entries (for Java class resolution)
+    private ClassLoader cpClassLoader;
 
     @FunctionalInterface
     public interface BuiltinFunction {
@@ -93,6 +95,19 @@ public class ClojureContext {
                     continue;
                 }
                 classpathEntries.add(resolved);
+            }
+        }
+        // Build URLClassLoader for -cp entries so Java class resolution works
+        if (!classpathEntries.isEmpty()) {
+            try {
+                java.net.URL[] urls = new java.net.URL[classpathEntries.size()];
+                for (int i = 0; i < classpathEntries.size(); i++) {
+                    urls[i] = new java.io.File(classpathEntries.get(i)).toURI().toURL();
+                }
+                cpClassLoader = new java.net.URLClassLoader(urls, getClass().getClassLoader());
+                Thread.currentThread().setContextClassLoader(cpClassLoader);
+            } catch (java.net.MalformedURLException e) {
+                throw new RuntimeException("Invalid classpath entry", e);
             }
         }
         // Create clojure.core and user namespaces
