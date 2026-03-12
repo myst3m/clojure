@@ -56,8 +56,8 @@ public class ClojureContext {
         default String name() { return "<builtin>"; }
     }
 
-    /** BuiltinFunction with a name for stack traces and debugging. */
-    public static class NamedBuiltin implements BuiltinFunction {
+    /** BuiltinFunction with a name for stack traces and debugging. Extends AFn for IFn compatibility. */
+    public static class NamedBuiltin extends clojure.lang.AFn implements BuiltinFunction {
         private final String name;
         private final BuiltinFunction delegate;
         private volatile clojure.lang.IPersistentMap meta;
@@ -70,6 +70,20 @@ public class ClojureContext {
         @Override public String toString() { return "<builtin:" + name + ">"; }
         public clojure.lang.IPersistentMap getMeta() { return meta; }
         public void setMeta(clojure.lang.IPersistentMap meta) { this.meta = meta; }
+
+        // IFn invoke methods delegate to execute()
+        @Override public Object invoke() { return execute(new Object[]{}); }
+        @Override public Object invoke(Object a1) { return execute(new Object[]{a1}); }
+        @Override public Object invoke(Object a1, Object a2) { return execute(new Object[]{a1, a2}); }
+        @Override public Object invoke(Object a1, Object a2, Object a3) { return execute(new Object[]{a1, a2, a3}); }
+        @Override public Object invoke(Object a1, Object a2, Object a3, Object a4) { return execute(new Object[]{a1, a2, a3, a4}); }
+        @Override public Object invoke(Object a1, Object a2, Object a3, Object a4, Object a5) { return execute(new Object[]{a1, a2, a3, a4, a5}); }
+        @Override public Object invoke(Object a1, Object a2, Object a3, Object a4, Object a5, Object a6) { return execute(new Object[]{a1, a2, a3, a4, a5, a6}); }
+        @Override public Object invoke(Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7) { return execute(new Object[]{a1, a2, a3, a4, a5, a6, a7}); }
+        @Override public Object invoke(Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7, Object a8) { return execute(new Object[]{a1, a2, a3, a4, a5, a6, a7, a8}); }
+        @Override public Object invoke(Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7, Object a8, Object a9) { return execute(new Object[]{a1, a2, a3, a4, a5, a6, a7, a8, a9}); }
+        @Override public Object invoke(Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7, Object a8, Object a9, Object a10) { return execute(new Object[]{a1, a2, a3, a4, a5, a6, a7, a8, a9, a10}); }
+        @Override public Object applyTo(clojure.lang.ISeq arglist) { return execute(clojure.lang.RT.seqToArray(arglist)); }
     }
 
     /** Register a builtin function with a name for debugging. */
@@ -273,6 +287,10 @@ public class ClojureContext {
         return namespaces.get(name);
     }
 
+    public java.util.Collection<ClojureNamespace> getAllNamespaces() {
+        return namespaces.values();
+    }
+
     public void declareDynamic(String name) {
         dynamicVars.add(name);
     }
@@ -379,6 +397,10 @@ public class ClojureContext {
             }
             currentNamespace = prevNs;
             System.err.println("[NS-LOAD] << " + nsName + " (" + (System.currentTimeMillis() - nsStartTime) + "ms)");
+            // Post-load hooks for specific namespaces
+            if ("clojure.core.async".equals(nsName)) {
+                registerAsyncOverrides();
+            }
         } catch (java.io.IOException e) {
             throw new RuntimeException("Error loading namespace: " + nsName, e);
         } finally {
@@ -644,6 +666,11 @@ public class ClojureContext {
             return ClojureNil.INSTANCE;
         });
 
+        defBuiltin("shutdown-agents", args -> {
+            // No-op: Truffle Clojure doesn't have an agent thread pool
+            return ClojureNil.INSTANCE;
+        });
+
         // Collections
         defBuiltin("list", args -> {
             clojure.lang.IPersistentList list = clojure.lang.PersistentList.EMPTY;
@@ -651,6 +678,45 @@ public class ClojureContext {
                 list = (clojure.lang.IPersistentList) list.cons(args[i]);
             }
             return list;
+        });
+
+        // list* - prepends args to last arg (which must be a seq)
+        defBuiltin("list*", args -> {
+            if (args.length == 0) throw new RuntimeException("list*: expected at least 1 arg");
+            if (args.length == 1) return seqOf(args[0]);
+            Object last = args[args.length - 1];
+            clojure.lang.ISeq result = seqOf(last);
+            for (int i = args.length - 2; i >= 0; i--) {
+                result = new clojure.lang.Cons(args[i], result);
+            }
+            return result;
+        });
+
+        // reductions - returns lazy seq of intermediate reduce values
+        defBuiltin("reductions", args -> {
+            if (args.length < 2 || args.length > 3)
+                throw new RuntimeException("reductions: expected 2 or 3 args");
+            Object f = args[0];
+            Object init;
+            clojure.lang.ISeq seq;
+            if (args.length == 3) {
+                init = args[1];
+                seq = seqOf(args[2]);
+            } else {
+                seq = seqOf(args[1]);
+                if (seq == null) return clojure.lang.PersistentList.create(java.util.Arrays.asList(callFunction(f, new Object[0])));
+                init = seq.first();
+                seq = seq.next();
+            }
+            java.util.List<Object> result = new ArrayList<>();
+            result.add(init);
+            Object acc = init;
+            for (; seq != null; seq = seq.next()) {
+                acc = callFunction(f, new Object[]{acc, seq.first()});
+                if (acc instanceof Reduced r) { result.add(r.value); break; }
+                result.add(acc);
+            }
+            return clojure.lang.PersistentList.create(result);
         });
 
         defBuiltin("vector", args ->
@@ -750,6 +816,12 @@ public class ClojureContext {
             if (args.length < 2 || args.length > 3)
                 throw new RuntimeException("reduce: expected 2 or 3 args");
             Object fn = args[0];
+            if (fn instanceof clojure.truffle.runtime.ClojureNil || fn == null) {
+                System.err.println("[REDUCE-DEBUG] reduce called with nil function. args.length=" + args.length);
+                if (args.length == 3) System.err.println("  init=" + args[1] + " coll=" + (args[2] != null ? args[2].getClass().getSimpleName() + ":" + args[2] : "null"));
+                else System.err.println("  coll=" + (args[1] != null ? args[1].getClass().getSimpleName() + ":" + args[1] : "null"));
+                new RuntimeException("reduce-nil-fn trace").printStackTrace(System.err);
+            }
             Object acc;
             clojure.lang.ISeq seq;
             if (args.length == 3) {
@@ -844,10 +916,25 @@ public class ClojureContext {
 
         defBuiltin("seq", args -> {
             checkArity(args, 1, "seq");
-            if (args[0] instanceof ClojureNil) return ClojureNil.INSTANCE;
+            if (args[0] == null || args[0] instanceof ClojureNil) return ClojureNil.INSTANCE;
             if (args[0] instanceof clojure.lang.Seqable s) {
                 clojure.lang.ISeq seq = s.seq();
                 return seq == null ? ClojureNil.INSTANCE : seq;
+            }
+            if (args[0] instanceof CharSequence cs) {
+                if (cs.length() == 0) return ClojureNil.INSTANCE;
+                return clojure.lang.StringSeq.create(cs.toString());
+            }
+            if (args[0] instanceof java.lang.Iterable<?> it) {
+                java.util.Iterator<?> iter = it.iterator();
+                if (!iter.hasNext()) return ClojureNil.INSTANCE;
+                java.util.List<Object> items = new java.util.ArrayList<>();
+                while (iter.hasNext()) items.add(iter.next());
+                return clojure.lang.PersistentList.create(items);
+            }
+            if (args[0].getClass().isArray()) {
+                clojure.lang.ISeq s = clojure.lang.RT.seq(args[0]);
+                return s == null ? ClojureNil.INSTANCE : s;
             }
             throw new RuntimeException("seq: not seqable: " + args[0]);
         });
@@ -886,6 +973,20 @@ public class ClojureContext {
             checkArity(args, 1, "dec");
             return subtractNumbers(args[0], 1L);
         });
+
+        // Unchecked math operations - same as checked versions (no overflow checking in Truffle)
+        defBuiltin("unchecked-inc", args -> { checkArity(args, 1, "unchecked-inc"); return addNumbers(args[0], 1L); });
+        defBuiltin("unchecked-inc-int", args -> { checkArity(args, 1, "unchecked-inc-int"); return addNumbers(args[0], 1L); });
+        defBuiltin("unchecked-dec", args -> { checkArity(args, 1, "unchecked-dec"); return subtractNumbers(args[0], 1L); });
+        defBuiltin("unchecked-dec-int", args -> { checkArity(args, 1, "unchecked-dec-int"); return subtractNumbers(args[0], 1L); });
+        defBuiltin("unchecked-add", args -> { checkArity(args, 2, "unchecked-add"); return addNumbers(args[0], args[1]); });
+        defBuiltin("unchecked-add-int", args -> { checkArity(args, 2, "unchecked-add-int"); return addNumbers(args[0], args[1]); });
+        defBuiltin("unchecked-subtract", args -> { checkArity(args, 2, "unchecked-subtract"); return subtractNumbers(args[0], args[1]); });
+        defBuiltin("unchecked-subtract-int", args -> { checkArity(args, 2, "unchecked-subtract-int"); return subtractNumbers(args[0], args[1]); });
+        defBuiltin("unchecked-multiply", args -> { checkArity(args, 2, "unchecked-multiply"); return multiplyNumbers(args[0], args[1]); });
+        defBuiltin("unchecked-multiply-int", args -> { checkArity(args, 2, "unchecked-multiply-int"); return multiplyNumbers(args[0], args[1]); });
+        defBuiltin("unchecked-negate", args -> { checkArity(args, 1, "unchecked-negate"); return subtractNumbers(0L, args[0]); });
+        defBuiltin("unchecked-negate-int", args -> { checkArity(args, 1, "unchecked-negate-int"); return subtractNumbers(0L, args[0]); });
 
         defBuiltin("max", args -> {
             if (args.length == 0) throw new RuntimeException("max: expected at least 1 arg");
@@ -947,6 +1048,12 @@ public class ClojureContext {
             if (coll instanceof clojure.lang.ILookup lookup) {
                 Object val = lookup.valAt(key, notFound);
                 return val == null ? ClojureNil.INSTANCE : val;
+            }
+            // String indexing: (get "foo" 0) => \f
+            if (coll instanceof String s && key instanceof Number n) {
+                int idx = n.intValue();
+                if (idx >= 0 && idx < s.length()) return s.charAt(idx);
+                return notFound;
             }
             return notFound;
         });
@@ -1051,8 +1158,17 @@ public class ClojureContext {
         // --- Atom ---
 
         defBuiltin("atom", args -> {
-            checkArity(args, 1, "atom");
-            return new ClojureAtom(args[0]);
+            if (args.length < 1) throw new RuntimeException("atom: expected at least 1 arg");
+            ClojureAtom a = new ClojureAtom(args[0]);
+            // Process keyword args: :validator fn, :meta m
+            for (int i = 1; i + 1 < args.length; i += 2) {
+                if (args[i] instanceof clojure.lang.Keyword kw) {
+                    if (kw.getName().equals("validator")) {
+                        a.setValidator(args[i + 1]);
+                    }
+                }
+            }
+            return a;
         });
 
         defBuiltin("deref", args -> {
@@ -1080,6 +1196,10 @@ public class ClojureContext {
                 callArgs[0] = oldVal;
                 System.arraycopy(extraArgs, 0, callArgs, 1, extraArgs.length);
                 Object newVal = callFunction(fn, callArgs);
+                Object validator = a.getValidator();
+                if (validator != null && !isTruthy(callFunction(validator, new Object[]{newVal}))) {
+                    throw new RuntimeException("Invalid reference state");
+                }
                 if (a.compareAndSet(oldVal, newVal)) return newVal;
             }
         });
@@ -1087,6 +1207,36 @@ public class ClojureContext {
         defBuiltin("atom?", args -> {
             checkArity(args, 1, "atom?");
             return args[0] instanceof ClojureAtom;
+        });
+
+        // swap-vals! - like swap! but returns [old new]
+        defBuiltin("swap-vals!", args -> {
+            if (args.length < 2) throw new RuntimeException("swap-vals!: expected at least 2 args");
+            if (!(args[0] instanceof ClojureAtom a))
+                throw new RuntimeException("swap-vals!: not an atom");
+            Object fn = args[1];
+            Object[] extraArgs = Arrays.copyOfRange(args, 2, args.length);
+            while (true) {
+                Object oldVal = a.deref();
+                Object[] callArgs = new Object[1 + extraArgs.length];
+                callArgs[0] = oldVal;
+                System.arraycopy(extraArgs, 0, callArgs, 1, extraArgs.length);
+                Object newVal = callFunction(fn, callArgs);
+                if (a.compareAndSet(oldVal, newVal))
+                    return clojure.lang.PersistentVector.create(oldVal, newVal);
+            }
+        });
+
+        // reset-vals! - like reset! but returns [old new]
+        defBuiltin("reset-vals!", args -> {
+            checkArity(args, 2, "reset-vals!");
+            if (!(args[0] instanceof ClojureAtom a))
+                throw new RuntimeException("reset-vals!: not an atom");
+            while (true) {
+                Object oldVal = a.deref();
+                if (a.compareAndSet(oldVal, args[1]))
+                    return clojure.lang.PersistentVector.create(oldVal, args[1]);
+            }
         });
 
         // --- More numeric predicates ---
@@ -1326,6 +1476,13 @@ public class ClojureContext {
                 s = s.next();
             if (s == null) return clojure.lang.PersistentList.EMPTY;
             return s;
+        });
+
+        defBuiltin("take-nth", args -> {
+            checkArity(args, 2, "take-nth");
+            long n = ((Number) args[0]).longValue();
+            Object coll = args[1];
+            return lazyTakeNth(n, seqOf(coll));
         });
 
         defBuiltin("realized?", args -> {
@@ -1849,13 +2006,31 @@ public class ClojureContext {
                 throw new RuntimeException("partition: expected 2-4 args");
             int n = ((Number) args[0]).intValue();
             int step = args.length >= 3 ? ((Number) args[1]).intValue() : n;
-            Object coll = args.length == 2 ? args[1] : (args.length == 3 ? args[2] : args[3]);
+            Object pad = null;
+            Object coll;
+            if (args.length == 4) { pad = args[2]; coll = args[3]; }
+            else if (args.length == 3) { coll = args[2]; }
+            else { coll = args[1]; }
             java.util.List<Object> items = new ArrayList<>();
             for (clojure.lang.ISeq s = seqOf(coll); s != null; s = s.next())
                 items.add(s.first());
             java.util.List<Object> parts = new ArrayList<>();
             for (int i = 0; i + n <= items.size(); i += step)
                 parts.add(clojure.lang.PersistentVector.create(items.subList(i, i + n)));
+            // Handle pad: if there are remaining elements and pad is provided
+            if (pad != null) {
+                int lastStart = parts.isEmpty() ? 0 : ((parts.size()) * step);
+                if (lastStart < items.size()) {
+                    java.util.List<Object> last = new ArrayList<>(items.subList(lastStart, items.size()));
+                    // Fill from pad
+                    clojure.lang.ISeq padSeq = seqOf(pad);
+                    while (last.size() < n && padSeq != null) {
+                        last.add(padSeq.first());
+                        padSeq = padSeq.next();
+                    }
+                    parts.add(clojure.lang.PersistentVector.create(last));
+                }
+            }
             clojure.lang.IPersistentCollection result = clojure.lang.PersistentList.EMPTY;
             for (int i = parts.size() - 1; i >= 0; i--) result = result.cons(parts.get(i));
             return result;
@@ -1973,6 +2148,23 @@ public class ClojureContext {
         });
 
         defBuiltin("keep", args -> {
+            if (args.length == 1) {
+                // Transducer form: (keep f) returns a transducer fn(rf) -> rf'
+                Object fn = args[0];
+                return new NamedBuiltin("keep-transducer", rfArgs -> {
+                    checkArity(rfArgs, 1, "keep-transducer");
+                    Object rf = rfArgs[0];
+                    return new NamedBuiltin("keep-xf", xfArgs -> {
+                        if (xfArgs.length == 0) return callFunction(rf, new Object[0]);
+                        if (xfArgs.length == 1) return callFunction(rf, new Object[]{xfArgs[0]});
+                        Object result = xfArgs[0];
+                        Object input = xfArgs[1];
+                        Object val = callFunction(fn, new Object[]{input});
+                        if (val instanceof ClojureNil || val == null) return result;
+                        return callFunction(rf, new Object[]{result, val});
+                    });
+                });
+            }
             checkArity(args, 2, "keep");
             Object fn = args[0];
             java.util.List<Object> items = new ArrayList<>();
@@ -2094,7 +2286,9 @@ public class ClojureContext {
                         a[0] instanceof BuiltinFunction || a[0] instanceof clojure.lang.Keyword ||
                         a[0] instanceof clojure.lang.IPersistentMap || a[0] instanceof clojure.lang.IPersistentSet);
         defBuiltin("number?", a -> a[0] instanceof Number);
-        defBuiltin("integer?", a -> a[0] instanceof Long || a[0] instanceof Integer);
+        defBuiltin("integer?", a -> a[0] instanceof Long || a[0] instanceof Integer
+                || a[0] instanceof java.math.BigInteger || a[0] instanceof clojure.lang.BigInt
+                || a[0] instanceof Short || a[0] instanceof Byte);
         defBuiltin("float?", a -> a[0] instanceof Double || a[0] instanceof Float);
         defBuiltin("string?", a -> a[0] instanceof String);
         defBuiltin("keyword?", a -> a[0] instanceof clojure.lang.Keyword);
@@ -2104,6 +2298,18 @@ public class ClojureContext {
         defBuiltin("false?", a -> Boolean.FALSE.equals(a[0]));
         defBuiltin("char?", a -> a[0] instanceof Character);
         defBuiltin("ratio?", a -> a[0] instanceof clojure.lang.Ratio);
+
+        defBuiltin("numerator", args -> {
+            checkArity(args, 1, "numerator");
+            if (args[0] instanceof clojure.lang.Ratio r) return r.numerator;
+            throw new RuntimeException("numerator: not a ratio: " + args[0]);
+        });
+
+        defBuiltin("denominator", args -> {
+            checkArity(args, 1, "denominator");
+            if (args[0] instanceof clojure.lang.Ratio r) return r.denominator;
+            throw new RuntimeException("denominator: not a ratio: " + args[0]);
+        });
 
         // --- Higher order ---
 
@@ -2143,9 +2349,25 @@ public class ClojureContext {
         defBuiltin("future-call", args -> {
             checkArity(args, 1, "future-call");
             Object fn = args[0];
+            // Capture current thread bindings to propagate to the new thread
+            java.util.HashMap<String, Object> parentBindings = new java.util.HashMap<>(threadBindings.get());
+            String parentNs = currentNamespace;
             java.util.concurrent.ExecutorService exec = java.util.concurrent.Executors
                     .newSingleThreadExecutor(r -> { Thread t = new Thread(r); t.setDaemon(true); return t; });
-            java.util.concurrent.Future<Object> future = exec.submit(() -> callFunction(fn, new Object[0]));
+            java.util.concurrent.Future<Object> future = exec.submit(() -> {
+                // Install parent thread's bindings in this thread
+                threadBindings.get().putAll(parentBindings);
+                String savedNs = currentNamespace;
+                currentNamespace = parentNs;
+                try {
+                    return callFunction(fn, new Object[0]);
+                } catch (Exception e) {
+                    System.err.println("[FUTURE-ERROR] " + e.getMessage());
+                    throw e;
+                } finally {
+                    currentNamespace = savedNs;
+                }
+            });
             return future;
         });
 
@@ -2257,9 +2479,21 @@ public class ClojureContext {
 
         defBuiltin("spit", args -> {
             if (args.length < 2) throw new RuntimeException("spit: expected at least 2 args");
+            boolean append = false;
+            for (int i = 2; i + 1 < args.length; i += 2) {
+                if (args[i] instanceof clojure.lang.Keyword kw && kw.getName().equals("append")) {
+                    append = isTruthy(args[i + 1]);
+                }
+            }
             try {
-                java.nio.file.Files.writeString(java.nio.file.Path.of(args[0].toString()),
-                        args[1].toString());
+                java.nio.file.Path path = java.nio.file.Path.of(args[0].toString());
+                if (append) {
+                    java.nio.file.Files.writeString(path, args[1].toString(),
+                            java.nio.file.StandardOpenOption.CREATE,
+                            java.nio.file.StandardOpenOption.APPEND);
+                } else {
+                    java.nio.file.Files.writeString(path, args[1].toString());
+                }
             } catch (java.io.IOException e) {
                 throw new RuntimeException("spit: " + e.getMessage());
             }
@@ -2273,7 +2507,21 @@ public class ClojureContext {
         });
 
         defBuiltin("re-find", args -> {
-            if (args.length < 2) throw new RuntimeException("re-find: expected 2 args");
+            if (args.length == 1) {
+                // (re-find matcher)
+                if (!(args[0] instanceof Matcher m2))
+                    throw new RuntimeException("re-find: expected a matcher");
+                if (m2.find()) {
+                    if (m2.groupCount() == 0) return m2.group();
+                    java.util.List<Object> groups2 = new ArrayList<>();
+                    groups2.add(m2.group());
+                    for (int i = 1; i <= m2.groupCount(); i++)
+                        groups2.add(m2.group(i) == null ? ClojureNil.INSTANCE : m2.group(i));
+                    return clojure.lang.PersistentVector.create(groups2);
+                }
+                return ClojureNil.INSTANCE;
+            }
+            if (args.length != 2) throw new RuntimeException("re-find: expected 1 or 2 args");
             Pattern pat = (args[0] instanceof Pattern p) ? p : Pattern.compile(args[0].toString());
             String s = args[1].toString();
             Matcher m = pat.matcher(s);
@@ -2450,6 +2698,8 @@ public class ClojureContext {
                             if (s != null && s.next() != null && s.next().next() == null)
                                 return ((clojure.lang.IPersistentMap) rArgs[0]).assoc(s.first(), s.next().first());
                         }
+                        if (item instanceof java.util.Map.Entry<?,?> jme)
+                            return ((clojure.lang.IPersistentMap) rArgs[0]).assoc(jme.getKey(), jme.getValue());
                         throw new RuntimeException("into: map expects [k v] pairs");
                     };
                 } else if (to instanceof clojure.lang.IPersistentSet) {
@@ -2487,6 +2737,8 @@ public class ClojureContext {
                         } else {
                             throw new RuntimeException("into: map expects [k v] pairs, got: " + item);
                         }
+                    } else if (item instanceof java.util.Map.Entry<?,?> jme) {
+                        to = m.assoc(jme.getKey(), jme.getValue());
                     } else {
                         throw new RuntimeException("into: map expects [k v] pairs, got: " + item.getClass().getName());
                     }
@@ -2605,6 +2857,10 @@ public class ClojureContext {
         // --- Phase 8: Metadata ---
         defBuiltin("meta", args -> {
             checkArity(args, 1, "meta");
+            if (args[0] instanceof ClojureAtom atom) {
+                Object m = atom.getMeta();
+                return m == null ? ClojureNil.INSTANCE : m;
+            }
             if (args[0] instanceof clojure.lang.IMeta obj) {
                 clojure.lang.IPersistentMap m = obj.meta();
                 return m == null ? ClojureNil.INSTANCE : m;
@@ -2941,13 +3197,24 @@ public class ClojureContext {
 
         defBuiltin("type", args -> {
             checkArity(args, 1, "type");
-            if (args[0] instanceof ClojureNil) return ClojureNil.INSTANCE;
+            if (args[0] == null || args[0] instanceof ClojureNil) return ClojureNil.INSTANCE;
+            // Check :type metadata first (standard Clojure behavior)
+            if (args[0] instanceof clojure.lang.IMeta imeta) {
+                clojure.lang.IPersistentMap m = imeta.meta();
+                if (m != null) {
+                    Object t = m.valAt(clojure.lang.Keyword.intern("type"));
+                    if (t != null) return t;
+                }
+            }
+            // For deftype instances, return the type name string (matches defmethod dispatch values)
+            if (args[0] instanceof ClojureDeftypeInstance dti) return dti.getTypeName();
             return args[0].getClass();
         });
 
         defBuiltin("class", args -> {
             checkArity(args, 1, "class");
-            if (args[0] instanceof ClojureNil) return ClojureNil.INSTANCE;
+            if (args[0] == null || args[0] instanceof ClojureNil) return ClojureNil.INSTANCE;
+            if (args[0] instanceof ClojureDeftypeInstance dti) return dti.getTypeName();
             return args[0].getClass();
         });
 
@@ -2967,8 +3234,22 @@ public class ClojureContext {
                 if (args[1] instanceof ClojureNil) return false;
                 return proto.hasImplementation(args[1]);
             }
-            if (!(args[0] instanceof Class<?> clazz))
+            Class<?> clazz;
+            if (args[0] instanceof Class<?> c) {
+                clazz = c;
+            } else if (args[0] instanceof String className) {
+                // Check if it's a deftype name
+                if (args[1] instanceof ClojureDeftypeInstance dti) {
+                    return className.equals(dti.getTypeName());
+                }
+                try { clazz = Class.forName(className); }
+                catch (ClassNotFoundException e) {
+                    // deftype names that aren't the instance type → false
+                    return false;
+                }
+            } else {
                 throw new RuntimeException("instance?: first arg must be a Class, got " + args[0].getClass().getName());
+            }
             if (args[1] instanceof ClojureNil) return false;
             // ClojureAtom should be recognized as clojure.lang.Atom
             if (clazz == clojure.lang.Atom.class && args[1] instanceof ClojureAtom) return true;
@@ -3155,6 +3436,28 @@ public class ClojureContext {
             }
             if (ref instanceof clojure.truffle.runtime.ClojureVar v) return v.deref();
             if (ref instanceof clojure.lang.IDeref d) return d.deref();
+            // deftype/defrecord instances implementing IDeref protocol via method map
+            if (ref instanceof clojure.truffle.runtime.ClojureDeftypeInstance dt) {
+                Object derefMethod = dt.getMethod("deref");
+                if (derefMethod != null) {
+                    try {
+                        if (args.length == 3) {
+                            return callFunction(derefMethod, new Object[]{ref, args[1], args[2]});
+                        }
+                        return callFunction(derefMethod, new Object[]{ref});
+                    } catch (RuntimeException e) {
+                        if (e.getMessage() != null && e.getMessage().contains("Wrong number of args")) {
+                            // Try the other arity — deftype may have compiled IBlockingDeref (3-arg)
+                            // instead of IDeref (1-arg)
+                            if (args.length == 1) {
+                                // Try with default timeout
+                                return callFunction(derefMethod, new Object[]{ref, Long.valueOf(60000L), ClojureNil.INSTANCE});
+                            }
+                        }
+                        throw e;
+                    }
+                }
+            }
             throw new RuntimeException("deref: not a derefable: " + ref);
         });
 
@@ -3349,6 +3652,12 @@ public class ClojureContext {
             return args[0];
         });
 
+        defBuiltin("ensure-reduced", args -> {
+            checkArity(args, 1, "ensure-reduced");
+            if (args[0] instanceof Reduced) return args[0];
+            return new Reduced(args[0]);
+        });
+
         // comp for function/transducer composition
         defBuiltin("comp", args -> {
             if (args.length == 0) return (BuiltinFunction) a -> a[0];
@@ -3391,12 +3700,18 @@ public class ClojureContext {
         globalVars.put("*hierarchy*", ((BuiltinFunction) globalVars.get("make-hierarchy")).execute(new Object[0]));
 
         defBuiltin("derive", args -> {
-            if (args.length != 2) throw new RuntimeException("derive: expected 2 args (tag parent)");
-            Object tag = args[0];
-            Object parent = args[1];
-            // Modify global hierarchy
-            Object hier = globalVars.get("*hierarchy*");
-            clojure.lang.IPersistentMap h = (clojure.lang.IPersistentMap) hier;
+            if (args.length != 2 && args.length != 3)
+                throw new RuntimeException("derive: expected 2 or 3 args");
+            boolean custom = args.length == 3;
+            clojure.lang.IPersistentMap h;
+            Object tag, parent;
+            if (custom) {
+                h = (clojure.lang.IPersistentMap) args[0];
+                tag = args[1]; parent = args[2];
+            } else {
+                tag = args[0]; parent = args[1];
+                h = (clojure.lang.IPersistentMap) globalVars.get("*hierarchy*");
+            }
             clojure.lang.Keyword kParents = clojure.lang.Keyword.intern("parents");
             clojure.lang.Keyword kAncestors = clojure.lang.Keyword.intern("ancestors");
             clojure.lang.Keyword kDescendants = clojure.lang.Keyword.intern("descendants");
@@ -3441,17 +3756,18 @@ public class ClojureContext {
             }
             h = h.assoc(kDescendants, descs);
 
+            if (custom) return h;
             globalVars.put("*hierarchy*", h);
             return ClojureNil.INSTANCE;
         });
 
         defBuiltin("isa?", args -> {
-            checkArity(args, 2, "isa?");
-            Object child = args[0];
-            Object parent = args[1];
+            if (args.length < 2 || args.length > 3) throw new RuntimeException("isa?: expected 2 or 3 args");
+            Object child, parent;
+            Object hier;
+            if (args.length == 3) { hier = args[0]; child = args[1]; parent = args[2]; }
+            else { child = args[0]; parent = args[1]; hier = globalVars.get("*hierarchy*"); }
             if (child.equals(parent)) return true;
-            // Check hierarchy
-            Object hier = globalVars.get("*hierarchy*");
             if (hier instanceof clojure.lang.IPersistentMap h) {
                 Object ancestors = ((clojure.lang.IPersistentMap) h.valAt(
                         clojure.lang.Keyword.intern("ancestors"))).valAt(child);
@@ -3467,33 +3783,36 @@ public class ClojureContext {
         });
 
         defBuiltin("parents", args -> {
-            checkArity(args, 1, "parents");
-            Object hier = globalVars.get("*hierarchy*");
+            if (args.length < 1 || args.length > 2) throw new RuntimeException("parents: expected 1 or 2 args");
+            Object hier = args.length == 2 ? args[0] : globalVars.get("*hierarchy*");
+            Object tag = args.length == 2 ? args[1] : args[0];
             if (hier instanceof clojure.lang.IPersistentMap h) {
                 Object p = ((clojure.lang.IPersistentMap) h.valAt(
-                        clojure.lang.Keyword.intern("parents"))).valAt(args[0]);
+                        clojure.lang.Keyword.intern("parents"))).valAt(tag);
                 return p == null ? ClojureNil.INSTANCE : p;
             }
             return ClojureNil.INSTANCE;
         });
 
         defBuiltin("ancestors", args -> {
-            checkArity(args, 1, "ancestors");
-            Object hier = globalVars.get("*hierarchy*");
+            if (args.length < 1 || args.length > 2) throw new RuntimeException("ancestors: expected 1 or 2 args");
+            Object hier = args.length == 2 ? args[0] : globalVars.get("*hierarchy*");
+            Object tag = args.length == 2 ? args[1] : args[0];
             if (hier instanceof clojure.lang.IPersistentMap h) {
                 Object a = ((clojure.lang.IPersistentMap) h.valAt(
-                        clojure.lang.Keyword.intern("ancestors"))).valAt(args[0]);
+                        clojure.lang.Keyword.intern("ancestors"))).valAt(tag);
                 return a == null ? ClojureNil.INSTANCE : a;
             }
             return ClojureNil.INSTANCE;
         });
 
         defBuiltin("descendants", args -> {
-            checkArity(args, 1, "descendants");
-            Object hier = globalVars.get("*hierarchy*");
+            if (args.length < 1 || args.length > 2) throw new RuntimeException("descendants: expected 1 or 2 args");
+            Object hier = args.length == 2 ? args[0] : globalVars.get("*hierarchy*");
+            Object tag = args.length == 2 ? args[1] : args[0];
             if (hier instanceof clojure.lang.IPersistentMap h) {
                 Object d = ((clojure.lang.IPersistentMap) h.valAt(
-                        clojure.lang.Keyword.intern("descendants"))).valAt(args[0]);
+                        clojure.lang.Keyword.intern("descendants"))).valAt(tag);
                 return d == null ? ClojureNil.INSTANCE : d;
             }
             return ClojureNil.INSTANCE;
@@ -3577,6 +3896,7 @@ public class ClojureContext {
             checkArity(args, 1, "not-empty");
             Object coll = args[0];
             if (coll instanceof ClojureNil) return ClojureNil.INSTANCE;
+            if (coll instanceof String s) return s.isEmpty() ? ClojureNil.INSTANCE : coll;
             if (coll instanceof clojure.lang.Seqable s) return s.seq() == null ? ClojureNil.INSTANCE : coll;
             return coll;
         });
@@ -3690,9 +4010,13 @@ public class ClojureContext {
 
         defBuiltin("nfirst", args -> {
             checkArity(args, 1, "nfirst");
+            // nfirst = (next (first x))
             clojure.lang.ISeq seq = seqOf(args[0]);
             if (seq == null) return ClojureNil.INSTANCE;
-            return seqOf(seq.first());
+            clojure.lang.ISeq firstSeq = seqOf(seq.first());
+            if (firstSeq == null) return ClojureNil.INSTANCE;
+            clojure.lang.ISeq n = firstSeq.next();
+            return n == null ? (Object) ClojureNil.INSTANCE : n;
         });
 
         defBuiltin("nnext", args -> {
@@ -3739,6 +4063,22 @@ public class ClojureContext {
             if (coll == null || coll instanceof ClojureNil) {
                 if (notFound != null) return notFound;
                 return ClojureNil.INSTANCE;
+            }
+            // For deftype instances that implement nth as a type method
+            if (coll instanceof ClojureDeftypeInstance dti) {
+                Object nthFn = lookupTypeMethod(dti.getTypeName(), "nth");
+                if (nthFn != null) {
+                    try {
+                        if (args.length > 2) {
+                            return callFunction(nthFn, new Object[]{dti, args[1], args[2]});
+                        } else {
+                            return callFunction(nthFn, new Object[]{dti, args[1]});
+                        }
+                    } catch (Exception e) {
+                        if (notFound != null) return notFound;
+                        throw e;
+                    }
+                }
             }
             if (coll instanceof clojure.lang.Indexed indexed) {
                 if (idx < 0 || idx >= indexed.count()) {
@@ -3845,12 +4185,12 @@ public class ClojureContext {
             return clojure.lang.PersistentList.create(items);
         });
 
-        // repeat (finite)
+        // repeat (finite and infinite)
         defBuiltin("repeat", args -> {
             if (args.length == 1) {
                 // Infinite repeat
                 Object x = args[0];
-                return new LazySeq(() -> lazyRepeat(-1, x));
+                return lazyRepeatInfinite(x);
             }
             checkArity(args, 2, "repeat");
             int n = ((Number) args[0]).intValue();
@@ -4014,7 +4354,9 @@ public class ClojureContext {
 
         defBuiltin("integer?", args -> {
             checkArity(args, 1, "integer?");
-            return args[0] instanceof Long || args[0] instanceof Integer;
+            return args[0] instanceof Long || args[0] instanceof Integer
+                || args[0] instanceof java.math.BigInteger || args[0] instanceof clojure.lang.BigInt
+                || args[0] instanceof Short || args[0] instanceof Byte;
         });
 
         defBuiltin("float?", args -> {
@@ -4099,86 +4441,9 @@ public class ClojureContext {
         });
 
         // --- Phase 11: walk functions ---
-        defBuiltin("walk", args -> {
-            checkArity(args, 3, "walk");
-            Object inner = args[0];
-            Object outer = args[1];
-            Object form = args[2];
-            Object walked;
-            if (form instanceof clojure.lang.IMapEntry me) {
-                walked = clojure.lang.MapEntry.create(
-                        callFunction(inner, new Object[]{me.key()}),
-                        callFunction(inner, new Object[]{me.val()}));
-            } else if (form instanceof clojure.lang.IPersistentList) {
-                java.util.List<Object> result = new ArrayList<>();
-                for (clojure.lang.ISeq seq = seqOf(form); seq != null; seq = seq.next()) {
-                    result.add(callFunction(inner, new Object[]{seq.first()}));
-                }
-                walked = clojure.lang.PersistentList.create(result);
-            } else if (form instanceof clojure.lang.IPersistentVector v) {
-                java.util.List<Object> result = new ArrayList<>();
-                for (int i = 0; i < v.count(); i++) {
-                    result.add(callFunction(inner, new Object[]{v.nth(i)}));
-                }
-                walked = clojure.lang.PersistentVector.create(result);
-            } else if (form instanceof clojure.lang.IPersistentMap m) {
-                clojure.lang.IPersistentMap result = clojure.lang.PersistentArrayMap.EMPTY;
-                for (clojure.lang.ISeq seq = m.seq(); seq != null; seq = seq.next()) {
-                    Object entry = callFunction(inner, new Object[]{seq.first()});
-                    if (entry instanceof clojure.lang.IMapEntry me2) {
-                        result = result.assoc(me2.key(), me2.val());
-                    } else if (entry instanceof clojure.lang.IPersistentVector ev && ev.count() == 2) {
-                        result = result.assoc(ev.nth(0), ev.nth(1));
-                    }
-                }
-                walked = result;
-            } else if (form instanceof clojure.lang.ISeq) {
-                java.util.List<Object> result = new ArrayList<>();
-                for (clojure.lang.ISeq seq = (clojure.lang.ISeq) form; seq != null; seq = seq.next()) {
-                    result.add(callFunction(inner, new Object[]{seq.first()}));
-                }
-                walked = clojure.lang.PersistentList.create(result);
-            } else {
-                walked = form;
-            }
-            return callFunction(outer, new Object[]{walked});
-        });
-
-        defBuiltin("postwalk", args -> {
-            checkArity(args, 2, "postwalk");
-            return postwalk(args[0], args[1]);
-        });
-
-        defBuiltin("prewalk", args -> {
-            checkArity(args, 2, "prewalk");
-            return prewalk(args[0], args[1]);
-        });
-
-        defBuiltin("postwalk-replace", args -> {
-            checkArity(args, 2, "postwalk-replace");
-            Object smap = args[0];
-            return postwalk((BuiltinFunction) a -> {
-                if (a[0] instanceof ClojureNil) return a[0];
-                if (smap instanceof clojure.lang.IPersistentMap m) {
-                    Object replacement = m.valAt(a[0]);
-                    return replacement != null ? replacement : a[0];
-                }
-                return a[0];
-            }, args[1]);
-        });
-
-        defBuiltin("prewalk-replace", args -> {
-            checkArity(args, 2, "prewalk-replace");
-            Object smap = args[0];
-            return prewalk((BuiltinFunction) a -> {
-                if (a[0] instanceof ClojureNil) return a[0];
-                if (smap instanceof clojure.lang.IPersistentMap m) {
-                    Object replacement = m.valAt(a[0]);
-                    return replacement != null ? replacement : a[0];
-                }
-                return a[0];
-            }, args[1]);
-        });
+        // NOTE: walk/postwalk/prewalk are NOT clojure.core functions.
+        // They belong to clojure.walk namespace only. Registered in registerWalkNamespace()
+        // to avoid polluting globalVars and shadowing user-defined 'walk' functions.
 
         // --- Phase 11: update-keys, update-vals (Clojure 1.11+) ---
         defBuiltin("update-keys", args -> {
@@ -4299,6 +4564,34 @@ public class ClojureContext {
             return ((Number) args[0]).longValue() >>> ((Number) args[1]).intValue();
         });
 
+        defBuiltin("bit-test", args -> {
+            checkArity(args, 2, "bit-test");
+            long x = ((Number) args[0]).longValue();
+            int n = ((Number) args[1]).intValue();
+            return (x & (1L << n)) != 0;
+        });
+
+        defBuiltin("bit-set", args -> {
+            checkArity(args, 2, "bit-set");
+            long x = ((Number) args[0]).longValue();
+            int n = ((Number) args[1]).intValue();
+            return x | (1L << n);
+        });
+
+        defBuiltin("bit-clear", args -> {
+            checkArity(args, 2, "bit-clear");
+            long x = ((Number) args[0]).longValue();
+            int n = ((Number) args[1]).intValue();
+            return x & ~(1L << n);
+        });
+
+        defBuiltin("bit-flip", args -> {
+            checkArity(args, 2, "bit-flip");
+            long x = ((Number) args[0]).longValue();
+            int n = ((Number) args[1]).intValue();
+            return x ^ (1L << n);
+        });
+
         defBuiltin("long", args -> {
             checkArity(args, 1, "long");
             if (args[0] instanceof Long l) return l;
@@ -4331,8 +4624,26 @@ public class ClojureContext {
         // with-redefs support via dynamic binding
         defBuiltin("alter-var-root", args -> {
             checkArity(args, 2, "alter-var-root");
-            String varName = args[0].toString();
             Object f = args[1];
+            if (args[0] instanceof clojure.truffle.runtime.ClojureVar cvar) {
+                Object oldVal = cvar.deref();
+                if (oldVal == null) oldVal = ClojureNil.INSTANCE;
+                Object newVal = callFunction(f, new Object[]{oldVal});
+                // Set the new value in the var's namespace
+                String ns = cvar.getNamespace();
+                String name = cvar.getName();
+                if (ns != null) {
+                    ClojureNamespace namespace = getNamespace(ns);
+                    if (namespace != null) {
+                        namespace.intern(name, newVal);
+                    }
+                    setVar(ns + "/" + name, newVal);
+                } else {
+                    setVar(name, newVal);
+                }
+                return newVal;
+            }
+            String varName = args[0].toString();
             Object oldVal = getVar(varName);
             Object newVal = callFunction(f, new Object[]{oldVal == null ? ClojureNil.INSTANCE : oldVal});
             setVar(varName, newVal);
@@ -4840,8 +5151,8 @@ public class ClojureContext {
             for (clojure.lang.ISeq seq = kmap.seq(); seq != null; seq = seq.next()) {
                 clojure.lang.MapEntry entry = (clojure.lang.MapEntry) seq.first();
                 Object oldKey = entry.key(), newKey = entry.val();
-                if (m.containsKey(oldKey)) {
-                    Object val = m.valAt(oldKey);
+                if (result.containsKey(oldKey)) {
+                    Object val = result.valAt(oldKey);
                     result = result.without(oldKey);
                     result = result.assoc(newKey, val);
                 }
@@ -4869,11 +5180,12 @@ public class ClojureContext {
             if (args.length < 2) throw new RuntimeException("eduction: expected xform and coll");
             Object xform = args[0];
             Object coll = args[args.length - 1];
-            // Compose multiple xforms if more than 2 args
+            // Compose multiple xforms if more than 2 args: (eduction xf1 xf2 ... coll)
+            // comp(xf1, xf2, ...)(rf) = xf1(xf2(...(rf)))
             if (args.length > 2) {
-                for (int i = args.length - 2; i >= 1; i--) {
-                    final Object outerXf = args[i];
-                    final Object innerXf = xform;
+                for (int i = 1; i < args.length - 1; i++) {
+                    final Object outerXf = xform;
+                    final Object innerXf = args[i];
                     xform = (BuiltinFunction) compArgs -> {
                         Object inner = callFunction(innerXf, compArgs);
                         return callFunction(outerXf, new Object[]{inner});
@@ -4965,21 +5277,21 @@ public class ClojureContext {
         });
 
         defBuiltin("send-off", args -> {
-            // Same as send for our simplified implementation
             if (args.length < 2) throw new RuntimeException("send-off: expected at least 2 args");
             if (!(args[0] instanceof clojure.truffle.runtime.ClojureAgent ag))
                 throw new RuntimeException("send-off: first arg must be an agent");
             Object fn = args[1];
             Object[] extraArgs = new Object[args.length - 2];
             System.arraycopy(args, 2, extraArgs, 0, extraArgs.length);
-            ag.send(fn, extraArgs, this);
+            ag.sendOff(fn, extraArgs, this);
             return ag;
         });
 
         defBuiltin("await", args -> {
-            // Simple implementation: sleep briefly to let agent actions complete
-            try { Thread.sleep(100); } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
+            for (Object arg : args) {
+                if (arg instanceof clojure.truffle.runtime.ClojureAgent ag) {
+                    ag.awaitActions();
+                }
             }
             return ClojureNil.INSTANCE;
         });
@@ -5274,7 +5586,23 @@ public class ClojureContext {
 
         // remove - filter complement
         defBuiltin("remove", args -> {
-            if (args.length < 2) throw new RuntimeException("remove: expected 2 args");
+            if (args.length == 1) {
+                // Transducer form: (remove pred) returns a transducer
+                Object pred = args[0];
+                return (BuiltinFunction) xfArgs -> {
+                    checkArity(xfArgs, 1, "remove-transducer");
+                    Object rf = xfArgs[0];
+                    return new TransducerRf(rf) {
+                        @Override public Object step(Object acc, Object input) {
+                            if (!isTruthy(callFunction(pred, new Object[]{input}))) {
+                                return callFunction(rf, new Object[]{acc, input});
+                            }
+                            return acc;
+                        }
+                    };
+                };
+            }
+            if (args.length != 2) throw new RuntimeException("remove: expected 1 or 2 args");
             Object pred = args[0];
             Object coll = args[1];
             java.util.List<Object> result = new java.util.ArrayList<>();
@@ -5311,7 +5639,13 @@ public class ClojureContext {
             Object comp = args[0];
             java.util.Comparator<Object> comparator = (a, b) -> {
                 Object result = callFunction(comp, new Object[]{a, b});
-                return ((Number) result).intValue();
+                if (result instanceof Number n) return n.intValue();
+                if (result instanceof Boolean bool) {
+                    if (bool) return -1;
+                    Object rev = callFunction(comp, new Object[]{b, a});
+                    return (rev instanceof Boolean rb && rb) ? 1 : 0;
+                }
+                return 0;
             };
             Object[] kvs = new Object[args.length - 1];
             System.arraycopy(args, 1, kvs, 0, kvs.length);
@@ -5330,6 +5664,13 @@ public class ClojureContext {
                 Object macro = getMacro(sym.getName());
                 if (macro != null) {
                     java.util.List<Object> macroArgs = new java.util.ArrayList<>();
+                    // User-defined macros expect &form and &env as first two args
+                    boolean isUserMacro = (macro instanceof clojure.truffle.runtime.ClojureFunction
+                            || macro instanceof clojure.truffle.runtime.MultiArityFunction);
+                    if (isUserMacro) {
+                        macroArgs.add(form); // &form
+                        macroArgs.add(clojure.truffle.runtime.ClojureNil.INSTANCE); // &env
+                    }
                     for (clojure.lang.ISeq s = seq.next(); s != null; s = s.next()) {
                         macroArgs.add(s.first());
                     }
@@ -5337,6 +5678,17 @@ public class ClojureContext {
                 }
             }
             return form; // not a macro call, return as-is
+        });
+
+        // macroexpand - repeatedly expand until form doesn't change
+        defBuiltin("macroexpand", args -> {
+            checkArity(args, 1, "macroexpand");
+            Object form = args[0];
+            while (true) {
+                Object expanded = callFunction(getVar("macroexpand-1"), new Object[]{form});
+                if (expanded == form || expanded.equals(form)) return expanded;
+                form = expanded;
+            }
         });
 
         // var? - check if object is a Var
@@ -5368,8 +5720,32 @@ public class ClojureContext {
         // with-in-str* - internal helper
         defBuiltin("with-in-str*", args -> {
             checkArity(args, 2, "with-in-str*");
-            // For now just execute the thunk - full *in* binding requires reader refactoring
-            return callFunction(args[1], new Object[]{});
+            String s = args[0].toString();
+            Object oldIn = globalVars.get("*in*");
+            java.io.BufferedReader newIn = new java.io.BufferedReader(new java.io.StringReader(s));
+            globalVars.put("*in*", newIn);
+            try {
+                return callFunction(args[1], new Object[]{});
+            } finally {
+                if (oldIn != null) globalVars.put("*in*", oldIn);
+                else globalVars.remove("*in*");
+            }
+        });
+
+        defBuiltin("read-line", args -> {
+            Object in = globalVars.get("*in*");
+            java.io.BufferedReader reader;
+            if (in instanceof java.io.BufferedReader br) {
+                reader = br;
+            } else {
+                reader = new java.io.BufferedReader(new java.io.InputStreamReader(System.in));
+            }
+            try {
+                String line = reader.readLine();
+                return line == null ? ClojureNil.INSTANCE : line;
+            } catch (java.io.IOException e) {
+                throw new RuntimeException("read-line: " + e.getMessage());
+            }
         });
 
         // not= - complement of =
@@ -5450,6 +5826,8 @@ public class ClojureContext {
         // realized? - check if delay/lazy-seq/future/promise is realized
         defBuiltin("realized?", args -> {
             checkArity(args, 1, "realized?");
+            if (args[0] instanceof clojure.truffle.runtime.ClojurePromise p) return p.isRealized();
+            if (args[0] instanceof clojure.truffle.runtime.LazySeq ls) return ls.isRealized();
             if (args[0] instanceof clojure.lang.IPending p) return p.isRealized();
             if (args[0] instanceof java.util.concurrent.Future<?> f) return f.isDone();
             return true; // regular values are always "realized"
@@ -5519,6 +5897,22 @@ public class ClojureContext {
 
         // map-indexed
         defBuiltin("map-indexed", args -> {
+            if (args.length == 1) {
+                // Transducer form: (map-indexed f) returns a transducer
+                Object f = args[0];
+                return (BuiltinFunction) xfArgs -> {
+                    checkArity(xfArgs, 1, "map-indexed-transducer");
+                    Object rf = xfArgs[0];
+                    long[] idx = {0};
+                    return new TransducerRf(rf) {
+                        @Override public Object step(Object acc, Object input) {
+                            Object result = callFunction(rf, new Object[]{acc, callFunction(f, new Object[]{idx[0], input})});
+                            idx[0]++;
+                            return result;
+                        }
+                    };
+                };
+            }
             checkArity(args, 2, "map-indexed");
             Object f = args[0];
             java.util.List<Object> result = new java.util.ArrayList<>();
@@ -5638,7 +6032,13 @@ public class ClojureContext {
             Object comp = args[0];
             java.util.Comparator<Object> comparator = (a, b) -> {
                 Object result = callFunction(comp, new Object[]{a, b});
-                return ((Number) result).intValue();
+                if (result instanceof Number n) return n.intValue();
+                if (result instanceof Boolean bool) {
+                    if (bool) return -1;
+                    Object rev = callFunction(comp, new Object[]{b, a});
+                    return (rev instanceof Boolean rb && rb) ? 1 : 0;
+                }
+                return 0;
             };
             clojure.lang.PersistentTreeSet s = clojure.lang.PersistentTreeSet.create(comparator, null);
             for (int i = 1; i < args.length; i++) {
@@ -6136,7 +6536,7 @@ public class ClojureContext {
                     if (isTruthy(ctx.callFunction(pred, new Object[]{input}))) {
                         Object haltVal = finalRetf != null
                                 ? ctx.callFunction(finalRetf, new Object[]{result, input})
-                                : input;
+                                : result;
                         return new Reduced(haltVal);
                     }
                     return ctx.callFunction(rf, stepArgs);
@@ -6165,6 +6565,108 @@ public class ClojureContext {
                 return ref.deref();
             }
             throw new RuntimeException("ensure: arg must be a ref");
+        });
+
+        defBuiltin("delivered?", args -> {
+            checkArity(args, 1, "delivered?");
+            if (args[0] instanceof clojure.truffle.runtime.ClojurePromise p) {
+                return p.isRealized();
+            }
+            throw new RuntimeException("delivered?: arg must be a promise");
+        });
+
+        defBuiltin("record?", args -> {
+            checkArity(args, 1, "record?");
+            if (args[0] instanceof clojure.lang.IRecord) return true;
+            if (args[0] instanceof clojure.truffle.runtime.ClojureDeftypeInstance inst) {
+                return inst.isRecord();
+            }
+            return false;
+        });
+
+        defBuiltin("await-for", args -> {
+            if (args.length < 2) throw new RuntimeException("await-for: expected at least 2 args");
+            long timeoutMs = ((Number) args[0]).longValue();
+            for (int i = 1; i < args.length; i++) {
+                if (args[i] instanceof clojure.truffle.runtime.ClojureAgent ag) {
+                    ag.awaitActions(timeoutMs);
+                }
+            }
+            // Return true if all agents have no error (simplified)
+            for (int i = 1; i < args.length; i++) {
+                if (args[i] instanceof clojure.truffle.runtime.ClojureAgent ag) {
+                    if (ag.getError() != null) return false;
+                }
+            }
+            return true;
+        });
+
+        // ── NFI (Native Function Interface) builtins ──
+
+        // (native-load "libfoo.so") → returns library object
+        // (native-load "libfoo.so" :global :lazy) → with flags
+        defBuiltin("native-load", args -> {
+            if (args.length < 1) throw new RuntimeException("native-load: requires library name");
+            String libName = args[0].toString();
+            StringBuilder loadExpr = new StringBuilder();
+            boolean hasGlobal = false, hasLazy = false;
+            for (int i = 1; i < args.length; i++) {
+                String flag = args[i].toString();
+                if (":global".equals(flag)) hasGlobal = true;
+                else if (":lazy".equals(flag)) hasLazy = true;
+            }
+            if (hasGlobal || hasLazy) {
+                loadExpr.append("load (");
+                if (hasGlobal) loadExpr.append("RTLD_GLOBAL");
+                if (hasGlobal && hasLazy) loadExpr.append(" | ");
+                if (hasLazy) loadExpr.append("RTLD_LAZY");
+                loadExpr.append(") \"").append(libName).append("\"");
+            } else {
+                loadExpr.append("load \"").append(libName).append("\"");
+            }
+            try {
+                com.oracle.truffle.api.source.Source nfiSrc = com.oracle.truffle.api.source.Source.newBuilder("nfi",
+                        loadExpr.toString(), "load-" + libName).build();
+                com.oracle.truffle.api.CallTarget ct = env.parseInternal(nfiSrc);
+                return ct.call();
+            } catch (Exception e) {
+                throw new RuntimeException("native-load: failed to load " + libName + ": " + e.getMessage());
+            }
+        });
+
+        // (native-fn lib "function_name" "(SINT32, STRING):POINTER") → callable function
+        defBuiltin("native-fn", args -> {
+            if (args.length < 3) throw new RuntimeException("native-fn: requires (lib name signature)");
+            Object lib = args[0];
+            String fnName = args[1].toString();
+            String signature = args[2].toString();
+            try {
+                com.oracle.truffle.api.interop.InteropLibrary interop =
+                        com.oracle.truffle.api.interop.InteropLibrary.getUncached();
+                Object symbol = interop.readMember(lib, fnName);
+                com.oracle.truffle.api.source.Source sigSrc = com.oracle.truffle.api.source.Source.newBuilder("nfi",
+                        signature, "sig-" + fnName).build();
+                com.oracle.truffle.api.CallTarget sigCt = env.parseInternal(sigSrc);
+                Object sig = sigCt.call();
+                Object bound = interop.invokeMember(sig, "bind", symbol);
+                return new clojure.truffle.runtime.NativeFunction(fnName, signature, bound);
+            } catch (RuntimeException e) {
+                throw e;
+            } catch (Exception e) {
+                throw new RuntimeException("native-fn: " + e.getMessage());
+            }
+        });
+
+        // (native-default) → returns default (process) symbol table
+        defBuiltin("native-default", args -> {
+            try {
+                com.oracle.truffle.api.source.Source nfiSrc = com.oracle.truffle.api.source.Source.newBuilder("nfi",
+                        "default", "default").build();
+                com.oracle.truffle.api.CallTarget ct = env.parseInternal(nfiSrc);
+                return ct.call();
+            } catch (Exception e) {
+                throw new RuntimeException("native-default: " + e.getMessage());
+            }
         });
 
         // Copy all builtins into clojure.core namespace
@@ -6319,10 +6821,11 @@ public class ClojureContext {
     private Object lazyMap(Object fn, Object coll) {
         return new LazySeq(() -> {
             clojure.lang.ISeq s;
-            if (coll instanceof ClojureNil) return null;
-            if (coll instanceof clojure.lang.ISeq is) s = is;
-            else if (coll instanceof clojure.lang.Seqable sq) s = sq.seq();
-            else return null;
+            if (coll == null || coll instanceof ClojureNil) return null;
+            if (coll instanceof clojure.lang.Seqable sq) s = sq.seq();
+            else {
+                s = seqOf(coll); // handles arrays, strings, Iterables via RT.seq
+            }
             if (s == null) return null;
             Object first = callFunction(fn, new Object[]{s.first()});
             clojure.lang.ISeq rest = s.next();
@@ -6355,8 +6858,7 @@ public class ClojureContext {
         return new LazySeq(() -> {
             clojure.lang.ISeq s;
             if (coll instanceof ClojureNil) return null;
-            if (coll instanceof clojure.lang.ISeq is) s = is;
-            else if (coll instanceof clojure.lang.Seqable sq) s = sq.seq();
+            if (coll instanceof clojure.lang.Seqable sq) s = sq.seq();
             else return null;
             while (s != null) {
                 Object item = s.first();
@@ -6394,6 +6896,22 @@ public class ClojureContext {
             if (n <= 0) return null;
             LazySeq rest = (LazySeq) lazyRepeat(n - 1, val);
             return (Object) new clojure.lang.Cons(val, rest);
+        });
+    }
+
+    private Object lazyRepeatInfinite(Object val) {
+        return new LazySeq(() -> new clojure.lang.Cons(val, (clojure.lang.ISeq) lazyRepeatInfinite(val)));
+    }
+
+    private Object lazyTakeNth(long n, clojure.lang.ISeq s) {
+        return new LazySeq(() -> {
+            if (s == null) return null;
+            // drop n elements for the next step
+            clojure.lang.ISeq rest = s;
+            for (long i = 0; i < n; i++) {
+                rest = rest != null ? rest.next() : null;
+            }
+            return (Object) new clojure.lang.Cons(s.first(), (clojure.lang.ISeq) lazyTakeNth(n, rest));
         });
     }
 
@@ -6488,7 +7006,7 @@ public class ClojureContext {
             return (double) la / lb;
         }
         double db = toDouble(b);
-        if (db == 0.0) throw new ArithmeticException("Divide by zero");
+        // Float division by zero returns NaN or Infinity, not an exception (Clojure semantics)
         return toDouble(a) / db;
     }
 
@@ -6572,7 +7090,7 @@ public class ClojureContext {
     // --- Collection helpers ---
 
     private static Object clojureFirst(Object coll) {
-        if (coll instanceof ClojureNil) return ClojureNil.INSTANCE;
+        if (coll == null || coll instanceof ClojureNil) return ClojureNil.INSTANCE;
         if (coll instanceof clojure.lang.ISeq seq) {
             Object f = seq.first();
             return f == null ? ClojureNil.INSTANCE : f;
@@ -6583,11 +7101,22 @@ public class ClojureContext {
             Object f = seq.first();
             return f == null ? ClojureNil.INSTANCE : f;
         }
+        if (coll instanceof CharSequence cs) {
+            return cs.length() == 0 ? ClojureNil.INSTANCE : Character.valueOf(cs.charAt(0));
+        }
+        if (coll.getClass().isArray()) {
+            clojure.lang.ISeq seq = clojure.lang.RT.seq(coll);
+            return seq == null ? ClojureNil.INSTANCE : seq.first();
+        }
+        if (coll instanceof java.lang.Iterable<?> it) {
+            java.util.Iterator<?> iter = it.iterator();
+            return iter.hasNext() ? iter.next() : ClojureNil.INSTANCE;
+        }
         throw new RuntimeException("first: not a sequence: " + coll);
     }
 
     private static Object clojureRest(Object coll) {
-        if (coll instanceof ClojureNil) return clojure.lang.PersistentList.EMPTY;
+        if (coll == null || coll instanceof ClojureNil) return clojure.lang.PersistentList.EMPTY;
         if (coll instanceof clojure.lang.ISeq seq) {
             clojure.lang.ISeq r = seq.next();
             return r == null ? clojure.lang.PersistentList.EMPTY : r;
@@ -6598,7 +7127,28 @@ public class ClojureContext {
             clojure.lang.ISeq r = seq.next();
             return r == null ? clojure.lang.PersistentList.EMPTY : r;
         }
-        throw new RuntimeException("rest: not a sequence: " + coll);
+        if (coll instanceof String str) {
+            if (str.length() <= 1) return clojure.lang.PersistentList.EMPTY;
+            clojure.lang.ISeq seq = clojure.lang.StringSeq.create(str);
+            if (seq == null) return clojure.lang.PersistentList.EMPTY;
+            clojure.lang.ISeq r = seq.next();
+            return r == null ? clojure.lang.PersistentList.EMPTY : r;
+        }
+        if (coll.getClass().isArray()) {
+            clojure.lang.ISeq seq = clojure.lang.RT.seq(coll);
+            if (seq == null) return clojure.lang.PersistentList.EMPTY;
+            clojure.lang.ISeq r = seq.next();
+            return r == null ? clojure.lang.PersistentList.EMPTY : r;
+        }
+        // Fallback: try RT.seq for Iterable and other types
+        try {
+            clojure.lang.ISeq seq = clojure.lang.RT.seq(coll);
+            if (seq == null) return clojure.lang.PersistentList.EMPTY;
+            clojure.lang.ISeq r = seq.next();
+            return r == null ? clojure.lang.PersistentList.EMPTY : r;
+        } catch (Exception e) {
+            throw new RuntimeException("rest: not a sequence: " + coll);
+        }
     }
 
     private static Object clojureCons(Object elem, Object coll) {
@@ -6656,6 +7206,168 @@ public class ClojureContext {
             }
         }
         return coll;
+    }
+
+    /**
+     * Override core.async channel operations with simple Java implementations
+     * using LinkedBlockingQueue. This avoids protocol dispatch issues with proxy objects.
+     */
+    private void registerAsyncOverrides() {
+        ClojureNamespace ns = getNamespace("clojure.core.async");
+        if (ns == null) return;
+
+        // chan: create a channel backed by LinkedBlockingQueue
+        NamedBuiltin chanFunc = new NamedBuiltin("chan", args -> {
+            int bufSize = (args.length > 0 && args[0] instanceof Number n) ? n.intValue() : 1024;
+            java.util.concurrent.LinkedBlockingQueue<Object> q = new java.util.concurrent.LinkedBlockingQueue<>(Math.max(bufSize, 1));
+            return new AsyncChannel(q);
+        });
+        ns.intern("chan", chanFunc);
+
+        // >!! (blocking put)
+        NamedBuiltin putBlockingFunc = new NamedBuiltin(">!!", args -> {
+            if (args.length < 2) throw new RuntimeException(">!!: requires channel and value");
+            if (args[0] instanceof AsyncChannel ch) {
+                if (ch.closed) return false;
+                try {
+                    ch.queue.put(args[1]);
+                    return true;
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return false;
+                }
+            }
+            throw new RuntimeException(">!!: first arg must be a channel, got " + (args[0] != null ? args[0].getClass().getName() : "nil"));
+        });
+        ns.intern(">!!", putBlockingFunc);
+
+        // <!! (blocking take)
+        NamedBuiltin takeBlockingFunc = new NamedBuiltin("<!!", args -> {
+            if (args.length < 1) throw new RuntimeException("<!!: requires channel");
+            if (args[0] instanceof AsyncChannel ch) {
+                if (ch.closed && ch.queue.isEmpty()) return ClojureNil.INSTANCE;
+                try {
+                    Object val = ch.queue.poll(60, java.util.concurrent.TimeUnit.SECONDS);
+                    return val != null ? val : ClojureNil.INSTANCE;
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return ClojureNil.INSTANCE;
+                }
+            }
+            throw new RuntimeException("<!!: first arg must be a channel, got " + (args[0] != null ? args[0].getClass().getName() : "nil"));
+        });
+        ns.intern("<!!", takeBlockingFunc);
+
+        // >! (park put - in our fake go blocks, same as >!!)
+        ns.intern(">!", putBlockingFunc);
+
+        // <! (park take - in our fake go blocks, same as <!!)
+        ns.intern("<!", takeBlockingFunc);
+
+        // close!
+        NamedBuiltin closeFunc = new NamedBuiltin("close!", args -> {
+            if (args.length > 0 && args[0] instanceof AsyncChannel ch) {
+                ch.closed = true;
+            }
+            return ClojureNil.INSTANCE;
+        });
+        ns.intern("close!", closeFunc);
+
+        // put! (async put with callback - simplified to blocking)
+        NamedBuiltin putAsyncFunc = new NamedBuiltin("put!", args -> {
+            if (args.length < 2) throw new RuntimeException("put!: requires channel and value");
+            if (args[0] instanceof AsyncChannel ch) {
+                if (ch.closed) return false;
+                ch.queue.offer(args[1]);
+                if (args.length > 2 && args[2] != null && !(args[2] instanceof clojure.truffle.runtime.ClojureNil)) {
+                    try { callFunction(args[2], new Object[]{true}); } catch (Exception ignored) {}
+                }
+                return true;
+            }
+            throw new RuntimeException("put!: first arg must be a channel");
+        });
+        ns.intern("put!", putAsyncFunc);
+
+        // poll! (non-blocking take, returns nil if nothing available)
+        NamedBuiltin pollFunc = new NamedBuiltin("poll!", args -> {
+            if (args.length < 1) throw new RuntimeException("poll!: requires channel");
+            if (args[0] instanceof AsyncChannel ch) {
+                Object val = ch.queue.poll();
+                return val != null ? val : ClojureNil.INSTANCE;
+            }
+            return ClojureNil.INSTANCE;
+        });
+        ns.intern("poll!", pollFunc);
+
+        // offer! (non-blocking put, returns true/false)
+        NamedBuiltin offerFunc = new NamedBuiltin("offer!", args -> {
+            if (args.length < 2) throw new RuntimeException("offer!: requires channel and value");
+            if (args[0] instanceof AsyncChannel ch) {
+                if (ch.closed) return false;
+                return ch.queue.offer(args[1]);
+            }
+            return false;
+        });
+        ns.intern("offer!", offerFunc);
+
+        // timeout (returns a channel that closes after ms)
+        NamedBuiltin timeoutFunc = new NamedBuiltin("timeout", args -> {
+            if (args.length < 1) throw new RuntimeException("timeout: requires ms");
+            long ms = ((Number) args[0]).longValue();
+            AsyncChannel ch = new AsyncChannel(new java.util.concurrent.LinkedBlockingQueue<>(1));
+            Thread t = new Thread(() -> {
+                try { Thread.sleep(ms); } catch (InterruptedException ignored) {}
+                ch.queue.offer(ClojureNil.INSTANCE);
+                ch.closed = true;
+            });
+            t.setDaemon(true);
+            t.start();
+            return ch;
+        });
+        ns.intern("timeout", timeoutFunc);
+
+        // alts!! (blocking choice on multiple channels)
+        NamedBuiltin altsBlockingFunc = new NamedBuiltin("alts!!", args -> {
+            if (args.length < 1) throw new RuntimeException("alts!!: requires channels vector");
+            Object portsArg = args[0];
+            java.util.List<AsyncChannel> channels = new java.util.ArrayList<>();
+            for (clojure.lang.ISeq s = clojure.lang.RT.seq(portsArg); s != null; s = s.next()) {
+                Object port = s.first();
+                if (port instanceof AsyncChannel ac) channels.add(ac);
+            }
+            // Busy-poll all channels until one has a value
+            while (true) {
+                for (int i = 0; i < channels.size(); i++) {
+                    AsyncChannel ch = channels.get(i);
+                    Object val = ch.queue.poll();
+                    if (val != null) {
+                        return clojure.lang.PersistentVector.create(val, ch);
+                    }
+                    if (ch.closed && ch.queue.isEmpty()) {
+                        return clojure.lang.PersistentVector.create(ClojureNil.INSTANCE, ch);
+                    }
+                }
+                try { Thread.sleep(1); } catch (InterruptedException e) { break; }
+            }
+            return clojure.lang.PersistentVector.create(ClojureNil.INSTANCE, channels.get(0));
+        });
+        ns.intern("alts!!", altsBlockingFunc);
+        ns.intern("alts!", altsBlockingFunc);
+    }
+
+    /** Simple channel implementation backed by a blocking queue */
+    public static class AsyncChannel {
+        public final java.util.concurrent.LinkedBlockingQueue<Object> queue;
+        public volatile boolean closed = false;
+
+        public AsyncChannel(java.util.concurrent.LinkedBlockingQueue<Object> queue) {
+            this.queue = queue;
+        }
+
+        @Override
+        public String toString() {
+            return "#<Channel" + (closed ? " (closed)" : "") + ">";
+        }
     }
 
     private void registerStringNamespace() {
@@ -6741,9 +7453,10 @@ public class ClojureContext {
                 clojure.lang.MapEntry entry = (clojure.lang.MapEntry) seq.first();
                 Object oldKey = entry.key();
                 Object newKey = entry.val();
-                if (m.containsKey(oldKey)) {
+                if (result.containsKey(oldKey)) {
+                    Object val = result.valAt(oldKey);
                     result = result.without(oldKey);
-                    result = result.assoc(newKey, m.valAt(oldKey));
+                    result = result.assoc(newKey, val);
                 }
             }
             return result;
@@ -6753,6 +7466,26 @@ public class ClojureContext {
             if (args.length < 2) throw new RuntimeException("clojure.set/join: expected 2+ args");
             // Simplified: return first arg
             return args[0];
+        });
+        ns.intern("index", (BuiltinFunction) args -> {
+            checkArity(args, 2, "clojure.set/index");
+            Object xrel = args[0]; // set of maps
+            Object ks = args[1]; // keys to index by
+            clojure.lang.IPersistentMap result = clojure.lang.PersistentHashMap.EMPTY;
+            for (clojure.lang.ISeq s = seqOf(xrel); s != null; s = s.next()) {
+                clojure.lang.IPersistentMap row = (clojure.lang.IPersistentMap) s.first();
+                // Build index key: select-keys of row by ks
+                clojure.lang.IPersistentMap indexKey = clojure.lang.PersistentHashMap.EMPTY;
+                for (clojure.lang.ISeq ks2 = seqOf(ks); ks2 != null; ks2 = ks2.next()) {
+                    Object k = ks2.first();
+                    indexKey = indexKey.assoc(k, row.valAt(k));
+                }
+                clojure.lang.IPersistentSet existing = (clojure.lang.IPersistentSet) result.valAt(indexKey);
+                if (existing == null) existing = clojure.lang.PersistentHashSet.EMPTY;
+                existing = (clojure.lang.IPersistentSet) existing.cons(row);
+                result = result.assoc(indexKey, existing);
+            }
+            return result;
         });
         ns.intern("select", (BuiltinFunction) args -> {
             checkArity(args, 2, "clojure.set/select");
@@ -6770,11 +7503,83 @@ public class ClojureContext {
 
     private void registerWalkNamespace() {
         ClojureNamespace ns = getOrCreateNamespace("clojure.walk");
-        String[] fns = {"walk", "postwalk", "prewalk", "postwalk-replace", "prewalk-replace"};
-        for (String fn : fns) {
-            Object val = globalVars.get(fn);
-            if (val != null) ns.intern(fn, val);
-        }
+        // Register walk functions as namespace-local builtins (NOT global)
+        ns.intern("walk", new NamedBuiltin("walk", args -> {
+            checkArity(args, 3, "walk");
+            Object inner = args[0];
+            Object outer = args[1];
+            Object form = args[2];
+            Object walked;
+            if (form instanceof clojure.lang.IMapEntry me) {
+                walked = clojure.lang.MapEntry.create(
+                        callFunction(inner, new Object[]{me.key()}),
+                        callFunction(inner, new Object[]{me.val()}));
+            } else if (form instanceof clojure.lang.IPersistentList) {
+                java.util.List<Object> result = new ArrayList<>();
+                for (clojure.lang.ISeq seq = seqOf(form); seq != null; seq = seq.next()) {
+                    result.add(callFunction(inner, new Object[]{seq.first()}));
+                }
+                walked = clojure.lang.PersistentList.create(result);
+            } else if (form instanceof clojure.lang.IPersistentVector v) {
+                java.util.List<Object> result = new ArrayList<>();
+                for (int i = 0; i < v.count(); i++) {
+                    result.add(callFunction(inner, new Object[]{v.nth(i)}));
+                }
+                walked = clojure.lang.PersistentVector.create(result);
+            } else if (form instanceof clojure.lang.IPersistentMap m) {
+                clojure.lang.IPersistentMap result = clojure.lang.PersistentArrayMap.EMPTY;
+                for (clojure.lang.ISeq seq = m.seq(); seq != null; seq = seq.next()) {
+                    Object entry = callFunction(inner, new Object[]{seq.first()});
+                    if (entry instanceof clojure.lang.IMapEntry me2) {
+                        result = result.assoc(me2.key(), me2.val());
+                    } else if (entry instanceof clojure.lang.IPersistentVector ev && ev.count() == 2) {
+                        result = result.assoc(ev.nth(0), ev.nth(1));
+                    }
+                }
+                walked = result;
+            } else if (form instanceof clojure.lang.ISeq) {
+                java.util.List<Object> result = new ArrayList<>();
+                for (clojure.lang.ISeq seq = (clojure.lang.ISeq) form; seq != null; seq = seq.next()) {
+                    result.add(callFunction(inner, new Object[]{seq.first()}));
+                }
+                walked = clojure.lang.PersistentList.create(result);
+            } else {
+                walked = form;
+            }
+            return callFunction(outer, new Object[]{walked});
+        }));
+        ns.intern("postwalk", new NamedBuiltin("postwalk", args -> {
+            checkArity(args, 2, "postwalk");
+            return postwalk(args[0], args[1]);
+        }));
+        ns.intern("prewalk", new NamedBuiltin("prewalk", args -> {
+            checkArity(args, 2, "prewalk");
+            return prewalk(args[0], args[1]);
+        }));
+        ns.intern("postwalk-replace", new NamedBuiltin("postwalk-replace", args -> {
+            checkArity(args, 2, "postwalk-replace");
+            Object smap = args[0];
+            return postwalk((BuiltinFunction) a -> {
+                if (a[0] instanceof ClojureNil) return a[0];
+                if (smap instanceof clojure.lang.IPersistentMap m) {
+                    Object replacement = m.valAt(a[0]);
+                    return replacement != null ? replacement : a[0];
+                }
+                return a[0];
+            }, args[1]);
+        }));
+        ns.intern("prewalk-replace", new NamedBuiltin("prewalk-replace", args -> {
+            checkArity(args, 2, "prewalk-replace");
+            Object smap = args[0];
+            return prewalk((BuiltinFunction) a -> {
+                if (a[0] instanceof ClojureNil) return a[0];
+                if (smap instanceof clojure.lang.IPersistentMap m) {
+                    Object replacement = m.valAt(a[0]);
+                    return replacement != null ? replacement : a[0];
+                }
+                return a[0];
+            }, args[1]);
+        }));
     }
 
     private void registerEdnNamespace() {
@@ -7188,9 +7993,11 @@ public class ClojureContext {
     }
 
     // Reduced wrapper for transducers
-    public static class Reduced {
+    public static class Reduced implements clojure.lang.IDeref {
         public final Object value;
         public Reduced(Object value) { this.value = value; }
+        @Override
+        public Object deref() { return value; }
     }
 
     // Base class for transducer reducing functions
