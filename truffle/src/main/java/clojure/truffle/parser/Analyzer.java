@@ -144,10 +144,10 @@ public class Analyzer {
         currentScope = new Scope(null);
         // Set *ns* for LispReader so ::keyword auto-qualification works
         String currentNs = context != null ? context.getCurrentNamespace() : "user";
-        clojure.lang.Var nsVar = clojure.lang.RT.var("clojure.core", "*ns*");
+        clojure.lang.Var nsVar = clojure.truffle.runtime.ClojureRT.var("clojure.core", "*ns*");
         clojure.lang.Namespace clojureNs = clojure.lang.Namespace.findOrCreate(
                 clojure.lang.Symbol.intern(currentNs));
-        clojure.lang.Var.pushThreadBindings(clojure.lang.RT.map(nsVar, clojureNs));
+        clojure.lang.Var.pushThreadBindings(clojure.truffle.runtime.ClojureRT.map(nsVar, clojureNs));
         try {
             // Read and analyze forms incrementally so that side-effect forms
             // (require, ns, use, import) are executed before subsequent forms are analyzed
@@ -268,7 +268,7 @@ public class Analyzer {
     private static volatile Object READ_OPTS;
     private static Object getReadOpts() {
         if (READ_OPTS == null) {
-            READ_OPTS = clojure.lang.RT.map(LispReader.OPT_READ_COND, LispReader.COND_ALLOW);
+            READ_OPTS = clojure.truffle.runtime.ClojureRT.map(LispReader.OPT_READ_COND, LispReader.COND_ALLOW);
         }
         return READ_OPTS;
     }

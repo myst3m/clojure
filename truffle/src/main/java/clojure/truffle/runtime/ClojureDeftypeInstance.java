@@ -124,7 +124,7 @@ public class ClojureDeftypeInstance implements TruffleObject, clojure.lang.ILook
             if (result == null || result instanceof ClojureNil) return null;
             if (result instanceof clojure.lang.ISeq s) return s;
             if (result instanceof clojure.lang.Seqable s) return s.seq();
-            return clojure.lang.RT.seq(result);
+            return ClojureRT.seq(result);
         }
         // Default: treat as map of fields
         java.util.List<Object> entries = new java.util.ArrayList<>();

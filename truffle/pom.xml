@@ -33,8 +33,10 @@
         </dependency>
         <dependency>
             <groupId>org.clojure</groupId>
-            <artifactId>clojure</artifactId>
-            <version>1.13.0-master-SNAPSHOT</version>
+            <artifactId>clojure-lang-only</artifactId>
+            <version>1.0.0</version>
+            <scope>system</scope>
+            <systemPath>${project.basedir}/lib/clojure-lang-only.jar</systemPath>
         </dependency>
         <dependency>
             <groupId>org.graalvm.truffle</groupId>

@@ -385,7 +385,7 @@ public class JavaInteropUtil {
 
     private static java.util.List<Object> seqToList(Object val) {
         java.util.List<Object> list = new java.util.ArrayList<>();
-        for (clojure.lang.ISeq s = clojure.lang.RT.seq(val); s != null; s = s.next()) {
+        for (clojure.lang.ISeq s = clojure.truffle.runtime.ClojureRT.seq(val); s != null; s = s.next()) {
             list.add(s.first());
         }
         return list;

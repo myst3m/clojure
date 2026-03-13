@@ -84,7 +84,7 @@ public class ClojureContext {
         @Override public Object invoke(Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7, Object a8) { return execute(new Object[]{a1, a2, a3, a4, a5, a6, a7, a8}); }
         @Override public Object invoke(Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7, Object a8, Object a9) { return execute(new Object[]{a1, a2, a3, a4, a5, a6, a7, a8, a9}); }
         @Override public Object invoke(Object a1, Object a2, Object a3, Object a4, Object a5, Object a6, Object a7, Object a8, Object a9, Object a10) { return execute(new Object[]{a1, a2, a3, a4, a5, a6, a7, a8, a9, a10}); }
-        @Override public Object applyTo(clojure.lang.ISeq arglist) { return execute(clojure.lang.RT.seqToArray(arglist)); }
+        @Override public Object applyTo(clojure.lang.ISeq arglist) { return execute(clojure.truffle.runtime.ClojureRT.seqToArray(arglist)); }
     }
 
     /** Register a builtin function with a name for debugging. */
@@ -391,13 +391,13 @@ public class ClojureContext {
             getOrCreateNamespace(nsName);
             currentNamespace = nsName;
             // Set Clojure's *ns* so LispReader can resolve ::alias/keyword
-            clojure.lang.Var nsVar = clojure.lang.RT.var("clojure.core", "*ns*");
+            clojure.lang.Var nsVar = clojure.truffle.runtime.ClojureRT.var("clojure.core", "*ns*");
             Object prevClojureNs = nsVar.deref();
             clojure.lang.Namespace clojureNs = clojure.lang.Namespace.findOrCreate(
                     clojure.lang.Symbol.intern(nsName));
             // Refer all clojure.core vars so syntax-quote resolves symbols properly
             referClojureCoreVars(clojureNs);
-            clojure.lang.Var.pushThreadBindings(clojure.lang.RT.map(nsVar, clojureNs));
+            clojure.lang.Var.pushThreadBindings(clojure.truffle.runtime.ClojureRT.map(nsVar, clojureNs));
             try {
                 Analyzer analyzer = new Analyzer(language);
                 analyzer.setContext(this);
@@ -480,7 +480,7 @@ public class ClojureContext {
             dynamicVars.add(v);
         }
         // *clojure-version* - version map
-        clojure.lang.IPersistentMap versionMap = clojure.lang.RT.map(
+        clojure.lang.IPersistentMap versionMap = clojure.truffle.runtime.ClojureRT.map(
                 clojure.lang.Keyword.intern("major"), 1L,
                 clojure.lang.Keyword.intern("minor"), 12L,
                 clojure.lang.Keyword.intern("incremental"), 0L,
@@ -945,7 +945,7 @@ public class ClojureContext {
                 return clojure.lang.PersistentList.create(items);
             }
             if (args[0].getClass().isArray()) {
-                clojure.lang.ISeq s = clojure.lang.RT.seq(args[0]);
+                clojure.lang.ISeq s = clojure.truffle.runtime.ClojureRT.seq(args[0]);
                 return s == null ? ClojureNil.INSTANCE : s;
             }
             throw new RuntimeException("seq: not seqable: " + args[0]);
@@ -3082,7 +3082,7 @@ public class ClojureContext {
             StringBuilder sb = new StringBuilder();
             for (int i = 0; i < s.length(); i++) {
                 char c = s.charAt(i);
-                Object replacement = clojure.lang.RT.get(cmap, c);
+                Object replacement = clojure.truffle.runtime.ClojureRT.get(cmap, c);
                 if (replacement != null) {
                     sb.append(replacement);
                 } else {
@@ -3232,12 +3232,12 @@ public class ClojureContext {
 
         defBuiltin("munge", args -> {
             checkArity(args, 1, "munge");
-            return clojure.lang.Compiler.munge(args[0].toString());
+            return clojure.truffle.runtime.ClojureRT.munge(args[0].toString());
         });
 
         defBuiltin("demunge", args -> {
             checkArity(args, 1, "demunge");
-            return clojure.lang.Compiler.demunge(args[0].toString());
+            return clojure.truffle.runtime.ClojureRT.demunge(args[0].toString());
         });
 
         defBuiltin("instance?", args -> {
@@ -4017,7 +4017,7 @@ public class ClojureContext {
             clojure.lang.IPersistentVector v = (clojure.lang.IPersistentVector) args[0];
             int start = ((Number) args[1]).intValue();
             int end = args.length > 2 ? ((Number) args[2]).intValue() : v.count();
-            return clojure.lang.RT.subvec(v, start, end);
+            return clojure.truffle.runtime.ClojureRT.subvec(v, start, end);
         });
 
         defBuiltin("nfirst", args -> {
@@ -6514,7 +6514,7 @@ public class ClojureContext {
                 java.util.List<Object> result = new java.util.ArrayList<>();
                 for (int i = 0; i < v.count(); i++) {
                     Object item = v.nth(i);
-                    Object replacement = clojure.lang.RT.get(smap, item);
+                    Object replacement = clojure.truffle.runtime.ClojureRT.get(smap, item);
                     result.add(replacement != null ? replacement : item);
                 }
                 return clojure.lang.PersistentVector.create(result);
@@ -6524,7 +6524,7 @@ public class ClojureContext {
             java.util.List<Object> result = new java.util.ArrayList<>();
             while (s != null) {
                 Object item = s.first();
-                Object replacement = clojure.lang.RT.get(smap, item);
+                Object replacement = clojure.truffle.runtime.ClojureRT.get(smap, item);
                 result.add(replacement != null ? replacement : item);
                 s = s.next();
             }
@@ -6870,7 +6870,7 @@ public class ClojureContext {
         if (coll instanceof clojure.lang.Seqable s) return s.seq();
         // Delegate to RT.seq for String, Iterable, arrays, Map etc.
         try {
-            return clojure.lang.RT.seq(coll);
+            return clojure.truffle.runtime.ClojureRT.seq(coll);
         } catch (IllegalArgumentException e) {
             throw new RuntimeException("Not seqable: " + coll);
         }
@@ -7167,7 +7167,7 @@ public class ClojureContext {
             return cs.length() == 0 ? ClojureNil.INSTANCE : Character.valueOf(cs.charAt(0));
         }
         if (coll.getClass().isArray()) {
-            clojure.lang.ISeq seq = clojure.lang.RT.seq(coll);
+            clojure.lang.ISeq seq = clojure.truffle.runtime.ClojureRT.seq(coll);
             return seq == null ? ClojureNil.INSTANCE : seq.first();
         }
         if (coll instanceof java.lang.Iterable<?> it) {
@@ -7197,14 +7197,14 @@ public class ClojureContext {
             return r == null ? clojure.lang.PersistentList.EMPTY : r;
         }
         if (coll.getClass().isArray()) {
-            clojure.lang.ISeq seq = clojure.lang.RT.seq(coll);
+            clojure.lang.ISeq seq = clojure.truffle.runtime.ClojureRT.seq(coll);
             if (seq == null) return clojure.lang.PersistentList.EMPTY;
             clojure.lang.ISeq r = seq.next();
             return r == null ? clojure.lang.PersistentList.EMPTY : r;
         }
         // Fallback: try RT.seq for Iterable and other types
         try {
-            clojure.lang.ISeq seq = clojure.lang.RT.seq(coll);
+            clojure.lang.ISeq seq = clojure.truffle.runtime.ClojureRT.seq(coll);
             if (seq == null) return clojure.lang.PersistentList.EMPTY;
             clojure.lang.ISeq r = seq.next();
             return r == null ? clojure.lang.PersistentList.EMPTY : r;
@@ -7393,7 +7393,7 @@ public class ClojureContext {
             if (args.length < 1) throw new RuntimeException("alts!!: requires channels vector");
             Object portsArg = args[0];
             java.util.List<AsyncChannel> channels = new java.util.ArrayList<>();
-            for (clojure.lang.ISeq s = clojure.lang.RT.seq(portsArg); s != null; s = s.next()) {
+            for (clojure.lang.ISeq s = clojure.truffle.runtime.ClojureRT.seq(portsArg); s != null; s = s.next()) {
                 Object port = s.first();
                 if (port instanceof AsyncChannel ac) channels.add(ac);
             }

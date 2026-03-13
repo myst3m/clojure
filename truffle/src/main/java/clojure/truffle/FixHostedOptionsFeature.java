@@ -14,6 +14,14 @@ import java.util.Iterator;
 public class FixHostedOptionsFeature implements Feature {
 
     @Override
+    public void afterRegistration(AfterRegistrationAccess access) {
+        // Force ContinuationsFeature.supported = true so that continuation lowerings
+        // are registered even though DeoptimizationSupport.enabled() is true (Truffle JIT).
+        // Without this, VirtualThread internals being reachable triggers a fatal error.
+        forceContinuationsSupported();
+    }
+
+    @Override
     public void beforeAnalysis(BeforeAnalysisAccess access) {
         // Register ClojureFunction constructor so its %%D deopt variant is parsed
         try {
@@ -25,6 +33,37 @@ public class FixHostedOptionsFeature implements Feature {
             }
         } catch (Exception e) {
             System.err.println("[FixHostedOptions] Warning (reflection): " + e.getMessage());
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private void forceContinuationsSupported() {
+        try {
+            Class<?> contFeatureClass = Class.forName("com.oracle.svm.core.thread.ContinuationsFeature");
+            Class<?> imageSingletons = Class.forName("org.graalvm.nativeimage.ImageSingletons");
+
+            // Check if ContinuationsFeature is registered
+            var containsMethod = imageSingletons.getMethod("contains", Class.class);
+            if (!(boolean) containsMethod.invoke(null, contFeatureClass)) {
+                System.out.println("[FixHostedOptions] ContinuationsFeature not registered, skipping");
+                return;
+            }
+
+            var lookupMethod = imageSingletons.getMethod("lookup", Class.class);
+            Object contFeature = lookupMethod.invoke(null, contFeatureClass);
+
+            // Force supported = Boolean.TRUE via Unsafe
+            var unsafeField = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
+            unsafeField.setAccessible(true);
+            var unsafe = (sun.misc.Unsafe) unsafeField.get(null);
+
+            var supportedField = contFeatureClass.getDeclaredField("supported");
+            long offset = unsafe.objectFieldOffset(supportedField);
+            Object oldValue = unsafe.getObject(contFeature, offset);
+            unsafe.putObject(contFeature, offset, Boolean.TRUE);
+            System.out.println("[FixHostedOptions] Forced ContinuationsFeature.supported = true (was " + oldValue + ")");
+        } catch (Exception e) {
+            System.err.println("[FixHostedOptions] Warning (continuations): " + e.getClass().getSimpleName() + ": " + e.getMessage());
         }
     }
 
