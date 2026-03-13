@@ -96,7 +96,7 @@ public class LazySeq implements ISeq, Seqable, Sequential, IPending {
         ISeq s = seq();
         if (s != null) return s.equiv(o);
         return (o instanceof Sequential || o instanceof java.util.List) &&
-                RT.seq(o) == null;
+                ClojureRT.seq(o) == null;
     }
 
     @Override

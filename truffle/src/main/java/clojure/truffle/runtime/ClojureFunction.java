@@ -5,7 +5,7 @@ import clojure.lang.IFn;
 import clojure.lang.ISeq;
 import clojure.lang.IPersistentMap;
 import clojure.lang.PersistentArrayMap;
-import clojure.lang.RT;
+import clojure.truffle.runtime.ClojureRT;
 import com.oracle.truffle.api.CallTarget;
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 
@@ -145,7 +145,7 @@ public class ClojureFunction extends AFn {
 
     @Override
     public Object applyTo(ISeq arglist) {
-        Object[] args = RT.seqToArray(arglist);
+        Object[] args = ClojureRT.seqToArray(arglist);
         return doInvoke(args);
     }
 

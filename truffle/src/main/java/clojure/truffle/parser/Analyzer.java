@@ -12,6 +12,7 @@ import clojure.truffle.runtime.ClojureNamespace;
 import clojure.truffle.runtime.ClojureNil;
 import clojure.truffle.runtime.ClojureProtocol;
 import clojure.truffle.runtime.MultiArityFunction;
+import clojure.truffle.runtime.ClojureRT;
 import com.oracle.truffle.api.CallTarget;
 import com.oracle.truffle.api.frame.FrameDescriptor;
 import com.oracle.truffle.api.frame.FrameSlotKind;
@@ -154,7 +155,7 @@ public class Analyzer {
             java.util.List<ExpressionNode> nodes = new java.util.ArrayList<>();
             java.io.PushbackReader reader = new java.io.PushbackReader(new java.io.StringReader(source), 2);
             while (true) {
-                Object form = clojure.lang.LispReader.read(reader, false, EOF, false, getReadOpts());
+                Object form = clojure.lang.TruffleReader.read(reader, false, EOF, false, getReadOpts());
                 if (form == EOF) break;
                 ExpressionNode node = analyze(form);
                 nodes.add(node);
@@ -193,7 +194,7 @@ public class Analyzer {
         PushbackReader reader = new PushbackReader(new StringReader(source), 2);
         try {
             while (true) {
-                Object form = LispReader.read(reader, false, EOF, false, getReadOpts());
+                Object form = TruffleReader.read(reader, false, EOF, false, getReadOpts());
                 if (form == EOF) {
                     if (context != null && "clojure.spec.alpha".equals(context.getCurrentNamespace())) {
                         if (ClojureContext.DEBUG) System.err.println("[LOAD-EOF] after " + formCount + " forms, source length=" + source.length());
@@ -268,7 +269,7 @@ public class Analyzer {
     private static volatile Object READ_OPTS;
     private static Object getReadOpts() {
         if (READ_OPTS == null) {
-            READ_OPTS = clojure.truffle.runtime.ClojureRT.map(LispReader.OPT_READ_COND, LispReader.COND_ALLOW);
+            READ_OPTS = clojure.truffle.runtime.ClojureRT.map(TruffleReader.OPT_READ_COND, TruffleReader.COND_ALLOW);
         }
         return READ_OPTS;
     }
@@ -278,7 +279,7 @@ public class Analyzer {
         PushbackReader reader = new PushbackReader(new StringReader(source), 2);
         try {
             while (true) {
-                Object form = LispReader.read(reader, false, EOF, false, getReadOpts());
+                Object form = TruffleReader.read(reader, false, EOF, false, getReadOpts());
                 if (form == EOF) break;
                 forms.add(form);
             }
@@ -691,7 +692,7 @@ public class Analyzer {
         for (int i = 0; i < params.count(); i++) {
             newParams.add(params.nth(i));
         }
-        return RT.vector(newParams.toArray());
+        return ClojureRT.vector(newParams.toArray());
     }
 
     /**
@@ -731,11 +732,11 @@ public class Analyzer {
             // Multi arity: each element is ([params] body...)
             for (ISeq s = rest; s != null; s = s.next()) {
                 Object arity = s.first();
-                ISeq aritySeq = RT.seq(arity);
+                ISeq aritySeq = ClojureRT.seq(arity);
                 if (aritySeq != null && aritySeq.first() instanceof IPersistentVector) {
                     IPersistentVector params = (IPersistentVector) aritySeq.first();
                     IPersistentVector newParams = prependFormEnvParams(params);
-                    transformed.add(RT.cons(newParams, aritySeq.next()));
+                    transformed.add(ClojureRT.cons(newParams, aritySeq.next()));
                 } else {
                     transformed.add(arity); // pass through (e.g., metadata)
                 }
@@ -756,7 +757,7 @@ public class Analyzer {
         ISeq transformedArgs = addImplicitMacroParams(args);
 
         // Build (fn* name [&form &env params...] body...) and compile it
-        ISeq fnForm = RT.cons(Symbol.intern("fn*"), transformedArgs);
+        ISeq fnForm = ClojureRT.cons(Symbol.intern("fn*"), transformedArgs);
         ExpressionNode fnNode = analyzeFn(fnForm);
 
         // Check if the fn captures from an outer scope
@@ -830,8 +831,8 @@ public class Analyzer {
         if (target instanceof ISeq targetSeq) {
             Object head = targetSeq.first();
             if (head instanceof Symbol dotSym && ".".equals(dotSym.getName())) {
-                Object classObj = RT.second(targetSeq);
-                Object fieldObj = RT.third(targetSeq);
+                Object classObj = ClojureRT.second(targetSeq);
+                Object fieldObj = ClojureRT.third(targetSeq);
                 if (classObj instanceof Symbol classSym && fieldObj instanceof Symbol fieldSym) {
                     String className = classSym.getName();
                     String fieldName = fieldSym.getName();
@@ -865,9 +866,9 @@ public class Analyzer {
         // Build: (let [s__temp (seq coll)] (when s__temp (let [sym (first s__temp)] body...)))
         Symbol tempSym = Symbol.intern("__when-first-temp__" + System.nanoTime());
         // (seq coll)
-        Object seqCall = RT.list(Symbol.intern("seq"), coll);
+        Object seqCall = ClojureRT.list(Symbol.intern("seq"), coll);
         // (first s__temp)
-        Object firstCall = RT.list(Symbol.intern("first"), tempSym);
+        Object firstCall = ClojureRT.list(Symbol.intern("first"), tempSym);
         // (let [sym (first s__temp)] body...)
         List<Object> innerLetForms = new ArrayList<>();
         innerLetForms.add(Symbol.intern("let"));
@@ -875,9 +876,9 @@ public class Analyzer {
         while (body != null) { innerLetForms.add(body.first()); body = body.next(); }
         Object innerLet = PersistentList.create(innerLetForms);
         // (when s__temp innerLet)
-        Object whenForm = RT.list(Symbol.intern("when"), tempSym, innerLet);
+        Object whenForm = ClojureRT.list(Symbol.intern("when"), tempSym, innerLet);
         // (let [s__temp (seq coll)] whenForm)
-        Object outerLet = RT.list(Symbol.intern("let"),
+        Object outerLet = ClojureRT.list(Symbol.intern("let"),
                 PersistentVector.create(tempSym, seqCall), whenForm);
         return analyze(outerLet);
     }
@@ -912,8 +913,8 @@ public class Analyzer {
 
     private ExpressionNode analyzeLambdaThunk(ISeq body) {
         // Wrap body in (fn* [] body...)
-        ISeq fnForm = RT.cons(Symbol.intern("fn*"),
-                RT.cons(PersistentVector.EMPTY, body));
+        ISeq fnForm = ClojureRT.cons(Symbol.intern("fn*"),
+                ClojureRT.cons(PersistentVector.EMPTY, body));
         return analyzeFn(fnForm);
     }
 
@@ -926,8 +927,8 @@ public class Analyzer {
             return new QuoteNode(PersistentList.EMPTY);
         }
         // Build: (lazy-seq (concat xs ys ...))
-        ISeq concatForm = RT.cons(Symbol.intern("concat"), args);
-        ISeq lazySeqForm = RT.list(Symbol.intern("lazy-seq"), concatForm);
+        ISeq concatForm = ClojureRT.cons(Symbol.intern("concat"), args);
+        ISeq lazySeqForm = ClojureRT.list(Symbol.intern("lazy-seq"), concatForm);
         return analyzeLazySeq(lazySeqForm);
     }
 
@@ -987,7 +988,7 @@ public class Analyzer {
         for (Symbol p : params) callForms.add(p);
         Object callForm = PersistentList.create(callForms);
         // Build (fn [target__ arg1 ...] (.methodName target__ arg1 ...))
-        Object fnForm = RT.list(Symbol.intern("fn"),
+        Object fnForm = ClojureRT.list(Symbol.intern("fn"),
                 PersistentVector.create(params.toArray()), callForm);
         return analyze(fnForm);
     }
@@ -1239,8 +1240,8 @@ public class Analyzer {
         // (lazy-seq body...) -> wrap body in (fn* [] body...) then LazySeqNode
         ISeq body = seq.next();
         // Build: (fn* [] body...)
-        ISeq fnForm = RT.cons(Symbol.intern("fn*"),
-                RT.cons(PersistentVector.EMPTY, body));
+        ISeq fnForm = ClojureRT.cons(Symbol.intern("fn*"),
+                ClojureRT.cons(PersistentVector.EMPTY, body));
         ExpressionNode thunkNode = analyzeFn(fnForm);
         return new LazySeqNode(thunkNode);
     }
@@ -1450,7 +1451,7 @@ public class Analyzer {
         if (args == null) throw err("defmethod: missing fn body");
 
         // Build fn from remaining args: [params] body...
-        ISeq fnForm = RT.cons(Symbol.intern("fn*"), args);
+        ISeq fnForm = ClojureRT.cons(Symbol.intern("fn*"), args);
         ExpressionNode fnNode = analyzeFn(fnForm);
 
         return new ExpressionNode() {
@@ -1683,7 +1684,7 @@ public class Analyzer {
             if (paramNames.contains(fieldName)) continue;
             letBindings.add(Symbol.intern(fieldName));
             // (.-fieldName this-param)
-            letBindings.add(RT.list(Symbol.intern(".-" + fieldName), thisSym));
+            letBindings.add(ClojureRT.list(Symbol.intern(".-" + fieldName), thisSym));
         }
 
         Object wrappedBody;
@@ -1692,16 +1693,16 @@ public class Analyzer {
         } else {
             // (let [bindings...] body...)
             IPersistentVector bindVec = PersistentVector.create(letBindings);
-            wrappedBody = RT.cons(Symbol.intern("let"), RT.cons(bindVec, body));
-            wrappedBody = RT.list(wrappedBody);
+            wrappedBody = ClojureRT.cons(Symbol.intern("let"), ClojureRT.cons(bindVec, body));
+            wrappedBody = ClojureRT.list(wrappedBody);
         }
 
         // (fn* [params] wrapped-body)
         ISeq fnSeq;
         if (wrappedBody instanceof ISeq ws) {
-            fnSeq = RT.cons(Symbol.intern("fn*"), RT.cons(params, ws));
+            fnSeq = ClojureRT.cons(Symbol.intern("fn*"), ClojureRT.cons(params, ws));
         } else {
-            fnSeq = RT.list(Symbol.intern("fn*"), params, wrappedBody);
+            fnSeq = ClojureRT.list(Symbol.intern("fn*"), params, wrappedBody);
         }
         return analyzeFn(fnSeq);
     }
@@ -1731,7 +1732,7 @@ public class Analyzer {
             for (String fieldName : fieldNames) {
                 if (paramNames.contains(fieldName)) continue;
                 letBindings.add(Symbol.intern(fieldName));
-                letBindings.add(RT.list(Symbol.intern(".-" + fieldName), thisSym));
+                letBindings.add(ClojureRT.list(Symbol.intern(".-" + fieldName), thisSym));
             }
 
             ISeq wrappedBody;
@@ -1739,16 +1740,16 @@ public class Analyzer {
                 wrappedBody = body;
             } else {
                 IPersistentVector bindVec = PersistentVector.create(letBindings);
-                Object letForm = RT.cons(Symbol.intern("let"), RT.cons(bindVec, body));
-                wrappedBody = RT.list(letForm);
+                Object letForm = ClojureRT.cons(Symbol.intern("let"), ClojureRT.cons(bindVec, body));
+                wrappedBody = ClojureRT.list(letForm);
             }
 
             // ([params] wrapped-body...)
-            arityForms.add(RT.cons(params, wrappedBody));
+            arityForms.add(ClojureRT.cons(params, wrappedBody));
         }
 
         // (fn* ([params1] body1) ([params2] body2) ...)
-        ISeq fnSeq = RT.cons(Symbol.intern("fn*"), PersistentList.create(arityForms));
+        ISeq fnSeq = ClojureRT.cons(Symbol.intern("fn*"), PersistentList.create(arityForms));
         return analyzeFn(fnSeq);
     }
 
@@ -1764,10 +1765,10 @@ public class Analyzer {
             Object step = args.first();
             if (step instanceof ISeq stepSeq) {
                 // Insert form as first arg: (f a b) -> (f form a b)
-                form = RT.cons(stepSeq.first(), RT.cons(form, stepSeq.next()));
+                form = ClojureRT.cons(stepSeq.first(), ClojureRT.cons(form, stepSeq.next()));
             } else {
                 // Bare symbol: (f) -> (f form)
-                form = RT.list(step, form);
+                form = ClojureRT.list(step, form);
             }
             args = args.next();
         }
@@ -1789,7 +1790,7 @@ public class Analyzer {
                 newList.add(form);
                 form = PersistentList.create(newList);
             } else {
-                form = RT.list(step, form);
+                form = ClojureRT.list(step, form);
             }
             args = args.next();
         }
@@ -1815,7 +1816,7 @@ public class Analyzer {
             bindings.add(args.first());
             args = args.next();
         }
-        Object letForm = RT.list(Symbol.intern("let"),
+        Object letForm = ClojureRT.list(Symbol.intern("let"),
                 PersistentVector.create(bindings), nameSym);
         return analyze(letForm);
     }
@@ -1835,7 +1836,7 @@ public class Analyzer {
             Object threadedForm;
             if (step instanceof ISeq stepSeq) {
                 if (first) {
-                    threadedForm = RT.cons(stepSeq.first(), RT.cons(tmpSym, stepSeq.next()));
+                    threadedForm = ClojureRT.cons(stepSeq.first(), ClojureRT.cons(tmpSym, stepSeq.next()));
                 } else {
                     java.util.List<Object> newList = new ArrayList<>();
                     for (ISeq s = stepSeq; s != null; s = s.next()) newList.add(s.first());
@@ -1843,16 +1844,16 @@ public class Analyzer {
                     threadedForm = PersistentList.create(newList);
                 }
             } else {
-                threadedForm = RT.list(step, tmpSym);
+                threadedForm = ClojureRT.list(step, tmpSym);
             }
             // (if (nil? t) nil threadedForm)
             bindings.add(tmpSym);
-            bindings.add(RT.list(Symbol.intern("if"),
-                    RT.list(Symbol.intern("nil?"), tmpSym),
+            bindings.add(ClojureRT.list(Symbol.intern("if"),
+                    ClojureRT.list(Symbol.intern("nil?"), tmpSym),
                     null, threadedForm));
             args = args.next();
         }
-        return analyze(RT.list(Symbol.intern("let"),
+        return analyze(ClojureRT.list(Symbol.intern("let"),
                 PersistentVector.create(bindings), tmpSym));
     }
 
@@ -1874,7 +1875,7 @@ public class Analyzer {
             Object threadedForm;
             if (step instanceof ISeq stepSeq) {
                 if (first) {
-                    threadedForm = RT.cons(stepSeq.first(), RT.cons(tmpSym, stepSeq.next()));
+                    threadedForm = ClojureRT.cons(stepSeq.first(), ClojureRT.cons(tmpSym, stepSeq.next()));
                 } else {
                     java.util.List<Object> newList = new ArrayList<>();
                     for (ISeq s = stepSeq; s != null; s = s.next()) newList.add(s.first());
@@ -1882,13 +1883,13 @@ public class Analyzer {
                     threadedForm = PersistentList.create(newList);
                 }
             } else {
-                threadedForm = RT.list(step, tmpSym);
+                threadedForm = ClojureRT.list(step, tmpSym);
             }
             bindings.add(tmpSym);
-            bindings.add(RT.list(Symbol.intern("if"), test, threadedForm, tmpSym));
+            bindings.add(ClojureRT.list(Symbol.intern("if"), test, threadedForm, tmpSym));
             args = args.next();
         }
-        return analyze(RT.list(Symbol.intern("let"),
+        return analyze(ClojureRT.list(Symbol.intern("let"),
                 PersistentVector.create(bindings), tmpSym));
     }
 
@@ -1903,9 +1904,9 @@ public class Analyzer {
         while (args != null) {
             Object step = args.first();
             if (step instanceof ISeq stepSeq) {
-                body.add(RT.cons(stepSeq.first(), RT.cons(tmpSym, stepSeq.next())));
+                body.add(ClojureRT.cons(stepSeq.first(), ClojureRT.cons(tmpSym, stepSeq.next())));
             } else {
-                body.add(RT.list(step, tmpSym));
+                body.add(ClojureRT.list(step, tmpSym));
             }
             args = args.next();
         }
@@ -1926,10 +1927,10 @@ public class Analyzer {
         while (args != null) {
             Object step = args.first();
             if (step instanceof Symbol sym) {
-                form = RT.list(Symbol.intern("." + sym.getName()), form);
+                form = ClojureRT.list(Symbol.intern("." + sym.getName()), form);
             } else if (step instanceof ISeq stepSeq) {
-                form = RT.cons(Symbol.intern("." + ((Symbol) stepSeq.first()).getName()),
-                        RT.cons(form, stepSeq.next()));
+                form = ClojureRT.cons(Symbol.intern("." + ((Symbol) stepSeq.first()).getName()),
+                        ClojureRT.cons(form, stepSeq.next()));
             }
             args = args.next();
         }
@@ -1962,12 +1963,12 @@ public class Analyzer {
             args = args.next();
             Object thenForm = args != null ? args.first() : null;
             Object elseForm = (args != null && args.next() != null) ? args.next().first() : null;
-            IPersistentVector firstPair = RT.vector(bindings.nth(0), bindings.nth(1));
+            IPersistentVector firstPair = ClojureRT.vector(bindings.nth(0), bindings.nth(1));
             java.util.List<Object> restBindings = new ArrayList<>();
             for (int i = 2; i < bindings.count(); i++) restBindings.add(bindings.nth(i));
             IPersistentVector restVec = PersistentVector.create(restBindings);
-            Object innerIfLet = RT.list(Symbol.intern("if-let"), restVec, thenForm, elseForm);
-            return analyze(RT.list(Symbol.intern("if-let"), firstPair, innerIfLet, elseForm));
+            Object innerIfLet = ClojureRT.list(Symbol.intern("if-let"), restVec, thenForm, elseForm);
+            return analyze(ClojureRT.list(Symbol.intern("if-let"), firstPair, innerIfLet, elseForm));
         }
         args = args.next();
         Object thenForm = args != null ? args.first() : null;
@@ -1976,16 +1977,16 @@ public class Analyzer {
         Object initExpr = bindings.nth(1);
         if (bindingForm instanceof Symbol) {
             // Simple case: (let [x expr] (if x then else))
-            return analyze(RT.list(Symbol.intern("let"), bindings,
-                    RT.list(Symbol.intern("if"), bindingForm, thenForm, elseForm)));
+            return analyze(ClojureRT.list(Symbol.intern("let"), bindings,
+                    ClojureRT.list(Symbol.intern("if"), bindingForm, thenForm, elseForm)));
         } else {
             // Destructuring case: use temp var for the test
             Symbol temp = Symbol.intern("__if_let_tmp__");
-            return analyze(RT.list(Symbol.intern("let"),
-                    RT.vector(temp, initExpr),
-                    RT.list(Symbol.intern("if"), temp,
-                            RT.list(Symbol.intern("let"),
-                                    RT.vector(bindingForm, temp),
+            return analyze(ClojureRT.list(Symbol.intern("let"),
+                    ClojureRT.vector(temp, initExpr),
+                    ClojureRT.list(Symbol.intern("if"), temp,
+                            ClojureRT.list(Symbol.intern("let"),
+                                    ClojureRT.vector(bindingForm, temp),
                                     thenForm),
                             elseForm)));
         }
@@ -2001,14 +2002,14 @@ public class Analyzer {
         ISeq body = args.next();
         // Handle empty bindings
         if (bindings.count() == 0) {
-            return body != null ? analyzeDo(RT.cons(Symbol.intern("do"), body)) : new NilNode();
+            return body != null ? analyzeDo(ClojureRT.cons(Symbol.intern("do"), body)) : new NilNode();
         }
         if (bindings.count() % 2 != 0) {
             throw err("when-let: binding must have even number of forms, got " + bindings.count());
         }
         // Multiple binding pairs: chain into nested when-let
         if (bindings.count() > 2) {
-            IPersistentVector firstPair = RT.vector(bindings.nth(0), bindings.nth(1));
+            IPersistentVector firstPair = ClojureRT.vector(bindings.nth(0), bindings.nth(1));
             java.util.List<Object> restBindings = new ArrayList<>();
             for (int i = 2; i < bindings.count(); i++) restBindings.add(bindings.nth(i));
             IPersistentVector restVec = PersistentVector.create(restBindings);
@@ -2017,7 +2018,7 @@ public class Analyzer {
             innerForm.add(Symbol.intern("when-let"));
             innerForm.add(restVec);
             while (body != null) { innerForm.add(body.first()); body = body.next(); }
-            return analyze(RT.list(Symbol.intern("when-let"), firstPair,
+            return analyze(ClojureRT.list(Symbol.intern("when-let"), firstPair,
                     PersistentList.create(innerForm)));
         }
         Object bindingForm = bindings.nth(0);
@@ -2028,18 +2029,18 @@ public class Analyzer {
             whenForm.add(Symbol.intern("when"));
             whenForm.add(bindingForm);
             while (body != null) { whenForm.add(body.first()); body = body.next(); }
-            return analyze(RT.list(Symbol.intern("let"), bindings,
+            return analyze(ClojureRT.list(Symbol.intern("let"), bindings,
                     PersistentList.create(whenForm)));
         } else {
             // Destructuring case: use temp var for the test
             Symbol temp = Symbol.intern("__when_let_tmp__");
             java.util.List<Object> innerBody = new ArrayList<>();
             innerBody.add(Symbol.intern("let"));
-            innerBody.add(RT.vector(bindingForm, temp));
+            innerBody.add(ClojureRT.vector(bindingForm, temp));
             while (body != null) { innerBody.add(body.first()); body = body.next(); }
-            return analyze(RT.list(Symbol.intern("let"),
-                    RT.vector(temp, initExpr),
-                    RT.list(Symbol.intern("when"), temp,
+            return analyze(ClojureRT.list(Symbol.intern("let"),
+                    ClojureRT.vector(temp, initExpr),
+                    ClojureRT.list(Symbol.intern("when"), temp,
                             PersistentList.create(innerBody))));
         }
     }
@@ -2052,9 +2053,9 @@ public class Analyzer {
         args = args.next();
         Object thenForm = args != null ? args.first() : null;
         Object elseForm = (args != null && args.next() != null) ? args.next().first() : null;
-        return analyze(RT.list(Symbol.intern("let"), bindings,
-                RT.list(Symbol.intern("if"),
-                        RT.list(Symbol.intern("not"), RT.list(Symbol.intern("nil?"), bindings.nth(0))),
+        return analyze(ClojureRT.list(Symbol.intern("let"), bindings,
+                ClojureRT.list(Symbol.intern("if"),
+                        ClojureRT.list(Symbol.intern("not"), ClojureRT.list(Symbol.intern("nil?"), bindings.nth(0))),
                         thenForm, elseForm)));
     }
 
@@ -2065,9 +2066,9 @@ public class Analyzer {
         ISeq body = args.next();
         java.util.List<Object> whenForm = new ArrayList<>();
         whenForm.add(Symbol.intern("when"));
-        whenForm.add(RT.list(Symbol.intern("not"), RT.list(Symbol.intern("nil?"), bindings.nth(0))));
+        whenForm.add(ClojureRT.list(Symbol.intern("not"), ClojureRT.list(Symbol.intern("nil?"), bindings.nth(0))));
         while (body != null) { whenForm.add(body.first()); body = body.next(); }
-        return analyze(RT.list(Symbol.intern("let"), bindings,
+        return analyze(ClojureRT.list(Symbol.intern("let"), bindings,
                 PersistentList.create(whenForm)));
     }
 
@@ -2117,7 +2118,7 @@ public class Analyzer {
             if (matchVal instanceof ISeq || matchVal instanceof IPersistentVector) {
                 // Multiple test values — generate (or (= tmp v1) (= tmp v2) ...)
                 List<ExpressionNode> tests = new ArrayList<>();
-                for (ISeq s = RT.seq(matchVal); s != null; s = s.next()) {
+                for (ISeq s = ClojureRT.seq(matchVal); s != null; s = s.next()) {
                     Object v = s.first();
                     ExpressionNode vNode = new QuoteNode(v);
                     tests.add(new InvokeNode(
@@ -2163,7 +2164,7 @@ public class Analyzer {
         if (pos >= bindings.count()) {
             // All bindings consumed, analyze body
             if (body.next() == null) return analyze(body.first());
-            return analyzeDo(RT.cons(Symbol.intern("do"), body));
+            return analyzeDo(ClojureRT.cons(Symbol.intern("do"), body));
         }
 
         Object key = bindings.nth(pos);
@@ -2217,7 +2218,7 @@ public class Analyzer {
         if (key instanceof Keyword kw && kw.getName().equals("let")) {
             IPersistentVector letBindings = (IPersistentVector) bindings.nth(pos + 1);
             Object innerForm = buildForInner(bindings, pos + 2, body);
-            return analyze(RT.list(Symbol.intern("let"), letBindings, innerForm));
+            return analyze(ClojureRT.list(Symbol.intern("let"), letBindings, innerForm));
         }
 
         // Normal binding: sym or destructuring pattern
@@ -2239,26 +2240,26 @@ public class Analyzer {
             // Last binding: (map (fn [sym] body) coll)
             Object bodyExpr = body.first();
             if (bodyWrapper != null) {
-                bodyExpr = RT.list(Symbol.intern("let"),
+                bodyExpr = ClojureRT.list(Symbol.intern("let"),
                         PersistentVector.create(java.util.List.of(bodyWrapper, paramSym)), bodyExpr);
             }
-            Object fnForm = RT.list(Symbol.intern("fn"),
+            Object fnForm = ClojureRT.list(Symbol.intern("fn"),
                     PersistentVector.create(java.util.List.of(paramSym)),
                     bodyExpr);
-            return analyze(RT.list(Symbol.intern("map"), fnForm, collForm));
+            return analyze(ClojureRT.list(Symbol.intern("map"), fnForm, collForm));
         } else {
             // Not last: (mapcat (fn [sym] (for [rest...] body)) coll)
             IPersistentVector restBindings = PersistentVector.EMPTY;
             for (int i = pos + 2; i < bindings.count(); i++)
                 restBindings = restBindings.cons(bindings.nth(i));
-            Object innerFor = RT.list(Symbol.intern("for"), restBindings, body.first());
+            Object innerFor = ClojureRT.list(Symbol.intern("for"), restBindings, body.first());
             if (bodyWrapper != null) {
-                innerFor = RT.list(Symbol.intern("let"),
+                innerFor = ClojureRT.list(Symbol.intern("let"),
                         PersistentVector.create(java.util.List.of(bodyWrapper, paramSym)), innerFor);
             }
-            Object fnForm = RT.list(Symbol.intern("fn"),
+            Object fnForm = ClojureRT.list(Symbol.intern("fn"),
                     PersistentVector.create(java.util.List.of(paramSym)), innerFor);
-            return analyze(RT.list(Symbol.intern("mapcat"), fnForm, collForm));
+            return analyze(ClojureRT.list(Symbol.intern("mapcat"), fnForm, collForm));
         }
     }
 
@@ -2268,7 +2269,7 @@ public class Analyzer {
         IPersistentVector restBindings = PersistentVector.EMPTY;
         for (int i = pos; i < bindings.count(); i++)
             restBindings = restBindings.cons(bindings.nth(i));
-        return RT.list(Symbol.intern("for"), restBindings, body.first());
+        return ClojureRT.list(Symbol.intern("for"), restBindings, body.first());
     }
 
     private ExpressionNode analyzeDoseq(ISeq seq) {
@@ -2284,8 +2285,8 @@ public class Analyzer {
         java.util.List<Object> doBody = new ArrayList<>();
         doBody.add(Symbol.intern("do"));
         while (body != null) { doBody.add(body.first()); body = body.next(); }
-        Object forForm = RT.list(Symbol.intern("for"), bindings, PersistentList.create(doBody));
-        return analyze(RT.list(Symbol.intern("dorun"), forForm));
+        Object forForm = ClojureRT.list(Symbol.intern("for"), bindings, PersistentList.create(doBody));
+        return analyze(ClojureRT.list(Symbol.intern("dorun"), forForm));
     }
 
     private ExpressionNode analyzeDotimes(ISeq seq) {
@@ -2301,14 +2302,14 @@ public class Analyzer {
         Symbol nSym = Symbol.intern("__dotimes_n__");
         java.util.List<Object> loopBody = new ArrayList<>();
         loopBody.add(Symbol.intern("when"));
-        loopBody.add(RT.list(Symbol.intern("<"), iSym, nSym));
+        loopBody.add(ClojureRT.list(Symbol.intern("<"), iSym, nSym));
         while (body != null) { loopBody.add(body.first()); body = body.next(); }
-        loopBody.add(RT.list(Symbol.intern("recur"), RT.list(Symbol.intern("inc"), iSym)));
+        loopBody.add(ClojureRT.list(Symbol.intern("recur"), ClojureRT.list(Symbol.intern("inc"), iSym)));
 
-        Object loopForm = RT.list(Symbol.intern("loop"),
+        Object loopForm = ClojureRT.list(Symbol.intern("loop"),
                 PersistentVector.create(java.util.List.of(iSym, 0L)),
                 PersistentList.create(loopBody));
-        return analyze(RT.list(Symbol.intern("let"),
+        return analyze(ClojureRT.list(Symbol.intern("let"),
                 PersistentVector.create(java.util.List.of(nSym, nForm)), loopForm));
     }
 
@@ -2352,7 +2353,7 @@ public class Analyzer {
             ISeq fnSpec = (ISeq) fnBindings.nth(i);
             Symbol fnName = (Symbol) fnSpec.first();
             ISeq fnArgs = fnSpec.next();
-            ISeq fnForm = RT.cons(Symbol.intern("fn*"), RT.cons(fnName, fnArgs));
+            ISeq fnForm = ClojureRT.cons(Symbol.intern("fn*"), ClojureRT.cons(fnName, fnArgs));
             ExpressionNode fnNode = analyze(fnForm);
             final int slot = slots.get(i);
             // Create the fn and update its cell
@@ -3230,7 +3231,7 @@ public class Analyzer {
                 letForm.add(body.first());
                 body = body.next();
             }
-            ISeq newSeq = RT.list(Symbol.intern("loop"), newBindings,
+            ISeq newSeq = ClojureRT.list(Symbol.intern("loop"), newBindings,
                     PersistentList.create(letForm));
             return analyzeLoop(newSeq);
         }
@@ -3287,11 +3288,11 @@ public class Analyzer {
                     // We construct (let [bindings] (cond remaining...)) as forms
                     Object condBody;
                     if (remaining != null) {
-                        condBody = RT.cons(Symbol.intern("cond"), remaining);
+                        condBody = ClojureRT.cons(Symbol.intern("cond"), remaining);
                     } else {
                         condBody = null; // nil
                     }
-                    return analyze(RT.list(Symbol.intern("let"), bindings,
+                    return analyze(ClojureRT.list(Symbol.intern("let"), bindings,
                             condBody != null ? condBody : null));
                 }
                 case "do": {
@@ -3368,7 +3369,7 @@ public class Analyzer {
             context.setVarMeta(qname, (clojure.lang.IPersistentMap) resolveVarRefsInMeta(varMeta));
         }
 
-        ISeq fnForm = RT.cons(Symbol.intern("fn*"), args);
+        ISeq fnForm = ClojureRT.cons(Symbol.intern("fn*"), args);
         ExpressionNode fnNode = analyzeFn(fnForm);
         return new DefNode(context, name, fnNode);
     }
@@ -3638,8 +3639,8 @@ public class Analyzer {
         List<Object> doBody = new ArrayList<>();
         doBody.add(Symbol.intern("do"));
         doBody.addAll(body);
-        return analyze(RT.list(Symbol.intern("if"),
-                RT.list(Symbol.intern("not"), test),
+        return analyze(ClojureRT.list(Symbol.intern("if"),
+                ClojureRT.list(Symbol.intern("not"), test),
                 PersistentList.create(doBody),
                 null));
     }
@@ -3652,8 +3653,8 @@ public class Analyzer {
         args = args.next();
         Object thenForm = args != null ? args.first() : null;
         Object elseForm = (args != null && args.next() != null) ? args.next().first() : null;
-        return analyze(RT.list(Symbol.intern("if"),
-                RT.list(Symbol.intern("not"), test),
+        return analyze(ClojureRT.list(Symbol.intern("if"),
+                ClojureRT.list(Symbol.intern("not"), test),
                 thenForm, elseForm));
     }
 
@@ -3678,8 +3679,8 @@ public class Analyzer {
             Object result = args.first();
             args = args.next();
             // (if (pred testVal tmpSym) result ...)
-            body.add(0, RT.list(Symbol.intern("if"),
-                    RT.list(pred, testVal, tmpSym),
+            body.add(0, ClojureRT.list(Symbol.intern("if"),
+                    ClojureRT.list(pred, testVal, tmpSym),
                     result,
                     null)); // placeholder
         }
@@ -3696,7 +3697,7 @@ public class Analyzer {
                 ISeq ifArgs = s.next();
                 Object cond = ifArgs.first();
                 Object then = ifArgs.next().first();
-                item = RT.list(Symbol.intern("if"), cond, then, result);
+                item = ClojureRT.list(Symbol.intern("if"), cond, then, result);
                 result = item;
             } else if (i < body.size() - 1) {
                 // shouldn't happen
@@ -3704,7 +3705,7 @@ public class Analyzer {
             }
         }
         // Wrap in let to evaluate expr once
-        return analyze(RT.list(Symbol.intern("let"),
+        return analyze(ClojureRT.list(Symbol.intern("let"),
                 PersistentVector.create(java.util.List.of(tmpSym, expr)),
                 result));
     }
@@ -3722,8 +3723,8 @@ public class Analyzer {
         whenBody.add(Symbol.intern("when"));
         whenBody.add(test);
         whenBody.addAll(body);
-        whenBody.add(RT.list(Symbol.intern("recur")));
-        return analyze(RT.list(Symbol.intern("loop"),
+        whenBody.add(ClojureRT.list(Symbol.intern("recur")));
+        return analyze(ClojureRT.list(Symbol.intern("loop"),
                 PersistentVector.EMPTY,
                 PersistentList.create(whenBody)));
     }
@@ -3756,7 +3757,7 @@ public class Analyzer {
         List<Object> doForm = new ArrayList<>();
         doForm.add(Symbol.intern("do"));
         doForm.addAll(body);
-        Object fnForm = RT.list(Symbol.intern("fn"), PersistentVector.EMPTY, PersistentList.create(doForm));
+        Object fnForm = ClojureRT.list(Symbol.intern("fn"), PersistentVector.EMPTY, PersistentList.create(doForm));
         // Call the builtin delay function directly using core-qualified name
         ExpressionNode fnNode = analyze(fnForm);
         return new InvokeNode(new SymbolNode(context, "clojure.core/delay"), new ExpressionNode[]{fnNode});
@@ -3985,7 +3986,7 @@ public class Analyzer {
         List<Object> finallyBody = new ArrayList<>();
         for (int i = 0; i < bindings.count(); i += 2) {
             Symbol sym = (Symbol) bindings.nth(i);
-            finallyBody.add(RT.list(Symbol.intern(".close"), sym));
+            finallyBody.add(ClojureRT.list(Symbol.intern(".close"), sym));
         }
         // Build: (let [bindings] (try body... (finally close-forms...)))
         List<Object> tryForm = new ArrayList<>();
@@ -3996,7 +3997,7 @@ public class Analyzer {
         finallyForm.addAll(finallyBody);
         tryForm.add(PersistentList.create(finallyForm));
 
-        return analyze(RT.list(Symbol.intern("let"), bindings, PersistentList.create(tryForm)));
+        return analyze(ClojureRT.list(Symbol.intern("let"), bindings, PersistentList.create(tryForm)));
     }
 
     /**
@@ -4046,8 +4047,8 @@ public class Analyzer {
     private ExpressionNode analyzeWithOutStr(ISeq seq) {
         // (with-out-str body...) => wrap body in fn thunk, invoke with-out-str builtin
         ISeq body = seq.next();
-        Object fnForm = RT.cons(Symbol.intern("fn"),
-                RT.cons(PersistentVector.EMPTY, body));
+        Object fnForm = ClojureRT.cons(Symbol.intern("fn"),
+                ClojureRT.cons(PersistentVector.EMPTY, body));
         ExpressionNode thunkNode = analyze(fnForm);
         ExpressionNode wosNode = new SymbolNode(context, "with-out-str");
         return new InvokeNode(wosNode, new ExpressionNode[]{thunkNode});
@@ -4056,8 +4057,8 @@ public class Analyzer {
     private ExpressionNode analyzeFuture(ISeq seq) {
         // (future body...) => (future-call (fn [] body...))
         ISeq body = seq.next();
-        Object fnForm = RT.cons(Symbol.intern("fn"),
-                RT.cons(PersistentVector.EMPTY, body));
+        Object fnForm = ClojureRT.cons(Symbol.intern("fn"),
+                ClojureRT.cons(PersistentVector.EMPTY, body));
         ExpressionNode thunkNode = analyze(fnForm);
         ExpressionNode futureCallNode = new SymbolNode(context, "future-call");
         return new InvokeNode(futureCallNode, new ExpressionNode[]{thunkNode});

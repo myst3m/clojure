@@ -878,7 +878,7 @@ public class ClojureContext {
                 throw new RuntimeException("read-string: expected a string");
             try {
                 java.io.PushbackReader r = new java.io.PushbackReader(new java.io.StringReader(s), 2);
-                return clojure.lang.LispReader.read(r, true, null, false, null);
+                return clojure.lang.TruffleReader.read(r, true, null, false, null);
             } catch (Exception e) {
                 throw new RuntimeException("read-string: " + e.getMessage(), e);
             }
@@ -4445,7 +4445,7 @@ public class ClojureContext {
             String s = args[0].toString();
             try {
                 java.io.PushbackReader rdr = new java.io.PushbackReader(new java.io.StringReader(s));
-                Object form = clojure.lang.LispReader.read(rdr, true, null, false, null);
+                Object form = clojure.lang.TruffleReader.read(rdr, true, null, false, null);
                 return form == null ? ClojureNil.INSTANCE : form;
             } catch (Exception e) {
                 throw new RuntimeException("read-string: " + e.getMessage());

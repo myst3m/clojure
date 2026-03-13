@@ -150,4 +150,54 @@ public final class ClojureRT {
         }
         return result;
     }
+
+    public static IPersistentVector vector(Object... init) {
+        return LazilyPersistentVector.createOwning(init);
+    }
+
+    public static Object first(Object x) {
+        if (x instanceof ISeq) return ((ISeq) x).first();
+        ISeq s = seq(x);
+        if (s == null) return null;
+        return s.first();
+    }
+
+    public static Object second(Object x) {
+        return first(next(x));
+    }
+
+    public static Object third(Object x) {
+        return first(next(next(x)));
+    }
+
+    public static ISeq next(Object x) {
+        if (x instanceof ISeq) return ((ISeq) x).next();
+        ISeq s = seq(x);
+        if (s == null) return null;
+        return s.next();
+    }
+
+    public static ISeq cons(Object x, Object coll) {
+        if (coll == null) return new PersistentList(x);
+        else if (coll instanceof ISeq) return new Cons(x, (ISeq) coll);
+        else return new Cons(x, seq(coll));
+    }
+
+    public static ISeq list() { return null; }
+    public static ISeq list(Object a1) { return new PersistentList(a1); }
+    public static ISeq list(Object a1, Object a2) { return listStar(a1, a2, null); }
+    public static ISeq list(Object a1, Object a2, Object a3) { return listStar(a1, a2, a3, null); }
+    public static ISeq list(Object a1, Object a2, Object a3, Object a4) { return listStar(a1, a2, a3, a4, null); }
+    public static ISeq list(Object a1, Object a2, Object a3, Object a4, Object a5) { return listStar(a1, a2, a3, a4, a5, null); }
+
+    public static ISeq listStar(Object a1, ISeq rest) { return (ISeq) cons(a1, rest); }
+    public static ISeq listStar(Object a1, Object a2, ISeq rest) { return (ISeq) cons(a1, cons(a2, rest)); }
+    public static ISeq listStar(Object a1, Object a2, Object a3, ISeq rest) { return (ISeq) cons(a1, cons(a2, cons(a3, rest))); }
+    public static ISeq listStar(Object a1, Object a2, Object a3, Object a4, ISeq rest) { return (ISeq) cons(a1, cons(a2, cons(a3, cons(a4, rest)))); }
+    public static ISeq listStar(Object a1, Object a2, Object a3, Object a4, Object a5, ISeq rest) { return (ISeq) cons(a1, cons(a2, cons(a3, cons(a4, cons(a5, rest))))); }
+
+    public static Associative assoc(Object coll, Object key, Object val) {
+        if (coll == null) return new PersistentArrayMap(new Object[]{key, val});
+        return ((Associative) coll).assoc(key, val);
+    }
 }

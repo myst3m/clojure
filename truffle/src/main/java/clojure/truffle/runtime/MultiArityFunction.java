@@ -3,7 +3,7 @@ package clojure.truffle.runtime;
 import clojure.lang.AFn;
 import clojure.lang.ISeq;
 import clojure.lang.IPersistentMap;
-import clojure.lang.RT;
+import clojure.truffle.runtime.ClojureRT;
 
 public class MultiArityFunction extends AFn {
     private final int[] arities;
@@ -92,7 +92,7 @@ public class MultiArityFunction extends AFn {
 
     @Override
     public Object applyTo(ISeq arglist) {
-        Object[] args = RT.seqToArray(arglist);
+        Object[] args = ClojureRT.seqToArray(arglist);
         return doInvoke(args);
     }
 
