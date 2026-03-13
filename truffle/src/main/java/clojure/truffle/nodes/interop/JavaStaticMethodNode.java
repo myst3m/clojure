@@ -38,6 +38,7 @@ public class JavaStaticMethodNode extends ExpressionNode {
             Throwable cause = e.getCause();
             if (cause instanceof RuntimeException re) throw re;
             if (cause instanceof Error err) throw err;
+            if (cause instanceof Exception ex) throw new RuntimeException(ex.toString(), cause);
             throw new RuntimeException(cause);
         } catch (Exception e) {
             throw new RuntimeException("Static method invocation failed: " + clazz.getName() +

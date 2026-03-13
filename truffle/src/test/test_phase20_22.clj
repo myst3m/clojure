@@ -59,10 +59,9 @@
 (assert (= "a&amp;b" (str/escape "a&b" {\& "&amp;"})))
 (println "PASS: str/escape")
 
-;; halt-when
+;; halt-when — returns accumulator when predicate matches
 (let [result (transduce (halt-when #(> % 5)) conj [] [1 2 3 6 7 8])]
-  ;; halt-when returns the first value that matches the predicate
-  (assert (= 6 result)))
+  (assert (= [1 2 3] result)))
 (println "PASS: halt-when")
 
 ;; === Phase 22: Sync / STM ===

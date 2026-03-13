@@ -9,6 +9,7 @@ import clojure.truffle.ClojureTruffleLanguage;
 
 import java.util.Map;
 import java.util.LinkedHashMap;
+import clojure.truffle.ClojureContext;
 
 @ExportLibrary(InteropLibrary.class)
 public class ClojureDeftypeInstance implements TruffleObject, clojure.lang.ILookup, clojure.lang.Associative,
@@ -21,6 +22,8 @@ public class ClojureDeftypeInstance implements TruffleObject, clojure.lang.ILook
     private final clojure.lang.IPersistentMap extras;
     // Per-type method implementations (IFn invoke, IDeref deref, etc.)
     private Map<String, Object> methods;
+    // Whether this instance was created via defrecord (vs deftype)
+    private boolean record;
 
     public ClojureDeftypeInstance(String typeName, Object[] fields, Map<String, Integer> fieldIndex) {
         this(typeName, fields, fieldIndex, clojure.lang.PersistentArrayMap.EMPTY);
@@ -36,6 +39,8 @@ public class ClojureDeftypeInstance implements TruffleObject, clojure.lang.ILook
 
     public void setMethods(Map<String, Object> methods) { this.methods = methods; }
     public Object getMethod(String name) { return methods != null ? methods.get(name) : null; }
+    public boolean isRecord() { return record; }
+    public void setRecord(boolean record) { this.record = record; }
 
     public String getTypeName() { return typeName; }
 
@@ -111,6 +116,16 @@ public class ClojureDeftypeInstance implements TruffleObject, clojure.lang.ILook
     // Seqable
     @Override
     public clojure.lang.ISeq seq() {
+        // Check if deftype defines a custom seq method
+        Object seqFn = getMethod("seq");
+        if (seqFn instanceof clojure.lang.IFn fn) {
+            Object result = fn.invoke(this);
+            if (result == null || result instanceof ClojureNil) return null;
+            if (result instanceof clojure.lang.ISeq s) return s;
+            if (result instanceof clojure.lang.Seqable s) return s.seq();
+            return clojure.lang.RT.seq(result);
+        }
+        // Default: treat as map of fields
         java.util.List<Object> entries = new java.util.ArrayList<>();
         for (Map.Entry<String, Integer> e : fieldIndex.entrySet()) {
             entries.add(new clojure.lang.MapEntry(
@@ -125,6 +140,12 @@ public class ClojureDeftypeInstance implements TruffleObject, clojure.lang.ILook
     // Counted
     @Override
     public int count() {
+        // Check if deftype defines a custom count method
+        Object countFn = getMethod("count");
+        if (countFn instanceof clojure.lang.IFn fn) {
+            Object result = fn.invoke(this);
+            return ((Number) result).intValue();
+        }
         return fieldIndex.size() + extras.count();
     }
 

@@ -25,11 +25,10 @@ public class SymbolNode extends ExpressionNode {
             }
         }
         if (value == null) {
-            if ("this".equals(name)) {
-                new RuntimeException("DEBUG: 'this' resolution failed").printStackTrace(System.err);
-            }
             throw new RuntimeException("Unable to resolve symbol: " + name + " in this context");
         }
         return value;
     }
+
+    public String getName() { return name; }
 }

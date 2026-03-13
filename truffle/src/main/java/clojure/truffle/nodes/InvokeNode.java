@@ -89,6 +89,19 @@ public class InvokeNode extends ExpressionNode {
             Object val = s.get(argValues[0]);
             return val == null ? clojure.truffle.runtime.ClojureNil.INSTANCE : val;
         }
+        // IFn (includes NativeFunction via AFn, and Clojure stdlib fns)
+        if (function instanceof clojure.lang.IFn ifn) {
+            return switch (argValues.length) {
+                case 0 -> ifn.invoke();
+                case 1 -> ifn.invoke(argValues[0]);
+                case 2 -> ifn.invoke(argValues[0], argValues[1]);
+                case 3 -> ifn.invoke(argValues[0], argValues[1], argValues[2]);
+                case 4 -> ifn.invoke(argValues[0], argValues[1], argValues[2], argValues[3]);
+                case 5 -> ifn.invoke(argValues[0], argValues[1], argValues[2], argValues[3], argValues[4]);
+                case 6 -> ifn.invoke(argValues[0], argValues[1], argValues[2], argValues[3], argValues[4], argValues[5]);
+                default -> throw new RuntimeException("IFn invoke with " + argValues.length + " args not supported");
+            };
+        }
         // Deftype instances as functions (IFn implementation via type method registry)
         if (function instanceof clojure.truffle.runtime.ClojureDeftypeInstance dt) {
             Object invokeFn = dt.getMethod("invoke");
@@ -114,7 +127,8 @@ public class InvokeNode extends ExpressionNode {
             }
         }
 
+        String fnDesc = (functionNode instanceof SymbolNode sn) ? "symbol=" + sn.getName() : functionNode.getClass().getSimpleName();
         throw new RuntimeException("Cannot invoke: " + function + " (type: " +
-                (function == null ? "null" : function.getClass().getName()) + ")");
+                (function == null ? "null" : function.getClass().getName()) + ", source: " + fnDesc + ")");
     }
 }

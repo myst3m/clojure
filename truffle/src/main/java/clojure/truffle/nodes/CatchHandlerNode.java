@@ -17,11 +17,27 @@ public class CatchHandlerNode extends Node {
     }
 
     public boolean matches(Throwable e) {
-        return exceptionClass.isInstance(e);
+        if (exceptionClass.isInstance(e)) return true;
+        // Check cause chain: Java method invocations wrap checked exceptions in RuntimeException
+        Throwable cause = e.getCause();
+        while (cause != null) {
+            if (exceptionClass.isInstance(cause)) return true;
+            cause = cause.getCause();
+        }
+        return false;
     }
 
     public Object handle(VirtualFrame frame, Throwable e) {
-        frame.setObject(bindingSlot, e);
+        // Bind the most specific matching exception
+        Throwable toBindDirect = exceptionClass.isInstance(e) ? e : null;
+        if (toBindDirect == null) {
+            Throwable cause = e.getCause();
+            while (cause != null) {
+                if (exceptionClass.isInstance(cause)) { toBindDirect = cause; break; }
+                cause = cause.getCause();
+            }
+        }
+        frame.setObject(bindingSlot, toBindDirect != null ? toBindDirect : e);
         return handlerBody.executeGeneric(frame);
     }
 }

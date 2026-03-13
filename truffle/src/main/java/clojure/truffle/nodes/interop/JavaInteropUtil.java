@@ -60,6 +60,33 @@ public class JavaInteropUtil {
                 CLASS_CACHE.put(name, Class.forName("java.io." + name));
             } catch (ClassNotFoundException ignored) {}
         }
+        // clojure.lang.* (needed for native-image where Class.forName may fail)
+        for (String name : new String[]{
+                "MapEntry", "RT", "Keyword", "Symbol", "Var", "Namespace",
+                "PersistentVector", "PersistentHashMap", "PersistentArrayMap",
+                "PersistentHashSet", "PersistentList", "PersistentQueue",
+                "PersistentTreeMap", "PersistentTreeSet", "PersistentStructMap",
+                "LazySeq", "Cons", "ChunkedCons", "Range", "Repeat", "Cycle",
+                "ISeq", "Seqable", "IFn", "AFn", "IObj", "IMeta",
+                "IPersistentMap", "IPersistentVector", "IPersistentSet",
+                "IPersistentList", "IPersistentCollection", "Associative",
+                "Counted", "Indexed", "ILookup", "IHashEq", "Named",
+                "IMapEntry", "IRecord", "IType", "IDeref", "IBlockingDeref",
+                "IRef", "IAtom", "Atom", "Agent", "Ref",
+                "Ratio", "BigInt", "Numbers",
+                "ExceptionInfo", "ArityException",
+                "Compiler", "LispReader", "EdnReader",
+                "MultiFn", "Delay", "Volatile",
+                "APersistentMap", "APersistentVector", "APersistentSet",
+                "ASeq", "AFunction", "AReference", "ARef",
+                "ArraySeq", "StringSeq", "IteratorSeq",
+                "ITransientCollection", "ITransientMap", "ITransientVector", "ITransientSet",
+                "IEditableCollection", "Reduced", "Reversible", "Sorted"
+        }) {
+            try {
+                CLASS_CACHE.put("clojure.lang." + name, Class.forName("clojure.lang." + name));
+            } catch (ClassNotFoundException ignored) {}
+        }
     }
 
     public static Class<?> resolveClass(String name) {
@@ -129,6 +156,25 @@ public class JavaInteropUtil {
         if (best != null && bestScore <= bestVarArgsScore) return best;
         if (bestVarArgs != null) return bestVarArgs;
         return best;
+    }
+
+    public static java.lang.reflect.Field findField(Class<?> clazz, String name) {
+        // Search declared fields up the class hierarchy
+        Class<?> c = clazz;
+        while (c != null) {
+            try {
+                return c.getDeclaredField(name);
+            } catch (NoSuchFieldException e) {
+                // continue
+            }
+            c = c.getSuperclass();
+        }
+        // Also check public fields (includes inherited public fields)
+        try {
+            return clazz.getField(name);
+        } catch (NoSuchFieldException e) {
+            return null;
+        }
     }
 
     private static int matchScore(Class<?>[] paramTypes, Object[] args) {

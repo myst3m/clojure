@@ -6657,6 +6657,53 @@ public class ClojureContext {
             }
         });
 
+        // (require-native 'c "libc.so.6" strlen "(STRING):UINT64" getpid "():SINT32")
+        // Creates namespace, binds native functions, and aliases into current ns
+        defBuiltin("require-native", args -> {
+            if (args.length < 4 || args.length % 2 != 0)
+                throw new RuntimeException("require-native: requires (ns-sym lib-path fn-name sig ...)");
+            String nsName = nsNameFromArg(args[0]);
+            String libPath = args[1].toString();
+
+            // Load library (same as native-load)
+            Object lib;
+            try {
+                com.oracle.truffle.api.source.Source nfiSrc = com.oracle.truffle.api.source.Source.newBuilder("nfi",
+                        "load \"" + libPath + "\"", "load-" + libPath).build();
+                com.oracle.truffle.api.CallTarget ct = env.parseInternal(nfiSrc);
+                lib = ct.call();
+            } catch (Exception e) {
+                throw new RuntimeException("require-native: failed to load " + libPath + ": " + e.getMessage());
+            }
+
+            // Create namespace and bind functions
+            ClojureNamespace ns = getOrCreateNamespace(nsName);
+            com.oracle.truffle.api.interop.InteropLibrary interop =
+                    com.oracle.truffle.api.interop.InteropLibrary.getUncached();
+            for (int i = 2; i < args.length; i += 2) {
+                String fnName = nsNameFromArg(args[i]);
+                String signature = args[i + 1].toString();
+                try {
+                    Object symbol = interop.readMember(lib, fnName);
+                    com.oracle.truffle.api.source.Source sigSrc = com.oracle.truffle.api.source.Source.newBuilder("nfi",
+                            signature, "sig-" + fnName).build();
+                    com.oracle.truffle.api.CallTarget sigCt = env.parseInternal(sigSrc);
+                    Object sig = sigCt.call();
+                    Object bound = interop.invokeMember(sig, "bind", symbol);
+                    ns.intern(fnName, new clojure.truffle.runtime.NativeFunction(fnName, signature, bound));
+                } catch (RuntimeException e) {
+                    throw e;
+                } catch (Exception e) {
+                    throw new RuntimeException("require-native: failed to bind " + fnName + ": " + e.getMessage());
+                }
+            }
+
+            // Alias into current namespace
+            ClojureNamespace currentNs = getOrCreateNamespace(currentNamespace);
+            currentNs.alias(nsName, ns);
+            return clojure.truffle.runtime.ClojureNil.INSTANCE;
+        });
+
         // (native-default) → returns default (process) symbol table
         defBuiltin("native-default", args -> {
             try {

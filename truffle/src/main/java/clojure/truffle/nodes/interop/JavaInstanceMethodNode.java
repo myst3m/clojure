@@ -43,12 +43,23 @@ public class JavaInstanceMethodNode extends ExpressionNode {
                 if (method != null) break;
             }
         }
+        if (method == null && args.length == 0) {
+            // Fall back to field access: (.name obj) may be a public field
+            try {
+                java.lang.reflect.Field field = JavaInteropUtil.findField(clazz, methodName);
+                if (field != null) {
+                    field.setAccessible(true);
+                    return JavaInteropUtil.wrapResult(field.get(target));
+                }
+            } catch (Exception ignored) {}
+        }
         if (method == null) {
             throw new RuntimeException("No such method: " + clazz.getName() + "." + methodName
                     + " with " + args.length + " args");
         }
 
         try {
+            method.setAccessible(true);
             Object[] coerced = JavaInteropUtil.coerceArgs(method, args);
             Object result = method.invoke(target, coerced);
             return JavaInteropUtil.wrapResult(result);

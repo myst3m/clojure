@@ -29,6 +29,7 @@ public class JavaConstructorNode extends ExpressionNode {
         }
 
         try {
+            ctor.setAccessible(true);
             Object[] coerced = JavaInteropUtil.coerceArgs(ctor, args);
             return ctor.newInstance(coerced);
         } catch (java.lang.reflect.InvocationTargetException e) {

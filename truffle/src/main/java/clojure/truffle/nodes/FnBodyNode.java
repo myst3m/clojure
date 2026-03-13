@@ -116,7 +116,8 @@ public class FnBodyNode extends RootNode {
         }
     }
 
-    @Override
+    public int getParamCount() { return paramCount; }
+    public int getVariadicSlot() { return variadicSlot; }
     public String getName() {
         return name != null ? name : "<fn>";
     }
