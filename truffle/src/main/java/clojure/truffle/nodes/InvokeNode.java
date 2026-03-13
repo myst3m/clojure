@@ -1,8 +1,8 @@
 package clojure.truffle.nodes;
 
+import com.oracle.truffle.api.CompilerDirectives;
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 import com.oracle.truffle.api.frame.VirtualFrame;
-import com.oracle.truffle.api.nodes.IndirectCallNode;
 import clojure.truffle.ClojureContext;
 import clojure.truffle.runtime.ClojureFunction;
 import clojure.truffle.runtime.ClojureMultiMethod;
@@ -12,12 +12,12 @@ public class InvokeNode extends ExpressionNode {
 
     @Child private ExpressionNode functionNode;
     @Children private final ExpressionNode[] argumentNodes;
-    @Child private IndirectCallNode callNode;
+    @Child private DispatchNode dispatchNode;
 
     public InvokeNode(ExpressionNode functionNode, ExpressionNode[] argumentNodes) {
         this.functionNode = functionNode;
         this.argumentNodes = argumentNodes;
-        this.callNode = IndirectCallNode.create();
+        this.dispatchNode = DispatchNode.create();
     }
 
     @Override
@@ -38,13 +38,13 @@ public class InvokeNode extends ExpressionNode {
             Object[] callArgs = new Object[argValues.length + 1];
             callArgs[0] = fn;
             System.arraycopy(argValues, 0, callArgs, 1, argValues.length);
-            return callNode.call(fn.getCallTarget(), callArgs);
+            return dispatchNode.executeDispatch(fn.getCallTarget(), callArgs);
         } else if (function instanceof MultiArityFunction maf) {
             ClojureFunction fn = maf.resolve(argValues.length);
             Object[] callArgs = new Object[argValues.length + 1];
             callArgs[0] = fn;
             System.arraycopy(argValues, 0, callArgs, 1, argValues.length);
-            return callNode.call(fn.getCallTarget(), callArgs);
+            return dispatchNode.executeDispatch(fn.getCallTarget(), callArgs);
         } else if (function instanceof ClojureContext.BuiltinFunction builtin) {
             return invokeBuiltin(builtin, argValues);
         } else if (function instanceof ClojureMultiMethod mm) {
@@ -123,7 +123,6 @@ public class InvokeNode extends ExpressionNode {
                 if (invokeFn instanceof ClojureContext.BuiltinFunction bf) {
                     return bf.execute(fnArgs);
                 }
-                // For ClojureFunction/MultiArityFunction in deftype invoke, use callFunction
                 if (invokeFn instanceof ClojureFunction fn2) {
                     Object[] callArgs2 = new Object[fnArgs.length + 1];
                     callArgs2[0] = fn2;

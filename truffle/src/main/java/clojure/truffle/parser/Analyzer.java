@@ -3545,8 +3545,55 @@ public class Analyzer {
     // --- Invoke ---
 
     private ExpressionNode analyzeInvoke(ISeq seq) {
-        ExpressionNode fn = analyze(seq.first());
+        Object head = seq.first();
+
+        // Emit specialized arithmetic nodes for known builtins
+        if (head instanceof Symbol sym && sym.getNamespace() == null) {
+            String name = sym.getName();
+            // Only specialize if not locally shadowed
+            if (currentScope.findLocal(name) == null) {
+                ExpressionNode specialized = trySpecializeArithmetic(name, seq.next());
+                if (specialized != null) return specialized;
+            }
+        }
+
+        ExpressionNode fn = analyze(head);
         return new InvokeNode(fn, analyzeArgList(seq.next()));
+    }
+
+    private ExpressionNode trySpecializeArithmetic(String name, ISeq argSeq) {
+        int argc = countSeq(argSeq);
+
+        // Binary arithmetic: (+ a b), (- a b), (* a b), (/ a b)
+        if (argc == 2) {
+            switch (name) {
+                case "+": return AddNode.create(analyze(argSeq.first()), analyze(argSeq.next().first()));
+                case "-": return SubNode.create(analyze(argSeq.first()), analyze(argSeq.next().first()));
+                case "*": return MulNode.create(analyze(argSeq.first()), analyze(argSeq.next().first()));
+                case "/": return DivNode.create(analyze(argSeq.first()), analyze(argSeq.next().first()));
+                case "<": return CompareNode.create(CompareNode.Op.LT, analyze(argSeq.first()), analyze(argSeq.next().first()));
+                case ">": return CompareNode.create(CompareNode.Op.GT, analyze(argSeq.first()), analyze(argSeq.next().first()));
+                case "<=": return CompareNode.create(CompareNode.Op.LE, analyze(argSeq.first()), analyze(argSeq.next().first()));
+                case ">=": return CompareNode.create(CompareNode.Op.GE, analyze(argSeq.first()), analyze(argSeq.next().first()));
+                case "==": return CompareNode.create(CompareNode.Op.EQ, analyze(argSeq.first()), analyze(argSeq.next().first()));
+            }
+        }
+
+        // Unary: (inc x), (dec x)
+        if (argc == 1) {
+            switch (name) {
+                case "inc": return IncNode.create(analyze(argSeq.first()));
+                case "dec": return DecNode.create(analyze(argSeq.first()));
+            }
+        }
+
+        return null;
+    }
+
+    private static int countSeq(ISeq seq) {
+        int count = 0;
+        for (ISeq s = seq; s != null; s = s.next()) count++;
+        return count;
     }
 
     // --- Collections ---

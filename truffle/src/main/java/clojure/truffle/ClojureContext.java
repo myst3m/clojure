@@ -17,6 +17,8 @@ import clojure.truffle.runtime.ClojureVolatile;
 import clojure.truffle.runtime.LazySeq;
 import clojure.truffle.runtime.MultiArityFunction;
 
+import com.oracle.truffle.api.utilities.CyclicAssumption;
+
 import java.io.PrintStream;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -50,6 +52,9 @@ public class ClojureContext {
     private ClassLoader cpClassLoader;
     // Per-type method registry for deftype methods (IFn, IDeref, etc.)
     private final ConcurrentHashMap<String, ConcurrentHashMap<String, Object>> typeMethodRegistry = new ConcurrentHashMap<>();
+    // Assumptions for var stability — invalidated when a var's value changes.
+    // SymbolNode uses these to cache resolved values during JIT compilation.
+    private final ConcurrentHashMap<String, CyclicAssumption> varAssumptions = new ConcurrentHashMap<>();
 
     @FunctionalInterface
     public interface BuiltinFunction {
@@ -176,6 +181,19 @@ public class ClojureContext {
         // Always intern in current namespace
         ClojureNamespace ns = namespaces.get(currentNamespace);
         if (ns != null) ns.intern(name, value);
+        // Invalidate assumption so JIT-compiled code re-resolves this var
+        invalidateVarAssumption(name);
+    }
+
+    /** Get or create a CyclicAssumption for the given var name. */
+    public CyclicAssumption getVarAssumption(String name) {
+        return varAssumptions.computeIfAbsent(name, k -> new CyclicAssumption("var:" + k));
+    }
+
+    /** Invalidate the assumption for a var, causing JIT-compiled code to deoptimize. */
+    private void invalidateVarAssumption(String name) {
+        CyclicAssumption a = varAssumptions.get(name);
+        if (a != null) a.invalidate("var redefined: " + name);
     }
 
     @TruffleBoundary
@@ -6611,121 +6629,6 @@ public class ClojureContext {
                 }
             }
             return true;
-        });
-
-        // ── NFI (Native Function Interface) builtins ──
-
-        // (native-load "libfoo.so") → returns library object
-        // (native-load "libfoo.so" :global :lazy) → with flags
-        defBuiltin("native-load", args -> {
-            if (args.length < 1) throw new RuntimeException("native-load: requires library name");
-            String libName = args[0].toString();
-            StringBuilder loadExpr = new StringBuilder();
-            boolean hasGlobal = false, hasLazy = false;
-            for (int i = 1; i < args.length; i++) {
-                String flag = args[i].toString();
-                if (":global".equals(flag)) hasGlobal = true;
-                else if (":lazy".equals(flag)) hasLazy = true;
-            }
-            if (hasGlobal || hasLazy) {
-                loadExpr.append("load (");
-                if (hasGlobal) loadExpr.append("RTLD_GLOBAL");
-                if (hasGlobal && hasLazy) loadExpr.append(" | ");
-                if (hasLazy) loadExpr.append("RTLD_LAZY");
-                loadExpr.append(") \"").append(libName).append("\"");
-            } else {
-                loadExpr.append("load \"").append(libName).append("\"");
-            }
-            try {
-                com.oracle.truffle.api.source.Source nfiSrc = com.oracle.truffle.api.source.Source.newBuilder("nfi",
-                        loadExpr.toString(), "load-" + libName).build();
-                com.oracle.truffle.api.CallTarget ct = env.parseInternal(nfiSrc);
-                return ct.call();
-            } catch (Exception e) {
-                throw new RuntimeException("native-load: failed to load " + libName + ": " + e.getMessage());
-            }
-        });
-
-        // (native-fn lib "function_name" "(SINT32, STRING):POINTER") → callable function
-        defBuiltin("native-fn", args -> {
-            if (args.length < 3) throw new RuntimeException("native-fn: requires (lib name signature)");
-            Object lib = args[0];
-            String fnName = args[1].toString();
-            String signature = args[2].toString();
-            try {
-                com.oracle.truffle.api.interop.InteropLibrary interop =
-                        com.oracle.truffle.api.interop.InteropLibrary.getUncached();
-                Object symbol = interop.readMember(lib, fnName);
-                com.oracle.truffle.api.source.Source sigSrc = com.oracle.truffle.api.source.Source.newBuilder("nfi",
-                        signature, "sig-" + fnName).build();
-                com.oracle.truffle.api.CallTarget sigCt = env.parseInternal(sigSrc);
-                Object sig = sigCt.call();
-                Object bound = interop.invokeMember(sig, "bind", symbol);
-                return new clojure.truffle.runtime.NativeFunction(fnName, signature, bound);
-            } catch (RuntimeException e) {
-                throw e;
-            } catch (Exception e) {
-                throw new RuntimeException("native-fn: " + e.getMessage());
-            }
-        });
-
-        // (require-native 'c "libc.so.6" strlen "(STRING):UINT64" getpid "():SINT32")
-        // Creates namespace, binds native functions, and aliases into current ns
-        defBuiltin("require-native", args -> {
-            if (args.length < 4 || args.length % 2 != 0)
-                throw new RuntimeException("require-native: requires (ns-sym lib-path fn-name sig ...)");
-            String nsName = nsNameFromArg(args[0]);
-            String libPath = args[1].toString();
-
-            // Load library (same as native-load)
-            Object lib;
-            try {
-                com.oracle.truffle.api.source.Source nfiSrc = com.oracle.truffle.api.source.Source.newBuilder("nfi",
-                        "load \"" + libPath + "\"", "load-" + libPath).build();
-                com.oracle.truffle.api.CallTarget ct = env.parseInternal(nfiSrc);
-                lib = ct.call();
-            } catch (Exception e) {
-                throw new RuntimeException("require-native: failed to load " + libPath + ": " + e.getMessage());
-            }
-
-            // Create namespace and bind functions
-            ClojureNamespace ns = getOrCreateNamespace(nsName);
-            com.oracle.truffle.api.interop.InteropLibrary interop =
-                    com.oracle.truffle.api.interop.InteropLibrary.getUncached();
-            for (int i = 2; i < args.length; i += 2) {
-                String fnName = nsNameFromArg(args[i]);
-                String signature = args[i + 1].toString();
-                try {
-                    Object symbol = interop.readMember(lib, fnName);
-                    com.oracle.truffle.api.source.Source sigSrc = com.oracle.truffle.api.source.Source.newBuilder("nfi",
-                            signature, "sig-" + fnName).build();
-                    com.oracle.truffle.api.CallTarget sigCt = env.parseInternal(sigSrc);
-                    Object sig = sigCt.call();
-                    Object bound = interop.invokeMember(sig, "bind", symbol);
-                    ns.intern(fnName, new clojure.truffle.runtime.NativeFunction(fnName, signature, bound));
-                } catch (RuntimeException e) {
-                    throw e;
-                } catch (Exception e) {
-                    throw new RuntimeException("require-native: failed to bind " + fnName + ": " + e.getMessage());
-                }
-            }
-
-            // Alias into current namespace
-            ClojureNamespace currentNs = getOrCreateNamespace(currentNamespace);
-            currentNs.alias(nsName, ns);
-            return clojure.truffle.runtime.ClojureNil.INSTANCE;
-        });
-
-        // (native-default) → returns default (process) symbol table
-        defBuiltin("native-default", args -> {
-            try {
-                com.oracle.truffle.api.source.Source nfiSrc = com.oracle.truffle.api.source.Source.newBuilder("nfi",
-                        "default", "default").build();
-                com.oracle.truffle.api.CallTarget ct = env.parseInternal(nfiSrc);
-                return ct.call();
-            } catch (Exception e) {
-                throw new RuntimeException("native-default: " + e.getMessage());
-            }
         });
 
         // Copy all builtins into clojure.core namespace

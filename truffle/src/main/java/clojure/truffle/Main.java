@@ -23,6 +23,10 @@ public class Main {
                 classpath = args[++i];
             } else if ("-e".equals(args[i]) && i + 1 < args.length) {
                 evalExpr = args[++i];
+            } else if (args[i].startsWith("-D") && args[i].contains("=")) {
+                String prop = args[i].substring(2);
+                int eq = prop.indexOf('=');
+                System.setProperty(prop.substring(0, eq), prop.substring(eq + 1));
             } else {
                 remaining.add(args[i]);
             }
@@ -46,11 +50,18 @@ public class Main {
     }
 
     private static void evalAndPrint(String code) {
-        try (Context context = Context.newBuilder("clj")
+        Context.Builder builder = Context.newBuilder("clj")
                 .allowAllAccess(true)
-                .option("engine.WarnInterpreterOnly", "false")
-                .option("engine.TraceCompilation", System.getProperty("truffle.trace", "false"))
-                .build()) {
+                .option("engine.WarnInterpreterOnly", "false");
+
+        // Set trace options when requested (requires JVMCI/Graal compiler)
+        if ("true".equals(System.getProperty("truffle.trace"))) {
+            builder.option("engine.TraceCompilation", "true");
+            builder.option("engine.TraceInlining", "true");
+            builder.option("engine.WarnOptionDeprecation", "false");
+        }
+
+        try (Context context = builder.build()) {
             Value result = context.eval("clj", code);
             System.out.println(formatResult(result));
         }
