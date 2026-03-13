@@ -1,5 +1,6 @@
 package clojure.truffle.runtime;
 
+import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 import com.oracle.truffle.api.TruffleLanguage;
 import com.oracle.truffle.api.interop.InteropLibrary;
 import com.oracle.truffle.api.interop.TruffleObject;
@@ -36,11 +37,13 @@ public class ClojureObject implements TruffleObject {
     }
 
     @ExportMessage
+    @TruffleBoundary
     Object toDisplayString(@SuppressWarnings("unused") boolean allowSideEffects) {
         return value.toString();
     }
 
     @Override
+    @TruffleBoundary
     public String toString() {
         return value.toString();
     }

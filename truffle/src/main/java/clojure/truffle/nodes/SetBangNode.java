@@ -1,5 +1,6 @@
 package clojure.truffle.nodes;
 
+import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 import com.oracle.truffle.api.frame.VirtualFrame;
 import clojure.truffle.ClojureContext;
 
@@ -22,10 +23,14 @@ public class SetBangNode extends ExpressionNode {
     public Object executeGeneric(VirtualFrame frame) {
         Object value = valueNode.executeGeneric(frame);
         if (!context.isDynamic(varName)) {
-            throw new RuntimeException("Can't set! non-dynamic var: " + varName);
+            throwNonDynamic(varName);
         }
-        // set! changes the thread-local binding
         context.pushThreadBinding(varName, value);
         return value;
+    }
+
+    @TruffleBoundary
+    private static void throwNonDynamic(String varName) {
+        throw new RuntimeException("Can't set! non-dynamic var: " + varName);
     }
 }

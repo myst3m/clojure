@@ -1,5 +1,6 @@
 package clojure.truffle.nodes;
 
+import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 import com.oracle.truffle.api.frame.VirtualFrame;
 import clojure.lang.PersistentHashSet;
 
@@ -19,10 +20,17 @@ public class SetLiteralNode extends ExpressionNode {
 
     @Override
     public Object executeGeneric(VirtualFrame frame) {
-        List<Object> values = new ArrayList<>(elements.length);
-        for (ExpressionNode element : elements) {
-            values.add(element.executeGeneric(frame));
+        Object[] values = new Object[elements.length];
+        for (int i = 0; i < elements.length; i++) {
+            values[i] = elements[i].executeGeneric(frame);
         }
-        return PersistentHashSet.create(values);
+        return createSet(values);
+    }
+
+    @TruffleBoundary
+    private static Object createSet(Object[] values) {
+        List<Object> list = new ArrayList<>(values.length);
+        for (Object v : values) list.add(v);
+        return PersistentHashSet.create(list);
     }
 }

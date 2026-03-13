@@ -1,5 +1,6 @@
 package clojure.truffle.nodes;
 
+import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 import com.oracle.truffle.api.frame.VirtualFrame;
 import clojure.truffle.ClojureContext;
 import clojure.truffle.runtime.ClojureNil;
@@ -30,12 +31,17 @@ public class ExtendTypeNode extends ExpressionNode {
     public Object executeGeneric(VirtualFrame frame) {
         Object type = typeNode.executeGeneric(frame);
         Object proto = protoNode.executeGeneric(frame);
+        return doExtendType(type, proto, methodForms, analyzer, frame);
+    }
 
+    @TruffleBoundary
+    private static Object doExtendType(Object type, Object proto, Map<String, Object> methodForms,
+                                        Analyzer analyzer, Object frameObj) {
+        VirtualFrame frame = (VirtualFrame) frameObj;
         if (!(proto instanceof ClojureProtocol protocol)) {
             throw new RuntimeException("extend-type: second arg must be a protocol, got: " + proto);
         }
 
-        // Determine type key
         Object typeKey;
         if (type instanceof Class<?> clazz) {
             typeKey = clazz;
@@ -45,10 +51,8 @@ public class ExtendTypeNode extends ExpressionNode {
             typeKey = type.toString();
         }
 
-        // Evaluate method forms
         Map<String, Object> methods = new HashMap<>();
         for (var entry : methodForms.entrySet()) {
-            // Analyze and execute fn form
             ExpressionNode fnNode = analyzer.analyzePublic(entry.getValue());
             Object fn = fnNode.executeGeneric(frame);
             methods.put(entry.getKey(), fn);

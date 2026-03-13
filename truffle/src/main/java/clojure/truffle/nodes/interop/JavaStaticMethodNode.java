@@ -1,6 +1,7 @@
 package clojure.truffle.nodes.interop;
 
 import clojure.truffle.nodes.ExpressionNode;
+import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 import com.oracle.truffle.api.frame.VirtualFrame;
 
 import java.lang.reflect.Method;
@@ -23,7 +24,11 @@ public class JavaStaticMethodNode extends ExpressionNode {
         for (int i = 0; i < argNodes.length; i++) {
             args[i] = argNodes[i].executeGeneric(frame);
         }
+        return invokeStaticMethod(clazz, methodName, args);
+    }
 
+    @TruffleBoundary
+    private static Object invokeStaticMethod(Class<?> clazz, String methodName, Object[] args) {
         Method method = JavaInteropUtil.findMethod(clazz, methodName, args, true);
         if (method == null) {
             throw new RuntimeException("No such static method: " + clazz.getName() + "/" +

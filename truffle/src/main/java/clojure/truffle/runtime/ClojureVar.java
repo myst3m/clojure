@@ -1,5 +1,6 @@
 package clojure.truffle.runtime;
 
+import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 import com.oracle.truffle.api.interop.InteropLibrary;
 import com.oracle.truffle.api.interop.TruffleObject;
 import com.oracle.truffle.api.library.ExportLibrary;
@@ -31,6 +32,7 @@ public class ClojureVar implements TruffleObject, IDeref, clojure.lang.IMeta, cl
         return namespace != null ? namespace + "/" + name : name;
     }
 
+    @TruffleBoundary
     @Override
     public Object deref() {
         // Try namespace-qualified lookup first
@@ -114,6 +116,7 @@ public class ClojureVar implements TruffleObject, IDeref, clojure.lang.IMeta, cl
     }
 
     @ExportMessage
+    @TruffleBoundary
     Object toDisplayString(@SuppressWarnings("unused") boolean allowSideEffects) {
         return "#'" + getQualifiedName();
     }

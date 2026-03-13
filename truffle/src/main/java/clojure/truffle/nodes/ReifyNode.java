@@ -1,5 +1,6 @@
 package clojure.truffle.nodes;
 
+import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 import com.oracle.truffle.api.frame.VirtualFrame;
 import clojure.truffle.ClojureContext;
 import clojure.truffle.runtime.ClojureReified;
@@ -20,9 +21,18 @@ public class ReifyNode extends ExpressionNode {
 
     @Override
     public Object executeGeneric(VirtualFrame frame) {
+        Object[] methodValues = new Object[methodNodes.length];
+        for (int i = 0; i < methodNodes.length; i++) {
+            methodValues[i] = methodNodes[i].executeGeneric(frame);
+        }
+        return createReified(methodNames, methodValues);
+    }
+
+    @TruffleBoundary
+    private static ClojureReified createReified(String[] names, Object[] values) {
         Map<String, Object> methods = new LinkedHashMap<>();
-        for (int i = 0; i < methodNames.length; i++) {
-            methods.put(methodNames[i], methodNodes[i].executeGeneric(frame));
+        for (int i = 0; i < names.length; i++) {
+            methods.put(names[i], values[i]);
         }
         return new ClojureReified(methods);
     }

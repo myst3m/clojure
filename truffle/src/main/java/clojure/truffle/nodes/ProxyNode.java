@@ -1,5 +1,6 @@
 package clojure.truffle.nodes;
 
+import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 import com.oracle.truffle.api.frame.VirtualFrame;
 import clojure.truffle.ClojureContext;
 import clojure.truffle.nodes.interop.JavaInteropUtil;
@@ -38,12 +39,19 @@ public class ProxyNode extends ExpressionNode {
 
     @Override
     public Object executeGeneric(VirtualFrame frame) {
+        Object[] methodValues = new Object[methodNodes.length];
+        for (int i = 0; i < methodNodes.length; i++) {
+            methodValues[i] = methodNodes[i].executeGeneric(frame);
+        }
+        return buildProxy(interfaces, methodNames, methodValues, context);
+    }
+
+    @TruffleBoundary
+    private static Object buildProxy(Class<?>[] interfaces, String[] methodNames, Object[] methodValues, ClojureContext context) {
         Map<String, Object> methods = new LinkedHashMap<>();
         for (int i = 0; i < methodNames.length; i++) {
-            methods.put(methodNames[i], methodNodes[i].executeGeneric(frame));
+            methods.put(methodNames[i], methodValues[i]);
         }
-
-        // Separate superclass from interfaces
         Class<?> superClass = null;
         List<Class<?>> ifaceList = new ArrayList<>();
         for (Class<?> c : interfaces) {
@@ -59,15 +67,16 @@ public class ProxyNode extends ExpressionNode {
         }
 
         if (superClass != null) {
-            return createClassProxy(superClass, ifaceList.toArray(new Class<?>[0]), methods);
+            return createClassProxy(superClass, ifaceList.toArray(new Class<?>[0]), methods, context);
         } else {
-            return createInterfaceProxy(ifaceList.toArray(new Class<?>[0]), methods);
+            return createInterfaceProxy(ifaceList.toArray(new Class<?>[0]), methods, interfaces, context);
         }
     }
 
-    private Object createInterfaceProxy(Class<?>[] ifaces, Map<String, Object> methods) {
+    private static Object createInterfaceProxy(Class<?>[] ifaces, Map<String, Object> methods,
+                                                Class<?>[] allInterfaces, ClojureContext context) {
         InvocationHandler handler = (proxy, method, args) -> {
-            return invokeProxyMethod(proxy, method, args, methods);
+            return invokeProxyMethod(proxy, method, args, methods, allInterfaces, context);
         };
         return java.lang.reflect.Proxy.newProxyInstance(
                 Thread.currentThread().getContextClassLoader(),
@@ -76,7 +85,8 @@ public class ProxyNode extends ExpressionNode {
         );
     }
 
-    private Object createClassProxy(Class<?> superClass, Class<?>[] ifaces, Map<String, Object> methods) {
+    private static Object createClassProxy(Class<?> superClass, Class<?>[] ifaces,
+                                           Map<String, Object> methods, ClojureContext context) {
         try {
             return ClassProxyGenerator.createProxy(superClass, ifaces, methods, context);
         } catch (Exception e) {
@@ -84,7 +94,10 @@ public class ProxyNode extends ExpressionNode {
         }
     }
 
-    private Object invokeProxyMethod(Object proxy, Method method, Object[] args, Map<String, Object> methods) {
+    @TruffleBoundary
+    private static Object invokeProxyMethod(Object proxy, Method method, Object[] args,
+                                            Map<String, Object> methods, Class<?>[] interfaces,
+                                            ClojureContext context) {
         String name = method.getName();
         Object fn = methods.get(name);
         if (fn != null) {
@@ -105,13 +118,13 @@ public class ProxyNode extends ExpressionNode {
             return JavaInteropUtil.coerce(result, returnType);
         }
         // Default implementations for Object methods
-        if (name.equals("toString")) return "proxy[" + superClassAndIfacesString() + "]";
+        if (name.equals("toString")) return "proxy[" + superClassAndIfacesString(interfaces) + "]";
         if (name.equals("hashCode")) return System.identityHashCode(proxy);
         if (name.equals("equals")) return proxy == (args != null ? args[0] : null);
         throw new UnsupportedOperationException("No implementation for method: " + name);
     }
 
-    private String superClassAndIfacesString() {
+    private static String superClassAndIfacesString(Class<?>[] interfaces) {
         return String.join(",",
                 java.util.Arrays.stream(interfaces).map(Class::getSimpleName).toArray(String[]::new));
     }

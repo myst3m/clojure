@@ -7,6 +7,7 @@ import clojure.lang.IPersistentMap;
 import clojure.lang.PersistentArrayMap;
 import clojure.lang.RT;
 import com.oracle.truffle.api.CallTarget;
+import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 
 public class ClojureFunction extends AFn {
     private final String name;
@@ -15,6 +16,7 @@ public class ClojureFunction extends AFn {
     private volatile Object multiArityParent; // set when this is part of a MultiArityFunction
     private volatile IPersistentMap meta;
 
+    @TruffleBoundary
     public ClojureFunction(String name, CallTarget callTarget, Object[] capturedValues) {
         this.name = name;
         this.callTarget = callTarget;

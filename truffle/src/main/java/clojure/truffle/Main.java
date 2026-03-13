@@ -13,6 +13,8 @@ import java.util.List;
 public class Main {
 
     public static void main(String[] args) throws Exception {
+        // Signal to RT that we're in Truffle mode - skip loading clojure/core.clj
+        System.setProperty("clojure.truffle.mode", "true");
         String classpath = null;
         String evalExpr = null;
         List<String> remaining = new ArrayList<>();
@@ -47,6 +49,7 @@ public class Main {
         try (Context context = Context.newBuilder("clj")
                 .allowAllAccess(true)
                 .option("engine.WarnInterpreterOnly", "false")
+                .option("engine.TraceCompilation", System.getProperty("truffle.trace", "false"))
                 .build()) {
             Value result = context.eval("clj", code);
             System.out.println(formatResult(result));

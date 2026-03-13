@@ -1,5 +1,6 @@
 package clojure.truffle.nodes;
 
+import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 import com.oracle.truffle.api.frame.VirtualFrame;
 import com.oracle.truffle.api.nodes.IndirectCallNode;
 import clojure.truffle.ClojureContext;
@@ -45,15 +46,31 @@ public class InvokeNode extends ExpressionNode {
             System.arraycopy(argValues, 0, callArgs, 1, argValues.length);
             return callNode.call(fn.getCallTarget(), callArgs);
         } else if (function instanceof ClojureContext.BuiltinFunction builtin) {
-            try {
-                return builtin.execute(argValues);
-            } catch (Exception e) {
-                throw new RuntimeException("in builtin '" + builtin.name() + "': " + e.getMessage(), e);
-            }
+            return invokeBuiltin(builtin, argValues);
         } else if (function instanceof ClojureMultiMethod mm) {
-            return mm.invoke(argValues);
-        } else if (function instanceof clojure.lang.Keyword kw) {
-            // Keywords as functions: (:key map) → (get map :key)
+            return invokeMultiMethod(mm, argValues);
+        } else {
+            return invokeSlowPath(function, argValues, functionNode);
+        }
+    }
+
+    @TruffleBoundary
+    private static Object invokeBuiltin(ClojureContext.BuiltinFunction builtin, Object[] argValues) {
+        try {
+            return builtin.execute(argValues);
+        } catch (Exception e) {
+            throw new RuntimeException("in builtin '" + builtin.name() + "': " + e.getMessage(), e);
+        }
+    }
+
+    @TruffleBoundary
+    private static Object invokeMultiMethod(ClojureMultiMethod mm, Object[] argValues) {
+        return mm.invoke(argValues);
+    }
+
+    @TruffleBoundary
+    private static Object invokeSlowPath(Object function, Object[] argValues, ExpressionNode functionNode) {
+        if (function instanceof clojure.lang.Keyword kw) {
             if (argValues.length < 1 || argValues.length > 2)
                 throw new RuntimeException("Keyword lookup expects 1 or 2 args");
             Object map = argValues[0];
@@ -66,8 +83,6 @@ public class InvokeNode extends ExpressionNode {
             return argValues.length == 2 ? argValues[1] :
                     clojure.truffle.runtime.ClojureNil.INSTANCE;
         }
-
-        // Maps as functions: ({:a 1} :a) → 1
         if (function instanceof clojure.lang.IPersistentMap m) {
             if (argValues.length < 1 || argValues.length > 2)
                 throw new RuntimeException("Map lookup expects 1 or 2 args");
@@ -75,21 +90,18 @@ public class InvokeNode extends ExpressionNode {
                     argValues.length == 2 ? argValues[1] : clojure.truffle.runtime.ClojureNil.INSTANCE);
             return val == null ? clojure.truffle.runtime.ClojureNil.INSTANCE : val;
         }
-        // Vectors as functions: ([1 2 3] 1) → 2
         if (function instanceof clojure.lang.IPersistentVector v) {
             if (argValues.length != 1)
                 throw new RuntimeException("Vector lookup expects 1 arg");
             int idx = ((Number) argValues[0]).intValue();
             return v.nth(idx);
         }
-        // Sets as functions: (#{1 2 3} 2) → 2
         if (function instanceof clojure.lang.IPersistentSet s) {
             if (argValues.length != 1)
                 throw new RuntimeException("Set lookup expects 1 arg");
             Object val = s.get(argValues[0]);
             return val == null ? clojure.truffle.runtime.ClojureNil.INSTANCE : val;
         }
-        // IFn (includes NativeFunction via AFn, and Clojure stdlib fns)
         if (function instanceof clojure.lang.IFn ifn) {
             return switch (argValues.length) {
                 case 0 -> ifn.invoke();
@@ -102,27 +114,27 @@ public class InvokeNode extends ExpressionNode {
                 default -> throw new RuntimeException("IFn invoke with " + argValues.length + " args not supported");
             };
         }
-        // Deftype instances as functions (IFn implementation via type method registry)
         if (function instanceof clojure.truffle.runtime.ClojureDeftypeInstance dt) {
             Object invokeFn = dt.getMethod("invoke");
             if (invokeFn != null) {
-                // Prepend 'this' (the instance) to args
                 Object[] fnArgs = new Object[argValues.length + 1];
                 fnArgs[0] = dt;
                 System.arraycopy(argValues, 0, fnArgs, 1, argValues.length);
+                if (invokeFn instanceof ClojureContext.BuiltinFunction bf) {
+                    return bf.execute(fnArgs);
+                }
+                // For ClojureFunction/MultiArityFunction in deftype invoke, use callFunction
                 if (invokeFn instanceof ClojureFunction fn2) {
                     Object[] callArgs2 = new Object[fnArgs.length + 1];
                     callArgs2[0] = fn2;
                     System.arraycopy(fnArgs, 0, callArgs2, 1, fnArgs.length);
-                    return callNode.call(fn2.getCallTarget(), callArgs2);
+                    return fn2.getCallTarget().call(callArgs2);
                 } else if (invokeFn instanceof MultiArityFunction maf2) {
                     ClojureFunction fn2 = maf2.resolve(fnArgs.length);
                     Object[] callArgs2 = new Object[fnArgs.length + 1];
                     callArgs2[0] = fn2;
                     System.arraycopy(fnArgs, 0, callArgs2, 1, fnArgs.length);
-                    return callNode.call(fn2.getCallTarget(), callArgs2);
-                } else if (invokeFn instanceof ClojureContext.BuiltinFunction bf) {
-                    return bf.execute(fnArgs);
+                    return fn2.getCallTarget().call(callArgs2);
                 }
             }
         }

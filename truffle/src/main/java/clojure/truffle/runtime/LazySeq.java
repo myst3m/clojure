@@ -1,6 +1,7 @@
 package clojure.truffle.runtime;
 
 import clojure.lang.*;
+import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 
 import java.util.Iterator;
 import java.util.NoSuchElementException;
@@ -20,6 +21,7 @@ public class LazySeq implements ISeq, Seqable, Sequential, IPending {
         this.thunk = thunk;
     }
 
+    @TruffleBoundary
     private synchronized ISeq sval() {
         if (!realized) {
             realized = true;
@@ -41,23 +43,27 @@ public class LazySeq implements ISeq, Seqable, Sequential, IPending {
         return seq;
     }
 
+    @TruffleBoundary
     @Override
     public ISeq seq() {
         return sval();
     }
 
+    @TruffleBoundary
     @Override
     public Object first() {
         ISeq s = seq();
         return s == null ? null : s.first();
     }
 
+    @TruffleBoundary
     @Override
     public ISeq next() {
         ISeq s = seq();
         return s == null ? null : s.next();
     }
 
+    @TruffleBoundary
     @Override
     public ISeq more() {
         ISeq s = seq();
@@ -66,11 +72,13 @@ public class LazySeq implements ISeq, Seqable, Sequential, IPending {
         return r == null ? PersistentList.EMPTY : r;
     }
 
+    @TruffleBoundary
     @Override
     public ISeq cons(Object o) {
         return new Cons(o, seq());
     }
 
+    @TruffleBoundary
     @Override
     public int count() {
         int c = 0;

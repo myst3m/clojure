@@ -354,11 +354,14 @@ static{
 	               });
 	v.setMeta(map(DOC_KEY, "Sequentially read and evaluate the set of forms contained in the file.",
 	              arglistskw, list(vector(namesym))));
-	try {
-		load("clojure/core");
-	}
-	catch(Exception e) {
-		throw Util.sneakyThrow(e);
+	// Skip core.clj loading in Truffle mode (Truffle has its own builtins)
+	if(System.getProperty("clojure.truffle.mode") == null) {
+		try {
+			load("clojure/core");
+		}
+		catch(Exception e) {
+			throw Util.sneakyThrow(e);
+		}
 	}
 
 	CHECK_SPECS = RT.instrumentMacros;

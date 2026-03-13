@@ -154,7 +154,7 @@ public class Analyzer {
             java.util.List<ExpressionNode> nodes = new java.util.ArrayList<>();
             java.io.PushbackReader reader = new java.io.PushbackReader(new java.io.StringReader(source), 2);
             while (true) {
-                Object form = clojure.lang.LispReader.read(reader, false, EOF, false, READ_OPTS);
+                Object form = clojure.lang.LispReader.read(reader, false, EOF, false, getReadOpts());
                 if (form == EOF) break;
                 ExpressionNode node = analyze(form);
                 nodes.add(node);
@@ -193,7 +193,7 @@ public class Analyzer {
         PushbackReader reader = new PushbackReader(new StringReader(source), 2);
         try {
             while (true) {
-                Object form = LispReader.read(reader, false, EOF, false, READ_OPTS);
+                Object form = LispReader.read(reader, false, EOF, false, getReadOpts());
                 if (form == EOF) {
                     if (context != null && "clojure.spec.alpha".equals(context.getCurrentNamespace())) {
                         if (ClojureContext.DEBUG) System.err.println("[LOAD-EOF] after " + formCount + " forms, source length=" + source.length());
@@ -265,15 +265,20 @@ public class Analyzer {
 
     // --- Reader ---
 
-    private static final Object READ_OPTS = clojure.lang.RT.map(
-            LispReader.OPT_READ_COND, LispReader.COND_ALLOW);
+    private static volatile Object READ_OPTS;
+    private static Object getReadOpts() {
+        if (READ_OPTS == null) {
+            READ_OPTS = clojure.lang.RT.map(LispReader.OPT_READ_COND, LispReader.COND_ALLOW);
+        }
+        return READ_OPTS;
+    }
 
     private List<Object> readAll(String source) {
         List<Object> forms = new ArrayList<>();
         PushbackReader reader = new PushbackReader(new StringReader(source), 2);
         try {
             while (true) {
-                Object form = LispReader.read(reader, false, EOF, false, READ_OPTS);
+                Object form = LispReader.read(reader, false, EOF, false, getReadOpts());
                 if (form == EOF) break;
                 forms.add(form);
             }
@@ -832,24 +837,11 @@ public class Analyzer {
                     String fieldName = fieldSym.getName();
                     ExpressionNode valNode = valueNode;
                     return new ExpressionNode() {
+                        @Child private ExpressionNode valNodeChild = valNode;
                         @Override
                         public Object executeGeneric(com.oracle.truffle.api.frame.VirtualFrame frame) {
-                            try {
-                                Class<?> clazz = clojure.truffle.nodes.interop.JavaInteropUtil.resolveClass(className);
-                                java.lang.reflect.Field field = clazz.getField(fieldName);
-                                field.setAccessible(true);
-                                Object value = valNode.executeGeneric(frame);
-                                // Convert truthy/falsy to boolean if field is boolean
-                                if (field.getType() == boolean.class || field.getType() == Boolean.class) {
-                                    if (value instanceof Boolean b) field.set(null, b);
-                                    else field.set(null, value != null && !(value instanceof clojure.truffle.runtime.ClojureNil));
-                                } else {
-                                    field.set(null, value);
-                                }
-                                return value;
-                            } catch (Exception e) {
-                                throw new RuntimeException("set!: cannot set field " + className + "/" + fieldName + ": " + e.getMessage(), e);
-                            }
+                            Object value = valNodeChild.executeGeneric(frame);
+                            return setStaticField(className, fieldName, value);
                         }
                     };
                 }
@@ -1097,11 +1089,11 @@ public class Analyzer {
             args = args.next();
         }
         List<Object> capturedSpecs = List.copyOf(specs);
+        final Analyzer self = this;
         return new ExpressionNode() {
             @Override
             public Object executeGeneric(com.oracle.truffle.api.frame.VirtualFrame frame) {
-                for (Object spec : capturedSpecs) processUseSpec(spec);
-                return ClojureNil.INSTANCE;
+                return doUse(self, capturedSpecs);
             }
         };
     }
@@ -1178,50 +1170,11 @@ public class Analyzer {
             args = args.next();
         }
         List<String> capturedPaths = List.copyOf(paths);
+        final Analyzer self = this;
         return new ExpressionNode() {
             @Override
             public Object executeGeneric(com.oracle.truffle.api.frame.VirtualFrame frame) {
-                String currentNs = context.getCurrentNamespace();
-                // Clojure's load: paths starting with "/" are absolute (classpath root).
-                // Non-"/" paths are relative to root-directory of current namespace.
-                // root-directory = parent dir of the namespace's root resource.
-                // e.g. clojure.reflect -> root-resource=/clojure/reflect -> root-dir=/clojure
-                // So (load "reflect/java") in clojure.reflect -> /clojure/reflect/java
-                for (String path : capturedPaths) {
-                    String fullPath;
-                    if (path.startsWith("/")) {
-                        fullPath = path;
-                    } else {
-                        // root-resource: ns dots -> /, dashes -> _
-                        String rootRes = "/" + currentNs.replace('.', '/').replace('-', '_');
-                        // root-directory: everything up to last /
-                        int lastSlash = rootRes.lastIndexOf('/');
-                        String rootDir = lastSlash > 0 ? rootRes.substring(0, lastSlash) : "";
-                        fullPath = rootDir + "/" + path;
-                    }
-                    String cleanPath = fullPath.startsWith("/") ? fullPath.substring(1) : fullPath;
-                    String resourcePath = cleanPath + ".clj";
-                    java.io.InputStream is = context.findResource(resourcePath);
-                    if (is == null) {
-                        // Try .cljc
-                        resourcePath = cleanPath + ".cljc";
-                        is = context.findResource(resourcePath);
-                    }
-                    if (is == null) {
-                        throw new RuntimeException("Cannot find resource for load: " + path);
-                    }
-                    try {
-                        byte[] bytes = is.readAllBytes();
-                        is.close();
-                        String source = new String(bytes, java.nio.charset.StandardCharsets.UTF_8);
-                        Analyzer loader = new Analyzer(context.getLanguage());
-                        loader.setContext(context);
-                        loader.loadSource(source, context.getLanguage());
-                    } catch (java.io.IOException e) {
-                        throw new RuntimeException("Error loading: " + path, e);
-                    }
-                }
-                return ClojureNil.INSTANCE;
+                return doLoad(context, capturedPaths, self);
             }
         };
     }
@@ -1234,36 +1187,7 @@ public class Analyzer {
         return new ExpressionNode() {
             @Override
             public Object executeGeneric(com.oracle.truffle.api.frame.VirtualFrame frame) {
-                if (capturedArgs.isEmpty()) return ClojureNil.INSTANCE;
-                Object nsArg = capturedArgs.get(0);
-                // Unwrap quote
-                if (nsArg instanceof ISeq qs && qs.first() instanceof Symbol s && s.getName().equals("quote")) {
-                    nsArg = qs.next().first();
-                }
-                String nsName;
-                if (nsArg instanceof Symbol sym) nsName = sym.getName();
-                else nsName = nsArg.toString();
-                ClojureNamespace reqNs = context.getNamespace(nsName);
-                ClojureNamespace currentNs = context.getNamespace(context.getCurrentNamespace());
-                if (reqNs == null || currentNs == null) return ClojureNil.INSTANCE;
-
-                // Check for :only filter
-                if (capturedArgs.size() >= 3) {
-                    Object filterKey = capturedArgs.get(1);
-                    if (filterKey instanceof Keyword kw && kw.getName().equals("only")) {
-                        Object symsArg = capturedArgs.get(2);
-                        // Unwrap quote
-                        if (symsArg instanceof ISeq qs2 && qs2.first() instanceof Symbol s2 && s2.getName().equals("quote")) {
-                            symsArg = qs2.next().first();
-                        }
-                        if (symsArg instanceof IPersistentVector pv) {
-                            currentNs.referOnly(reqNs, extractSymbolNames(pv));
-                            return ClojureNil.INSTANCE;
-                        }
-                    }
-                }
-                currentNs.referAll(reqNs);
-                return ClojureNil.INSTANCE;
+                return doRefer(context, capturedArgs);
             }
         };
     }
@@ -1287,12 +1211,7 @@ public class Analyzer {
         return new ExpressionNode() {
             @Override
             public Object executeGeneric(com.oracle.truffle.api.frame.VirtualFrame frame) {
-                ClojureNamespace core = context.getNamespace("clojure.core");
-                ClojureNamespace currentNs = context.getNamespace(context.getCurrentNamespace());
-                if (core != null && currentNs != null) {
-                    currentNs.referWithExclude(core, capturedExcludes);
-                }
-                return ClojureNil.INSTANCE;
+                return referClojureBoundary(context, capturedExcludes);
             }
         };
     }
@@ -1467,16 +1386,7 @@ public class Analyzer {
             @Override
             public Object executeGeneric(com.oracle.truffle.api.frame.VirtualFrame frame) {
                 Object obj = targetNode.executeGeneric(frame);
-                if (obj instanceof ClojureDeftypeInstance inst) {
-                    return inst.getField(fieldName);
-                }
-                // Fall back to Java reflection for field access
-                try {
-                    java.lang.reflect.Field f = obj.getClass().getField(fieldName);
-                    return clojure.truffle.nodes.interop.JavaInteropUtil.wrapResult(f.get(obj));
-                } catch (Exception e) {
-                    throw new RuntimeException("No field '" + fieldName + "' on " + obj.getClass().getName());
-                }
+                return accessInstanceField(obj, fieldName);
             }
         };
     }
@@ -1522,9 +1432,7 @@ public class Analyzer {
             @Override
             public Object executeGeneric(com.oracle.truffle.api.frame.VirtualFrame frame) {
                 Object dispatchFn = dispatchNode.executeGeneric(frame);
-                ClojureMultiMethod mm = new ClojureMultiMethod(name, dispatchFn, context);
-                context.setVar(name, mm);
-                return mm;
+                return doDefmulti(context, name, dispatchFn);
             }
         };
     }
@@ -1552,11 +1460,7 @@ public class Analyzer {
             public Object executeGeneric(com.oracle.truffle.api.frame.VirtualFrame frame) {
                 Object dispatchVal = dvNode.executeGeneric(frame);
                 Object methodFn = methodFnNode.executeGeneric(frame);
-                Object mm = context.getVar(mmName);
-                if (!(mm instanceof ClojureMultiMethod multi))
-                    throw new RuntimeException("defmethod: " + mmName + " is not a multimethod");
-                multi.addMethod(dispatchVal, methodFn);
-                return multi;
+                return registerDefmethod(context, mmName, dispatchVal, methodFn);
             }
         };
     }
@@ -1586,27 +1490,7 @@ public class Analyzer {
         return new ExpressionNode() {
             @Override
             public Object executeGeneric(com.oracle.truffle.api.frame.VirtualFrame frame) {
-                ClojureProtocol proto = new ClojureProtocol(protoName, capturedMethodNames);
-                context.setVar(protoName, proto);
-                // Create dispatch functions for each method
-                for (String methodName : capturedMethodNames) {
-                    context.setVar(methodName, new ClojureContext.NamedBuiltin(
-                            protoName + "/" + methodName, fnArgs -> {
-                        if (fnArgs.length < 1)
-                            throw new RuntimeException(protoName + "/" + methodName + ": missing target (this)");
-                        Object target = fnArgs[0];
-                        Object fn = proto.findMethod(methodName, target);
-                        if (fn == null) {
-                            String targetType = target instanceof clojure.truffle.runtime.ClojureReified r
-                                    ? "ClojureReified{" + String.join(",", r.getMethods().keySet()) + "}"
-                                    : target.getClass().getName();
-                            throw new RuntimeException("No implementation of protocol " + protoName +
-                                    " method " + methodName + " for type: " + targetType);
-                        }
-                        return context.callFunction(fn, fnArgs);
-                    }));
-                }
-                return proto;
+                return registerDefprotocol(context, protoName, capturedMethodNames);
             }
         };
     }
@@ -1636,9 +1520,7 @@ public class Analyzer {
         return new ExpressionNode() {
             @Override
             public Object executeGeneric(com.oracle.truffle.api.frame.VirtualFrame frame) {
-                ClojureProtocol proto = new ClojureProtocol(ifaceName, capturedMethodNames);
-                context.setVar(ifaceName, proto);
-                return proto;
+                return doDefinterface(context, ifaceName, capturedMethodNames);
             }
         };
     }
@@ -1723,86 +1605,7 @@ public class Analyzer {
         return new ExpressionNode() {
             @Override
             public Object executeGeneric(com.oracle.truffle.api.frame.VirtualFrame frame) {
-                // Register constructor ->TypeName
-                java.util.Map<String, Integer> fieldIdx = new java.util.LinkedHashMap<>();
-                for (int i = 0; i < capturedFieldNames.size(); i++)
-                    fieldIdx.put(capturedFieldNames.get(i), i);
-
-                // Collect all non-protocol methods first
-                java.util.Map<String, Object> typeMethods = new java.util.HashMap<>();
-
-                // Register protocol implementations
-                for (var entry : capturedProtoMethods.entrySet()) {
-                    String protoName = entry.getKey();
-                    Object protoObj = context.getVar(protoName);
-                    if (protoObj instanceof ClojureProtocol proto) {
-                        java.util.Map<String, Object> methodMap = new java.util.HashMap<>();
-                        for (var methodEntry : entry.getValue().entrySet()) {
-                            Object fn = methodEntry.getValue().executeGeneric(frame);
-                            methodMap.put(methodEntry.getKey(), fn);
-                        }
-                        proto.extend(typeName, methodMap);
-                    } else {
-                        // Non-protocol interface (IFn, IDeref, etc.) — register in type method registry
-                        // Merge same-named methods from different interfaces into multi-arity
-                        for (var methodEntry : entry.getValue().entrySet()) {
-                            Object fn = methodEntry.getValue().executeGeneric(frame);
-                            String mName = methodEntry.getKey();
-                            Object existing = typeMethods.get(mName);
-                            if (existing != null && fn instanceof ClojureFunction newCf) {
-                                // Merge into MultiArityFunction
-                                if (existing instanceof MultiArityFunction maf) {
-                                    // Add new arity to existing MAF
-                                    int newArity = newCf.getArity();
-                                    int[] oldArities = maf.getArities();
-                                    ClojureFunction[] oldFns = maf.getFunctions();
-                                    int[] newArities = new int[oldArities.length + 1];
-                                    ClojureFunction[] newFns = new ClojureFunction[oldFns.length + 1];
-                                    System.arraycopy(oldArities, 0, newArities, 0, oldArities.length);
-                                    System.arraycopy(oldFns, 0, newFns, 0, oldFns.length);
-                                    newArities[oldArities.length] = newArity;
-                                    newFns[oldFns.length] = newCf;
-                                    MultiArityFunction merged = new MultiArityFunction(newArities, newFns,
-                                            newCf.isVariadic() ? oldArities.length : maf.getVariadicIndex());
-                                    context.registerTypeMethod(typeName, mName, merged);
-                                    typeMethods.put(mName, merged);
-                                } else if (existing instanceof ClojureFunction existCf) {
-                                    int[] mergedArities = {existCf.getArity(), newCf.getArity()};
-                                    ClojureFunction[] mergedFns = {existCf, newCf};
-                                    int varIdx = existCf.isVariadic() ? 0 : (newCf.isVariadic() ? 1 : -1);
-                                    MultiArityFunction merged = new MultiArityFunction(mergedArities, mergedFns, varIdx);
-                                    context.registerTypeMethod(typeName, mName, merged);
-                                    typeMethods.put(mName, merged);
-                                } else {
-                                    // Can't merge, overwrite
-                                    context.registerTypeMethod(typeName, mName, fn);
-                                    typeMethods.put(mName, fn);
-                                }
-                            } else {
-                                context.registerTypeMethod(typeName, mName, fn);
-                                typeMethods.put(mName, fn);
-                            }
-                        }
-                    }
-                }
-
-                // Capture typeMethods for constructor closure
-                java.util.Map<String, Object> capturedTypeMethods =
-                        typeMethods.isEmpty() ? null : new java.util.HashMap<>(typeMethods);
-
-                context.setVar("->" + typeName, (ClojureContext.BuiltinFunction) ctorArgs -> {
-                    if (ctorArgs.length != capturedFieldNames.size())
-                        throw new RuntimeException("->" + typeName + ": expected " +
-                                capturedFieldNames.size() + " args");
-                    ClojureDeftypeInstance inst = new ClojureDeftypeInstance(typeName, ctorArgs.clone(), fieldIdx);
-                    if (capturedTypeMethods != null) inst.setMethods(capturedTypeMethods);
-                    return inst;
-                });
-
-                // Register type name as a var (for extend, extend-protocol references)
-                context.setVar(typeName, typeName);
-
-                return ClojureNil.INSTANCE;
+                return evalDeftype(capturedProtoMethods, frame, context, typeName, capturedFieldNames, false);
             }
         };
     }
@@ -1858,101 +1661,7 @@ public class Analyzer {
         return new ExpressionNode() {
             @Override
             public Object executeGeneric(com.oracle.truffle.api.frame.VirtualFrame frame) {
-                java.util.Map<String, Integer> fieldIdx = new java.util.LinkedHashMap<>();
-                for (int i = 0; i < capturedFieldNames.size(); i++)
-                    fieldIdx.put(capturedFieldNames.get(i), i);
-
-                // Collect all non-protocol methods first
-                java.util.Map<String, Object> typeMethods = new java.util.HashMap<>();
-
-                // Register protocol implementations
-                for (var entry : capturedProtoMethods.entrySet()) {
-                    String protoName = entry.getKey();
-                    Object protoObj = context.getVar(protoName);
-                    if (protoObj instanceof ClojureProtocol proto) {
-                        java.util.Map<String, Object> methodMap = new java.util.HashMap<>();
-                        for (var methodEntry : entry.getValue().entrySet()) {
-                            Object fn = methodEntry.getValue().executeGeneric(frame);
-                            methodMap.put(methodEntry.getKey(), fn);
-                        }
-                        proto.extend(typeName, methodMap);
-                    } else {
-                        // Non-protocol interface (IFn, IDeref, etc.) — register in type method registry
-                        // Merge same-named methods from different interfaces into multi-arity
-                        for (var methodEntry : entry.getValue().entrySet()) {
-                            Object fn = methodEntry.getValue().executeGeneric(frame);
-                            String mName = methodEntry.getKey();
-                            Object existing = typeMethods.get(mName);
-                            if (existing != null && fn instanceof ClojureFunction newCf) {
-                                if (existing instanceof MultiArityFunction maf) {
-                                    int newArity = newCf.getArity();
-                                    int[] oldArities = maf.getArities();
-                                    ClojureFunction[] oldFns = maf.getFunctions();
-                                    int[] newArities = new int[oldArities.length + 1];
-                                    ClojureFunction[] newFns = new ClojureFunction[oldFns.length + 1];
-                                    System.arraycopy(oldArities, 0, newArities, 0, oldArities.length);
-                                    System.arraycopy(oldFns, 0, newFns, 0, oldFns.length);
-                                    newArities[oldArities.length] = newArity;
-                                    newFns[oldFns.length] = newCf;
-                                    MultiArityFunction merged = new MultiArityFunction(newArities, newFns,
-                                            newCf.isVariadic() ? oldArities.length : maf.getVariadicIndex());
-                                    context.registerTypeMethod(typeName, mName, merged);
-                                    typeMethods.put(mName, merged);
-                                } else if (existing instanceof ClojureFunction existCf) {
-                                    int[] mergedArities = {existCf.getArity(), newCf.getArity()};
-                                    ClojureFunction[] mergedFns = {existCf, newCf};
-                                    int varIdx = existCf.isVariadic() ? 0 : (newCf.isVariadic() ? 1 : -1);
-                                    MultiArityFunction merged = new MultiArityFunction(mergedArities, mergedFns, varIdx);
-                                    context.registerTypeMethod(typeName, mName, merged);
-                                    typeMethods.put(mName, merged);
-                                } else {
-                                    context.registerTypeMethod(typeName, mName, fn);
-                                    typeMethods.put(mName, fn);
-                                }
-                            } else {
-                                context.registerTypeMethod(typeName, mName, fn);
-                                typeMethods.put(mName, fn);
-                            }
-                        }
-                    }
-                }
-
-                java.util.Map<String, Object> capturedTypeMethods =
-                        typeMethods.isEmpty() ? null : new java.util.HashMap<>(typeMethods);
-
-                // Register ->TypeName positional constructor
-                context.setVar("->" + typeName, (ClojureContext.BuiltinFunction) ctorArgs -> {
-                    if (ctorArgs.length != capturedFieldNames.size())
-                        throw new RuntimeException("->" + typeName + ": expected " +
-                                capturedFieldNames.size() + " args");
-                    ClojureDeftypeInstance inst = new ClojureDeftypeInstance(typeName, ctorArgs.clone(), fieldIdx);
-                    inst.setRecord(true);
-                    if (capturedTypeMethods != null) inst.setMethods(capturedTypeMethods);
-                    return inst;
-                });
-
-                // Register type name as a var (for extend, extend-protocol references)
-                context.setVar(typeName, typeName);
-
-                // Register map->TypeName map-based constructor
-                context.setVar("map->" + typeName, (ClojureContext.BuiltinFunction) ctorArgs -> {
-                    if (ctorArgs.length != 1)
-                        throw new RuntimeException("map->" + typeName + ": expected 1 arg (a map)");
-                    Object mapArg = ctorArgs[0];
-                    if (!(mapArg instanceof clojure.lang.IPersistentMap m))
-                        throw new RuntimeException("map->" + typeName + ": arg must be a map");
-                    Object[] fieldValues = new Object[capturedFieldNames.size()];
-                    for (int i = 0; i < capturedFieldNames.size(); i++) {
-                        clojure.lang.Keyword kw = clojure.lang.Keyword.intern(capturedFieldNames.get(i));
-                        fieldValues[i] = m.valAt(kw);
-                    }
-                    ClojureDeftypeInstance inst = new ClojureDeftypeInstance(typeName, fieldValues, fieldIdx);
-                    inst.setRecord(true);
-                    if (capturedTypeMethods != null) inst.setMethods(capturedTypeMethods);
-                    return inst;
-                });
-
-                return ClojureNil.INSTANCE;
+                return evalDeftype(capturedProtoMethods, frame, context, typeName, capturedFieldNames, true);
             }
         };
     }
@@ -2735,28 +2444,12 @@ public class Analyzer {
         java.util.Set<String> capturedExcludes = java.util.Set.copyOf(referClojureExcludes);
         boolean capturedHasReferClojure = hasReferClojure;
 
+        final Analyzer self = this;
         return new ExpressionNode() {
             @Override
             public Object executeGeneric(com.oracle.truffle.api.frame.VirtualFrame frame) {
-                context.getOrCreateNamespace(nsName);
-                context.setCurrentNamespace(nsName);
-                ClojureNamespace ns = context.getNamespace(nsName);
-                ClojureNamespace core = context.getNamespace("clojure.core");
-                // Refer clojure.core (with optional exclusions)
-                if (core != null) {
-                    if (capturedHasReferClojure && !capturedExcludes.isEmpty()) {
-                        ns.referWithExclude(core, capturedExcludes);
-                    } else {
-                        ns.referAll(core);
-                    }
-                }
-                // Process requires
-                for (Object spec : capturedRequires) processRequireSpec(spec);
-                // Process uses
-                for (Object spec : capturedUses) processUseSpec(spec);
-                // Process imports
-                for (Object spec : capturedImports) processImportSpec(spec);
-                return ClojureNil.INSTANCE;
+                return doNs(context, nsName, capturedRequires, capturedUses, capturedImports,
+                           capturedExcludes, capturedHasReferClojure, self);
             }
         };
     }
@@ -2770,12 +2463,7 @@ public class Analyzer {
             @Override
             public Object executeGeneric(com.oracle.truffle.api.frame.VirtualFrame frame) {
                 Object name = nsNode.executeGeneric(frame);
-                String nsName;
-                if (name instanceof clojure.lang.Symbol sym) nsName = sym.getName();
-                else nsName = name.toString();
-                context.getOrCreateNamespace(nsName);
-                context.setCurrentNamespace(nsName);
-                return ClojureNil.INSTANCE;
+                return doInNs(context, name);
             }
         };
     }
@@ -2788,11 +2476,11 @@ public class Analyzer {
             args = args.next();
         }
         List<Object> capturedSpecs = List.copyOf(specs);
+        final Analyzer self = this;
         return new ExpressionNode() {
             @Override
             public Object executeGeneric(com.oracle.truffle.api.frame.VirtualFrame frame) {
-                for (Object spec : capturedSpecs) processRequireSpec(spec);
-                return ClojureNil.INSTANCE;
+                return doRequire(self, capturedSpecs);
             }
         };
     }
@@ -3449,20 +3137,7 @@ public class Analyzer {
                             @Override
                             public Object executeGeneric(com.oracle.truffle.api.frame.VirtualFrame frame) {
                                 Object rest = restNode.executeGeneric(frame);
-                                if (rest == null || rest instanceof ClojureNil) {
-                                    return clojure.lang.PersistentHashMap.EMPTY;
-                                }
-                                // Single map argument (Clojure 1.11+ style)
-                                clojure.lang.ISeq s = null;
-                                if (rest instanceof clojure.lang.Seqable sq) s = sq.seq();
-                                else if (rest instanceof clojure.lang.ISeq is) s = is;
-                                if (s != null && s.next() == null && s.first() instanceof clojure.lang.IPersistentMap) {
-                                    return s.first();
-                                }
-                                // Flat key-value pairs: (apply hash-map rest)
-                                return context.callFunction(
-                                        context.getVar("apply"),
-                                        new Object[]{context.getVar("hash-map"), rest});
+                                return convertKwArgs(rest, context);
                             }
                         };
                         destructSlots.add(mapSlot);
@@ -4068,14 +3743,7 @@ public class Analyzer {
         return new ExpressionNode() {
             @Override
             public Object executeGeneric(com.oracle.truffle.api.frame.VirtualFrame frame) {
-                for (String name : capturedNames) {
-                    // Only set to nil if not already defined
-                    Object existing = context.getVar(name);
-                    if (existing == null) {
-                        context.setVar(name, ClojureNil.INSTANCE);
-                    }
-                }
-                return ClojureNil.INSTANCE;
+                return declareVars(context, capturedNames);
             }
         };
     }
@@ -4408,9 +4076,7 @@ public class Analyzer {
             @Override
             public Object executeGeneric(com.oracle.truffle.api.frame.VirtualFrame frame) {
                 Object lock = lockExpr.executeGeneric(frame);
-                synchronized (lock) {
-                    return bodyExpr.executeGeneric(frame);
-                }
+                return doLocking(lock, bodyExpr, frame);
             }
         };
     }
@@ -4581,5 +4247,350 @@ public class Analyzer {
 
     private static RuntimeException err(String msg) {
         return new RuntimeException(msg);
+    }
+
+    @com.oracle.truffle.api.CompilerDirectives.TruffleBoundary
+    static Object accessInstanceField(Object obj, String fieldName) {
+        if (obj instanceof ClojureDeftypeInstance inst) {
+            return inst.getField(fieldName);
+        }
+        try {
+            java.lang.reflect.Field f = obj.getClass().getField(fieldName);
+            return clojure.truffle.nodes.interop.JavaInteropUtil.wrapResult(f.get(obj));
+        } catch (Exception e) {
+            throw new RuntimeException("No field '" + fieldName + "' on " + obj.getClass().getName());
+        }
+    }
+
+    @com.oracle.truffle.api.CompilerDirectives.TruffleBoundary
+    static Object setStaticField(String className, String fieldName, Object value) {
+        try {
+            Class<?> clazz = clojure.truffle.nodes.interop.JavaInteropUtil.resolveClass(className);
+            java.lang.reflect.Field field = clazz.getField(fieldName);
+            field.setAccessible(true);
+            if (field.getType() == boolean.class || field.getType() == Boolean.class) {
+                if (value instanceof Boolean b) field.set(null, b);
+                else field.set(null, value != null && !(value instanceof clojure.truffle.runtime.ClojureNil));
+            } else {
+                field.set(null, value);
+            }
+            return value;
+        } catch (Exception e) {
+            throw new RuntimeException("set!: cannot set field " + className + "/" + fieldName + ": " + e.getMessage(), e);
+        }
+    }
+
+    @com.oracle.truffle.api.CompilerDirectives.TruffleBoundary
+    static Object registerDefmethod(ClojureContext context, String mmName, Object dispatchVal, Object methodFn) {
+        Object mm = context.getVar(mmName);
+        if (!(mm instanceof ClojureMultiMethod multi))
+            throw new RuntimeException("defmethod: " + mmName + " is not a multimethod");
+        multi.addMethod(dispatchVal, methodFn);
+        return multi;
+    }
+
+    @com.oracle.truffle.api.CompilerDirectives.TruffleBoundary
+    static Object registerDefprotocol(ClojureContext context, String protoName, List<String> methodNames) {
+        ClojureProtocol proto = new ClojureProtocol(protoName, methodNames);
+        context.setVar(protoName, proto);
+        for (String methodName : methodNames) {
+            context.setVar(methodName, new ClojureContext.NamedBuiltin(
+                    protoName + "/" + methodName, fnArgs -> {
+                if (fnArgs.length < 1)
+                    throw new RuntimeException(protoName + "/" + methodName + ": missing target (this)");
+                Object target = fnArgs[0];
+                Object fn = proto.findMethod(methodName, target);
+                if (fn == null) {
+                    String targetType = target instanceof clojure.truffle.runtime.ClojureReified r
+                            ? "ClojureReified{" + String.join(",", r.getMethods().keySet()) + "}"
+                            : target.getClass().getName();
+                    throw new RuntimeException("No implementation of protocol " + protoName +
+                            " method " + methodName + " for type: " + targetType);
+                }
+                return context.callFunction(fn, fnArgs);
+            }));
+        }
+        return proto;
+    }
+
+    @com.oracle.truffle.api.CompilerDirectives.TruffleBoundary
+    static Object registerDeftype(ClojureContext context, String typeName, List<String> fieldNames,
+                                  java.util.Map<String, java.util.Map<String, Object>> evaluatedMethods,
+                                  boolean isRecord) {
+        java.util.Map<String, Integer> fieldIdx = new java.util.LinkedHashMap<>();
+        for (int i = 0; i < fieldNames.size(); i++)
+            fieldIdx.put(fieldNames.get(i), i);
+
+        java.util.Map<String, Object> typeMethods = new java.util.HashMap<>();
+
+        for (var entry : evaluatedMethods.entrySet()) {
+            String protoName = entry.getKey();
+            Object protoObj = context.getVar(protoName);
+            if (protoObj instanceof ClojureProtocol proto) {
+                proto.extend(typeName, new java.util.HashMap<>(entry.getValue()));
+            } else {
+                for (var methodEntry : entry.getValue().entrySet()) {
+                    Object fn = methodEntry.getValue();
+                    String mName = methodEntry.getKey();
+                    Object existing = typeMethods.get(mName);
+                    if (existing != null && fn instanceof ClojureFunction newCf) {
+                        if (existing instanceof MultiArityFunction maf) {
+                            int newArity = newCf.getArity();
+                            int[] oldArities = maf.getArities();
+                            ClojureFunction[] oldFns = maf.getFunctions();
+                            int[] newArities = new int[oldArities.length + 1];
+                            ClojureFunction[] newFns = new ClojureFunction[oldFns.length + 1];
+                            System.arraycopy(oldArities, 0, newArities, 0, oldArities.length);
+                            System.arraycopy(oldFns, 0, newFns, 0, oldFns.length);
+                            newArities[oldArities.length] = newArity;
+                            newFns[oldFns.length] = newCf;
+                            MultiArityFunction merged = new MultiArityFunction(newArities, newFns,
+                                    newCf.isVariadic() ? oldArities.length : maf.getVariadicIndex());
+                            context.registerTypeMethod(typeName, mName, merged);
+                            typeMethods.put(mName, merged);
+                        } else if (existing instanceof ClojureFunction existCf) {
+                            int[] mergedArities = {existCf.getArity(), newCf.getArity()};
+                            ClojureFunction[] mergedFns = {existCf, newCf};
+                            int varIdx = existCf.isVariadic() ? 0 : (newCf.isVariadic() ? 1 : -1);
+                            MultiArityFunction merged = new MultiArityFunction(mergedArities, mergedFns, varIdx);
+                            context.registerTypeMethod(typeName, mName, merged);
+                            typeMethods.put(mName, merged);
+                        } else {
+                            context.registerTypeMethod(typeName, mName, fn);
+                            typeMethods.put(mName, fn);
+                        }
+                    } else {
+                        context.registerTypeMethod(typeName, mName, fn);
+                        typeMethods.put(mName, fn);
+                    }
+                }
+            }
+        }
+
+        java.util.Map<String, Object> capturedTypeMethods =
+                typeMethods.isEmpty() ? null : new java.util.HashMap<>(typeMethods);
+
+        context.setVar("->" + typeName, (ClojureContext.BuiltinFunction) ctorArgs -> {
+            if (ctorArgs.length != fieldNames.size())
+                throw new RuntimeException("->" + typeName + ": expected " + fieldNames.size() + " args");
+            ClojureDeftypeInstance inst = new ClojureDeftypeInstance(typeName, ctorArgs.clone(), fieldIdx);
+            if (isRecord) inst.setRecord(true);
+            if (capturedTypeMethods != null) inst.setMethods(capturedTypeMethods);
+            return inst;
+        });
+
+        context.setVar(typeName, typeName);
+
+        if (isRecord) {
+            context.setVar("map->" + typeName, (ClojureContext.BuiltinFunction) ctorArgs -> {
+                if (ctorArgs.length != 1)
+                    throw new RuntimeException("map->" + typeName + ": expected 1 arg (a map)");
+                Object mapArg = ctorArgs[0];
+                if (!(mapArg instanceof clojure.lang.IPersistentMap m))
+                    throw new RuntimeException("map->" + typeName + ": arg must be a map");
+                Object[] fieldValues = new Object[fieldNames.size()];
+                for (int i = 0; i < fieldNames.size(); i++) {
+                    clojure.lang.Keyword kw = clojure.lang.Keyword.intern(fieldNames.get(i));
+                    fieldValues[i] = m.valAt(kw);
+                }
+                ClojureDeftypeInstance inst = new ClojureDeftypeInstance(typeName, fieldValues, fieldIdx);
+                inst.setRecord(true);
+                if (capturedTypeMethods != null) inst.setMethods(capturedTypeMethods);
+                return inst;
+            });
+        }
+
+        return ClojureNil.INSTANCE;
+    }
+
+    @com.oracle.truffle.api.CompilerDirectives.TruffleBoundary
+    static Object referClojureBoundary(ClojureContext context, java.util.Set<String> excludes) {
+        ClojureNamespace core = context.getNamespace("clojure.core");
+        ClojureNamespace currentNs = context.getNamespace(context.getCurrentNamespace());
+        if (core != null && currentNs != null) {
+            currentNs.referWithExclude(core, excludes);
+        }
+        return ClojureNil.INSTANCE;
+    }
+
+    @com.oracle.truffle.api.CompilerDirectives.TruffleBoundary
+    static Object evalDeftype(java.util.Map<String, java.util.Map<String, ExpressionNode>> protoMethods,
+                              Object frameObj, ClojureContext context, String typeName,
+                              List<String> fieldNames, boolean isRecord) {
+        com.oracle.truffle.api.frame.VirtualFrame frame = (com.oracle.truffle.api.frame.VirtualFrame) frameObj;
+        java.util.Map<String, java.util.Map<String, Object>> evaluatedMethods = new java.util.LinkedHashMap<>();
+        for (var entry : protoMethods.entrySet()) {
+            java.util.Map<String, Object> evaluated = new java.util.LinkedHashMap<>();
+            for (var methodEntry : entry.getValue().entrySet()) {
+                evaluated.put(methodEntry.getKey(), methodEntry.getValue().executeGeneric(frame));
+            }
+            evaluatedMethods.put(entry.getKey(), evaluated);
+        }
+        return registerDeftype(context, typeName, fieldNames, evaluatedMethods, isRecord);
+    }
+
+    @com.oracle.truffle.api.CompilerDirectives.TruffleBoundary
+    static Object declareVars(ClojureContext context, List<String> names) {
+        for (String name : names) {
+            Object existing = context.getVar(name);
+            if (existing == null) {
+                context.setVar(name, ClojureNil.INSTANCE);
+            }
+        }
+        return ClojureNil.INSTANCE;
+    }
+
+    @com.oracle.truffle.api.CompilerDirectives.TruffleBoundary
+    static Object convertKwArgs(Object rest, ClojureContext context) {
+        if (rest == null || rest instanceof ClojureNil) {
+            return clojure.lang.PersistentHashMap.EMPTY;
+        }
+        // Single map argument (Clojure 1.11+ style)
+        clojure.lang.ISeq s = null;
+        if (rest instanceof clojure.lang.Seqable sq) s = sq.seq();
+        else if (rest instanceof clojure.lang.ISeq is) s = is;
+        if (s != null && s.next() == null && s.first() instanceof clojure.lang.IPersistentMap) {
+            return s.first();
+        }
+        // Flat key-value pairs: (apply hash-map rest)
+        return context.callFunction(
+                context.getVar("apply"),
+                new Object[]{context.getVar("hash-map"), rest});
+    }
+
+    @com.oracle.truffle.api.CompilerDirectives.TruffleBoundary
+    static Object doUse(Analyzer analyzer, List<Object> specs) {
+        for (Object spec : specs) analyzer.processUseSpec(spec);
+        return ClojureNil.INSTANCE;
+    }
+
+    @com.oracle.truffle.api.CompilerDirectives.TruffleBoundary
+    static Object doLoad(ClojureContext context, List<String> paths, Analyzer self) {
+        String currentNs = context.getCurrentNamespace();
+        for (String path : paths) {
+            String fullPath;
+            if (path.startsWith("/")) {
+                fullPath = path;
+            } else {
+                String rootRes = "/" + currentNs.replace('.', '/').replace('-', '_');
+                int lastSlash = rootRes.lastIndexOf('/');
+                String rootDir = lastSlash > 0 ? rootRes.substring(0, lastSlash) : "";
+                fullPath = rootDir + "/" + path;
+            }
+            String cleanPath = fullPath.startsWith("/") ? fullPath.substring(1) : fullPath;
+            String resourcePath = cleanPath + ".clj";
+            java.io.InputStream is = context.findResource(resourcePath);
+            if (is == null) {
+                resourcePath = cleanPath + ".cljc";
+                is = context.findResource(resourcePath);
+            }
+            if (is == null) {
+                throw new RuntimeException("Cannot find resource for load: " + path);
+            }
+            try {
+                byte[] bytes = is.readAllBytes();
+                is.close();
+                String source = new String(bytes, java.nio.charset.StandardCharsets.UTF_8);
+                Analyzer loader = new Analyzer(context.getLanguage());
+                loader.setContext(context);
+                loader.loadSource(source, context.getLanguage());
+            } catch (java.io.IOException e) {
+                throw new RuntimeException("Error loading: " + path, e);
+            }
+        }
+        return ClojureNil.INSTANCE;
+    }
+
+    @com.oracle.truffle.api.CompilerDirectives.TruffleBoundary
+    static Object doRefer(ClojureContext context, List<Object> capturedArgs) {
+        if (capturedArgs.isEmpty()) return ClojureNil.INSTANCE;
+        Object nsArg = capturedArgs.get(0);
+        if (nsArg instanceof ISeq qs && qs.first() instanceof Symbol s && s.getName().equals("quote")) {
+            nsArg = qs.next().first();
+        }
+        String nsName;
+        if (nsArg instanceof Symbol sym) nsName = sym.getName();
+        else nsName = nsArg.toString();
+        ClojureNamespace reqNs = context.getNamespace(nsName);
+        ClojureNamespace currentNs = context.getNamespace(context.getCurrentNamespace());
+        if (reqNs == null || currentNs == null) return ClojureNil.INSTANCE;
+        if (capturedArgs.size() >= 3) {
+            Object filterKey = capturedArgs.get(1);
+            if (filterKey instanceof Keyword kw && kw.getName().equals("only")) {
+                Object symsArg = capturedArgs.get(2);
+                if (symsArg instanceof ISeq qs2 && qs2.first() instanceof Symbol s2 && s2.getName().equals("quote")) {
+                    symsArg = qs2.next().first();
+                }
+                if (symsArg instanceof IPersistentVector pv) {
+                    List<String> names = new ArrayList<>();
+                    for (int i = 0; i < pv.count(); i++) {
+                        names.add(((Symbol) pv.nth(i)).getName());
+                    }
+                    currentNs.referOnly(reqNs, names);
+                    return ClojureNil.INSTANCE;
+                }
+            }
+        }
+        currentNs.referAll(reqNs);
+        return ClojureNil.INSTANCE;
+    }
+
+    @com.oracle.truffle.api.CompilerDirectives.TruffleBoundary
+    static Object doDefmulti(ClojureContext context, String name, Object dispatchFn) {
+        ClojureMultiMethod mm = new ClojureMultiMethod(name, dispatchFn, context);
+        context.setVar(name, mm);
+        return mm;
+    }
+
+    @com.oracle.truffle.api.CompilerDirectives.TruffleBoundary
+    static Object doDefinterface(ClojureContext context, String ifaceName, List<String> methodNames) {
+        ClojureProtocol proto = new ClojureProtocol(ifaceName, methodNames);
+        context.setVar(ifaceName, proto);
+        return proto;
+    }
+
+    @com.oracle.truffle.api.CompilerDirectives.TruffleBoundary
+    static Object doNs(ClojureContext context, String nsName, List<Object> requires,
+                       List<Object> uses, List<Object> imports,
+                       java.util.Set<String> excludes, boolean hasReferClojure, Analyzer self) {
+        context.getOrCreateNamespace(nsName);
+        context.setCurrentNamespace(nsName);
+        ClojureNamespace ns = context.getNamespace(nsName);
+        ClojureNamespace core = context.getNamespace("clojure.core");
+        if (core != null) {
+            if (hasReferClojure && !excludes.isEmpty()) {
+                ns.referWithExclude(core, excludes);
+            } else {
+                ns.referAll(core);
+            }
+        }
+        for (Object spec : requires) self.processRequireSpec(spec);
+        for (Object spec : uses) self.processUseSpec(spec);
+        for (Object spec : imports) self.processImportSpec(spec);
+        return ClojureNil.INSTANCE;
+    }
+
+    @com.oracle.truffle.api.CompilerDirectives.TruffleBoundary
+    static Object doInNs(ClojureContext context, Object name) {
+        String nsName;
+        if (name instanceof clojure.lang.Symbol sym) nsName = sym.getName();
+        else nsName = name.toString();
+        context.getOrCreateNamespace(nsName);
+        context.setCurrentNamespace(nsName);
+        return ClojureNil.INSTANCE;
+    }
+
+    @com.oracle.truffle.api.CompilerDirectives.TruffleBoundary
+    static Object doRequire(Analyzer self, List<Object> specs) {
+        for (Object spec : specs) self.processRequireSpec(spec);
+        return ClojureNil.INSTANCE;
+    }
+
+    @com.oracle.truffle.api.CompilerDirectives.TruffleBoundary
+    static Object doLocking(Object lock, ExpressionNode bodyExpr, Object frameObj) {
+        com.oracle.truffle.api.frame.VirtualFrame frame = (com.oracle.truffle.api.frame.VirtualFrame) frameObj;
+        synchronized (lock) {
+            return bodyExpr.executeGeneric(frame);
+        }
     }
 }

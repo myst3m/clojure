@@ -1,5 +1,7 @@
 package clojure.truffle.nodes;
 
+import com.oracle.truffle.api.CompilerDirectives;
+import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 import com.oracle.truffle.api.frame.FrameDescriptor;
 import com.oracle.truffle.api.frame.VirtualFrame;
 import com.oracle.truffle.api.nodes.RootNode;
@@ -46,23 +48,8 @@ public class FnBodyNode extends RootNode {
 
         // Copy positional params (args[1..paramCount])
         if (args.length < paramCount + 1) {
-            String fnName = name != null ? name : "<anon>";
-            StringBuilder detail = new StringBuilder();
-            detail.append("Wrong number of args (").append(args.length - 1)
-                .append(") passed to fn ").append(fnName)
-                .append(", expected ").append(paramCount);
-            for (int ai = 1; ai < args.length; ai++) {
-                Object a = args[ai];
-                detail.append(" arg[").append(ai).append("]=")
-                    .append(a != null ? a.getClass().getSimpleName() + ":" +
-                        a.toString().substring(0, Math.min(60, a.toString().length())) : "null");
-            }
-            detail.append(" variadicSlot=").append(variadicSlot);
-            detail.append(" selfSlot=").append(selfSlot);
-            detail.append(" frameSlots=").append(getFrameDescriptor().getNumberOfSlots());
-            RuntimeException ex = new RuntimeException(detail.toString());
-            ex.printStackTrace(System.err);
-            throw ex;
+            CompilerDirectives.transferToInterpreterAndInvalidate();
+            throwArityError(args);
         }
         for (int i = 0; i < paramCount; i++) {
             frame.setObject(paramSlots[i], args[i + 1]);
@@ -104,16 +91,31 @@ public class FnBodyNode extends RootNode {
         }
     }
 
+    @TruffleBoundary
+    private void throwArityError(Object[] args) {
+        String fnName = name != null ? name : "<anon>";
+        StringBuilder detail = new StringBuilder();
+        detail.append("Wrong number of args (").append(args.length - 1)
+            .append(") passed to fn ").append(fnName)
+            .append(", expected ").append(paramCount);
+        throw new RuntimeException(detail.toString());
+    }
+
     private void collectVariadic(VirtualFrame frame, Object[] args, int restStart) {
         if (args.length > restStart) {
-            IPersistentCollection list = PersistentList.EMPTY;
-            for (int i = args.length - 1; i >= restStart; i--) {
-                list = list.cons(args[i]);
-            }
-            frame.setObject(variadicSlot, list);
+            frame.setObject(variadicSlot, buildVariadicList(args, restStart));
         } else {
             frame.setObject(variadicSlot, ClojureNil.INSTANCE);
         }
+    }
+
+    @TruffleBoundary
+    private static Object buildVariadicList(Object[] args, int restStart) {
+        IPersistentCollection list = PersistentList.EMPTY;
+        for (int i = args.length - 1; i >= restStart; i--) {
+            list = list.cons(args[i]);
+        }
+        return list;
     }
 
     public int getParamCount() { return paramCount; }

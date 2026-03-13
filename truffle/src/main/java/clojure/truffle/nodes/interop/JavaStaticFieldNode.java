@@ -1,6 +1,7 @@
 package clojure.truffle.nodes.interop;
 
 import clojure.truffle.nodes.ExpressionNode;
+import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 import com.oracle.truffle.api.frame.VirtualFrame;
 
 import java.lang.reflect.Field;
@@ -17,6 +18,11 @@ public class JavaStaticFieldNode extends ExpressionNode {
 
     @Override
     public Object executeGeneric(VirtualFrame frame) {
+        return getStaticField(clazz, fieldName);
+    }
+
+    @TruffleBoundary
+    private static Object getStaticField(Class<?> clazz, String fieldName) {
         try {
             Field field = clazz.getField(fieldName);
             Object result = field.get(null);

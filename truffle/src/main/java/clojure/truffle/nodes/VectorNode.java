@@ -1,5 +1,6 @@
 package clojure.truffle.nodes;
 
+import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 import com.oracle.truffle.api.frame.VirtualFrame;
 import clojure.lang.PersistentVector;
 
@@ -19,6 +20,11 @@ public class VectorNode extends ExpressionNode {
         for (int i = 0; i < elements.length; i++) {
             values[i] = elements[i].executeGeneric(frame);
         }
+        return createVector(values);
+    }
+
+    @TruffleBoundary
+    private static PersistentVector createVector(Object[] values) {
         return PersistentVector.create(Arrays.asList(values));
     }
 }

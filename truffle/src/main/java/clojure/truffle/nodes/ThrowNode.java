@@ -1,5 +1,6 @@
 package clojure.truffle.nodes;
 
+import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 import com.oracle.truffle.api.frame.VirtualFrame;
 
 public class ThrowNode extends ExpressionNode {
@@ -16,7 +17,12 @@ public class ThrowNode extends ExpressionNode {
         if (value instanceof Throwable t) {
             sneakyThrow(t);
         }
-        throw new RuntimeException(value.toString());
+        throw createRuntimeException(value);
+    }
+
+    @TruffleBoundary
+    private static RuntimeException createRuntimeException(Object value) {
+        return new RuntimeException(value.toString());
     }
 
     @SuppressWarnings("unchecked")

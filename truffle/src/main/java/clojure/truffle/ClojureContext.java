@@ -1,5 +1,6 @@
 package clojure.truffle;
 
+import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 import com.oracle.truffle.api.TruffleLanguage;
 import clojure.truffle.nodes.EvalRootNode;
 import clojure.truffle.nodes.ExpressionNode;
@@ -165,6 +166,7 @@ public class ClojureContext {
         return methods != null ? methods.get(methodName) : null;
     }
 
+    @TruffleBoundary
     public void setVar(String name, Object value) {
         // Only put into globalVars if we're in clojure.core (or no namespace yet)
         // Otherwise, namespace-local defs should NOT pollute the global scope
@@ -176,6 +178,7 @@ public class ClojureContext {
         if (ns != null) ns.intern(name, value);
     }
 
+    @TruffleBoundary
     public Object getVar(String name) {
         // Check for qualified name: ns/sym
         int slash = name.indexOf('/');
@@ -208,6 +211,7 @@ public class ClojureContext {
         return globalVars.get(name);
     }
 
+    @TruffleBoundary
     public clojure.truffle.runtime.ClojureVar getOrCreateVar(String name) {
         String ns = currentNamespace;
         String sym = name;
@@ -229,6 +233,7 @@ public class ClojureContext {
         }
     }
 
+    @TruffleBoundary
     public void setMacro(String name, Object fn) {
         // Only put into global macros map for core/user namespaces
         if (currentNamespace == null || "clojure.core".equals(currentNamespace) || "user".equals(currentNamespace)) {
@@ -243,6 +248,7 @@ public class ClojureContext {
         }
     }
 
+    @TruffleBoundary
     public Object getMacro(String name) {
         // Check current namespace's macros first, then fall back to global
         ClojureNamespace ns = namespaces.get(currentNamespace);
@@ -283,6 +289,7 @@ public class ClojureContext {
         return namespaces.computeIfAbsent(name, ClojureNamespace::new);
     }
 
+    @TruffleBoundary
     public ClojureNamespace getNamespace(String name) {
         return namespaces.get(name);
     }
@@ -295,23 +302,28 @@ public class ClojureContext {
         dynamicVars.add(name);
     }
 
+    @TruffleBoundary
     public boolean isDynamic(String name) {
         return dynamicVars.contains(name);
     }
 
+    @TruffleBoundary
     public void pushThreadBinding(String name, Object value) {
         threadBindings.get().put(name, value);
     }
 
+    @TruffleBoundary
     public void popThreadBinding(String name) {
         threadBindings.get().remove(name);
     }
 
+    @TruffleBoundary
     public Object getThreadBinding(String name) {
         return threadBindings.get().get(name);
     }
 
     // Override getVar to check thread-local bindings first for dynamic vars
+    @TruffleBoundary
     public Object getVarWithBindings(String name) {
         if (dynamicVars.contains(name)) {
             Object bound = threadBindings.get().get(name);
@@ -6782,6 +6794,7 @@ public class ClojureContext {
         }
     }
 
+    @TruffleBoundary
     public Object callFunction(Object fn, Object[] args) {
         // Dereference ClojureVar to its value
         if (fn instanceof clojure.truffle.runtime.ClojureVar cvar) {
@@ -7067,6 +7080,7 @@ public class ClojureContext {
         return -toDouble(a);
     }
 
+    @TruffleBoundary
     private static double toDouble(Object o) {
         if (o instanceof Long l) return l.doubleValue();
         if (o instanceof Double d) return d;
@@ -7077,6 +7091,7 @@ public class ClojureContext {
     // --- Comparison helpers ---
 
     @SuppressWarnings("unchecked")
+    @TruffleBoundary
     private static int compareNumbers(Object a, Object b) {
         if (a instanceof Long la && b instanceof Long lb) return Long.compare(la, lb);
         return Double.compare(toDouble(a), toDouble(b));

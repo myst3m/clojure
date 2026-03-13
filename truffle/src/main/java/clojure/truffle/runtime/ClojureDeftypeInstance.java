@@ -4,6 +4,7 @@ import com.oracle.truffle.api.interop.InteropLibrary;
 import com.oracle.truffle.api.interop.TruffleObject;
 import com.oracle.truffle.api.library.ExportLibrary;
 import com.oracle.truffle.api.library.ExportMessage;
+import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 import com.oracle.truffle.api.TruffleLanguage;
 import clojure.truffle.ClojureTruffleLanguage;
 
@@ -178,11 +179,13 @@ public class ClojureDeftypeInstance implements TruffleObject, clojure.lang.ILook
     Class<? extends TruffleLanguage<?>> getLanguage() { return ClojureTruffleLanguage.class; }
 
     @ExportMessage
+    @TruffleBoundary
     Object toDisplayString(@SuppressWarnings("unused") boolean allowSideEffects) {
         return toString();
     }
 
     @Override
+    @TruffleBoundary
     public String toString() {
         StringBuilder sb = new StringBuilder("#" + typeName + "{");
         boolean first = true;

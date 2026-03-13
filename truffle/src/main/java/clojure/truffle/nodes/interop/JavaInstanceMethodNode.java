@@ -1,6 +1,7 @@
 package clojure.truffle.nodes.interop;
 
 import clojure.truffle.nodes.ExpressionNode;
+import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 import com.oracle.truffle.api.frame.VirtualFrame;
 
 import java.lang.reflect.Method;
@@ -24,10 +25,13 @@ public class JavaInstanceMethodNode extends ExpressionNode {
         for (int i = 0; i < argNodes.length; i++) {
             args[i] = argNodes[i].executeGeneric(frame);
         }
+        return invokeMethod(target, methodName, args);
+    }
 
+    @TruffleBoundary
+    private static Object invokeMethod(Object target, String methodName, Object[] args) {
         Class<?> clazz = target.getClass();
         Method method = JavaInteropUtil.findMethod(clazz, methodName, args, false);
-        // For non-public classes (e.g. Collections$UnmodifiableMap), search public interfaces
         if (method == null || !java.lang.reflect.Modifier.isPublic(method.getDeclaringClass().getModifiers())) {
             Method ifaceMethod = null;
             for (Class<?> iface : JavaInteropUtil.getAllInterfaces(clazz)) {
@@ -36,7 +40,6 @@ public class JavaInstanceMethodNode extends ExpressionNode {
             }
             if (ifaceMethod != null) method = ifaceMethod;
         }
-        // For Proxy objects, search interfaces if method not found on proxy class
         if (method == null && java.lang.reflect.Proxy.isProxyClass(clazz)) {
             for (Class<?> iface : clazz.getInterfaces()) {
                 method = JavaInteropUtil.findMethod(iface, methodName, args, false);
@@ -44,7 +47,6 @@ public class JavaInstanceMethodNode extends ExpressionNode {
             }
         }
         if (method == null && args.length == 0) {
-            // Fall back to field access: (.name obj) may be a public field
             try {
                 java.lang.reflect.Field field = JavaInteropUtil.findField(clazz, methodName);
                 if (field != null) {
@@ -57,7 +59,6 @@ public class JavaInstanceMethodNode extends ExpressionNode {
             throw new RuntimeException("No such method: " + clazz.getName() + "." + methodName
                     + " with " + args.length + " args");
         }
-
         try {
             method.setAccessible(true);
             Object[] coerced = JavaInteropUtil.coerceArgs(method, args);

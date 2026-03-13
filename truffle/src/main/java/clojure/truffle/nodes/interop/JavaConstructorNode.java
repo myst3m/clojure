@@ -1,6 +1,7 @@
 package clojure.truffle.nodes.interop;
 
 import clojure.truffle.nodes.ExpressionNode;
+import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 import com.oracle.truffle.api.frame.VirtualFrame;
 
 import java.lang.reflect.Constructor;
@@ -21,7 +22,11 @@ public class JavaConstructorNode extends ExpressionNode {
         for (int i = 0; i < argNodes.length; i++) {
             args[i] = argNodes[i].executeGeneric(frame);
         }
+        return invokeConstructor(clazz, args);
+    }
 
+    @TruffleBoundary
+    private static Object invokeConstructor(Class<?> clazz, Object[] args) {
         Constructor<?> ctor = JavaInteropUtil.findConstructor(clazz, args);
         if (ctor == null) {
             throw new RuntimeException("No matching constructor for " + clazz.getName() +

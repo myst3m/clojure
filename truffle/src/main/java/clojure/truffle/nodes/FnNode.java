@@ -1,6 +1,7 @@
 package clojure.truffle.nodes;
 
 import com.oracle.truffle.api.CallTarget;
+import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 import com.oracle.truffle.api.frame.VirtualFrame;
 import clojure.truffle.runtime.ClojureFunction;
 
@@ -28,6 +29,11 @@ public class FnNode extends ExpressionNode {
                 captured[i] = frame.getObject(outerCaptureSlots[i]);
             }
         }
+        return createFunction(name, callTarget, captured);
+    }
+
+    @TruffleBoundary
+    private static ClojureFunction createFunction(String name, CallTarget callTarget, Object[] captured) {
         return new ClojureFunction(name, callTarget, captured);
     }
 }

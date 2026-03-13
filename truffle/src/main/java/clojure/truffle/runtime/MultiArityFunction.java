@@ -29,6 +29,13 @@ public class MultiArityFunction extends AFn {
         if (variadicIndex >= 0 && argCount >= arities[variadicIndex]) {
             return functions[variadicIndex];
         }
+        com.oracle.truffle.api.CompilerDirectives.transferToInterpreterAndInvalidate();
+        throwArityError(argCount);
+        return null; // unreachable
+    }
+
+    @com.oracle.truffle.api.CompilerDirectives.TruffleBoundary
+    private static void throwArityError(int argCount) {
         throw new RuntimeException("Wrong number of args (" + argCount + ") passed to fn");
     }
 

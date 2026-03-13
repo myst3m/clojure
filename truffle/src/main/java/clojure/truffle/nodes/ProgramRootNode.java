@@ -1,5 +1,6 @@
 package clojure.truffle.nodes;
 
+import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 import com.oracle.truffle.api.frame.FrameDescriptor;
 import com.oracle.truffle.api.frame.VirtualFrame;
 import com.oracle.truffle.api.nodes.RootNode;
@@ -21,6 +22,16 @@ public class ProgramRootNode extends RootNode {
 
     @Override
     public Object execute(VirtualFrame frame) {
+        // Delegate to boundary method to prevent Truffle PE from analyzing
+        // all top-level expression nodes (which include heavy operations
+        // like reflection, context lookups, etc.)
+        // JIT compilation only applies to FnBodyNode (function bodies).
+        return executeBody(bodyNodes, frame);
+    }
+
+    @TruffleBoundary
+    private static Object executeBody(ExpressionNode[] bodyNodes, Object frameObj) {
+        VirtualFrame frame = (VirtualFrame) frameObj;
         Object result = ClojureNil.INSTANCE;
         for (ExpressionNode node : bodyNodes) {
             result = node.executeGeneric(frame);

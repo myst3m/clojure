@@ -1,5 +1,6 @@
 package clojure.truffle.nodes;
 
+import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
 import com.oracle.truffle.api.frame.FrameDescriptor;
 import com.oracle.truffle.api.frame.VirtualFrame;
 import com.oracle.truffle.api.nodes.RootNode;
@@ -22,6 +23,12 @@ public class EvalRootNode extends RootNode {
 
     @Override
     public Object execute(VirtualFrame frame) {
+        return executeBody(bodyNodes, frame);
+    }
+
+    @TruffleBoundary
+    private static Object executeBody(ExpressionNode[] bodyNodes, Object frameObj) {
+        VirtualFrame frame = (VirtualFrame) frameObj;
         Object result = ClojureNil.INSTANCE;
         for (ExpressionNode node : bodyNodes) {
             result = node.executeGeneric(frame);
