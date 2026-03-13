@@ -19,10 +19,15 @@ public abstract class IncNode extends ExpressionNode {
     }
 
     @Fallback
+    @CompilerDirectives.TruffleBoundary
     protected Object incGeneric(Object a) {
         if (a instanceof Number n) return n.doubleValue() + 1.0;
-        CompilerDirectives.transferToInterpreterAndInvalidate();
-        throw new RuntimeException("Cannot increment non-number: " + a);
+        throw nonNumberError("increment", a);
+    }
+
+    @CompilerDirectives.TruffleBoundary
+    private static RuntimeException nonNumberError(String op, Object o) {
+        return new RuntimeException("Cannot " + op + " non-number: " + o);
     }
 
     public static IncNode create(ExpressionNode operand) {

@@ -35,17 +35,23 @@ public abstract class DivNode extends ExpressionNode {
     }
 
     @Fallback
+    @CompilerDirectives.TruffleBoundary
     protected Object divGeneric(Object a, Object b) {
         double db = toDouble(b);
         return toDouble(a) / db;
     }
 
+    @CompilerDirectives.TruffleBoundary
     private static double toDouble(Object o) {
         if (o instanceof Long l) return l.doubleValue();
         if (o instanceof Double d) return d;
         if (o instanceof Number n) return n.doubleValue();
-        CompilerDirectives.transferToInterpreterAndInvalidate();
-        throw new RuntimeException("Cannot divide non-number: " + o);
+        throw nonNumberError("divide", o);
+    }
+
+    @CompilerDirectives.TruffleBoundary
+    private static RuntimeException nonNumberError(String op, Object o) {
+        return new RuntimeException("Cannot " + op + " non-number: " + o);
     }
 
     public static DivNode create(ExpressionNode left, ExpressionNode right) {

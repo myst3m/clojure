@@ -52,14 +52,17 @@ public class Main {
     private static void evalAndPrint(String code) {
         Context.Builder builder = Context.newBuilder("clj")
                 .allowAllAccess(true)
-                .option("engine.WarnInterpreterOnly", "false");
+                .allowExperimentalOptions(true);
 
-        // Set trace options when requested (requires JVMCI/Graal compiler)
+        // Set trace options when requested
         if ("true".equals(System.getProperty("truffle.trace"))) {
             builder.option("engine.TraceCompilation", "true");
             builder.option("engine.TraceInlining", "true");
-            builder.option("engine.WarnOptionDeprecation", "false");
+            builder.option("engine.CompileImmediately", "true");
+            builder.option("compiler.TraceCompilation", "true");
         }
+        // Lower compilation threshold for faster JIT
+        builder.option("engine.CompilationThreshold", "100");
 
         try (Context context = builder.build()) {
             Value result = context.eval("clj", code);

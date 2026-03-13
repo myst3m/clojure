@@ -2,6 +2,7 @@ package clojure.truffle.nodes;
 
 import com.oracle.truffle.api.CompilerDirectives;
 import com.oracle.truffle.api.CompilerDirectives.TruffleBoundary;
+import com.oracle.truffle.api.Truffle;
 import com.oracle.truffle.api.frame.FrameDescriptor;
 import com.oracle.truffle.api.frame.VirtualFrame;
 import com.oracle.truffle.api.nodes.RootNode;
@@ -10,36 +11,46 @@ import clojure.lang.PersistentList;
 import clojure.truffle.ClojureTruffleLanguage;
 import clojure.truffle.runtime.ClojureFunction;
 import clojure.truffle.runtime.ClojureNil;
-import clojure.truffle.runtime.RecurException;
 
 public class FnBodyNode extends RootNode {
 
-    @Child private ExpressionNode bodyNode;
+    @Child private com.oracle.truffle.api.nodes.LoopNode loopNode;
     private final int[] paramSlots;
     private final int paramCount;
     private final int variadicSlot;     // -1 if not variadic
     private final int[] capturedSlots;
     private final String name;
     private final int selfSlot;         // -1 if not a named fn
+    private final int resultSlot;
 
     public FnBodyNode(ClojureTruffleLanguage language, FrameDescriptor frameDescriptor,
                       String name, int[] paramSlots, int variadicSlot,
                       int[] capturedSlots, ExpressionNode bodyNode) {
-        this(language, frameDescriptor, name, paramSlots, variadicSlot, capturedSlots, bodyNode, -1);
+        this(language, frameDescriptor, name, paramSlots, variadicSlot, capturedSlots, bodyNode, -1, -1);
     }
 
     public FnBodyNode(ClojureTruffleLanguage language, FrameDescriptor frameDescriptor,
                       String name, int[] paramSlots, int variadicSlot,
                       int[] capturedSlots, ExpressionNode bodyNode, int selfSlot) {
+        this(language, frameDescriptor, name, paramSlots, variadicSlot, capturedSlots, bodyNode, selfSlot, -1);
+    }
+
+    public FnBodyNode(ClojureTruffleLanguage language, FrameDescriptor frameDescriptor,
+                      String name, int[] paramSlots, int variadicSlot,
+                      int[] capturedSlots, ExpressionNode bodyNode, int selfSlot, int resultSlot) {
         super(language, frameDescriptor);
         this.name = name;
         this.paramSlots = paramSlots;
         this.paramCount = paramSlots.length;
         this.variadicSlot = variadicSlot;
         this.capturedSlots = capturedSlots;
-        this.bodyNode = bodyNode;
         this.selfSlot = selfSlot;
+        this.resultSlot = resultSlot;
+        FnRecurRepeatingNode repeatingNode = new FnRecurRepeatingNode(
+                bodyNode, paramSlots, variadicSlot, this.resultSlot);
+        this.loopNode = Truffle.getRuntime().createLoopNode(repeatingNode);
     }
+
 
     @Override
     public Object execute(VirtualFrame frame) {
@@ -75,20 +86,10 @@ public class FnBodyNode extends RootNode {
             }
         }
 
-        // Execute body with recur support
-        while (true) {
-            try {
-                return bodyNode.executeGeneric(frame);
-            } catch (RecurException e) {
-                Object[] newValues = e.getValues();
-                for (int i = 0; i < paramCount; i++) {
-                    frame.setObject(paramSlots[i], newValues[i]);
-                }
-                if (variadicSlot >= 0 && newValues.length > paramCount) {
-                    frame.setObject(variadicSlot, newValues[paramCount]);
-                }
-            }
-        }
+        // Execute body with recur support via Truffle LoopNode (enables OSR)
+        frame.setObject(resultSlot, ClojureNil.INSTANCE);
+        loopNode.execute(frame);
+        return frame.getObject(resultSlot);
     }
 
     @TruffleBoundary

@@ -2104,7 +2104,7 @@ public class Analyzer {
                     @Override
                     public Object executeGeneric(com.oracle.truffle.api.frame.VirtualFrame f) {
                         Object val = f.getObject(caseSlot);
-                        throw new RuntimeException("No matching clause in case for: " + val + " (type: " + (val != null ? val.getClass().getName() : "null") + ")");
+                        throw caseNoMatchError(val);
                     }
                 };
         }
@@ -3030,10 +3030,11 @@ public class Analyzer {
 
         int[] outerCaptureSlots = currentScope.getOuterCaptureSlots();
         int[] innerCaptureSlots = currentScope.getInnerCaptureSlots();
+        int fnResultSlot = currentScope.addLocal("__fn_result__");
         FrameDescriptor fd = currentScope.buildDescriptor();
 
         FnBodyNode fnBody = new FnBodyNode(language, fd, fnName,
-                paramSlots, variadicSlot, innerCaptureSlots, bodyNode, selfSlot);
+                paramSlots, variadicSlot, innerCaptureSlots, bodyNode, selfSlot, fnResultSlot);
 
         currentScope = outerScope;
         return new FnNode(fnName, fnBody.getCallTarget(), outerCaptureSlots);
@@ -3078,10 +3079,11 @@ public class Analyzer {
 
             int[] outerCaptures = currentScope.getOuterCaptureSlots();
             int[] innerCaptures = currentScope.getInnerCaptureSlots();
+            int fnResultSlot = currentScope.addLocal("__fn_result__");
             FrameDescriptor fd = currentScope.buildDescriptor();
 
             FnBodyNode fnBody = new FnBodyNode(language, fd, fnName,
-                    paramSlots, varSlot, innerCaptures, bodyNode, selfSlot);
+                    paramSlots, varSlot, innerCaptures, bodyNode, selfSlot, fnResultSlot);
             FnNode fnNode = new FnNode(fnName, fnBody.getCallTarget(), outerCaptures);
             arityFnNodes.add(fnNode);
 
@@ -3246,7 +3248,8 @@ public class Analyzer {
         for (int i = 0; i < count; i++) {
             slots[i] = currentScope.addLocal(((Symbol) bindings.nth(i * 2)).getName());
         }
-        return new LoopNode(slots, values, analyzeBody(args.next()));
+        int resultSlot = currentScope.addLocal("__loop_result__" + System.nanoTime());
+        return new LoopNode(slots, values, analyzeBody(args.next()), resultSlot);
     }
 
     private ExpressionNode analyzeAnd(ISeq seq) {
@@ -4640,5 +4643,10 @@ public class Analyzer {
         synchronized (lock) {
             return bodyExpr.executeGeneric(frame);
         }
+    }
+
+    @com.oracle.truffle.api.CompilerDirectives.TruffleBoundary
+    static RuntimeException caseNoMatchError(Object val) {
+        return new RuntimeException("No matching clause in case for: " + val + " (type: " + (val != null ? val.getClass().getName() : "null") + ")");
     }
 }

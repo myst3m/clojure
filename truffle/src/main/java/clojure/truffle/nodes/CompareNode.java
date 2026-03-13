@@ -51,16 +51,22 @@ public abstract class CompareNode extends ExpressionNode {
     }
 
     @Fallback
+    @CompilerDirectives.TruffleBoundary
     protected boolean compareGeneric(Object a, Object b) {
         return compareDouble(toDouble(a), toDouble(b));
     }
 
+    @CompilerDirectives.TruffleBoundary
     private static double toDouble(Object o) {
         if (o instanceof Long l) return l.doubleValue();
         if (o instanceof Double d) return d;
         if (o instanceof Number n) return n.doubleValue();
-        CompilerDirectives.transferToInterpreterAndInvalidate();
-        throw new RuntimeException("Cannot compare non-number: " + o);
+        throw nonNumberError("compare", o);
+    }
+
+    @CompilerDirectives.TruffleBoundary
+    private static RuntimeException nonNumberError(String op, Object o) {
+        return new RuntimeException("Cannot " + op + " non-number: " + o);
     }
 
     public static CompareNode create(Op op, ExpressionNode left, ExpressionNode right) {

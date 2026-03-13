@@ -30,16 +30,22 @@ public abstract class AddNode extends ExpressionNode {
     }
 
     @Fallback
+    @CompilerDirectives.TruffleBoundary
     protected Object addGeneric(Object a, Object b) {
         return toDouble(a) + toDouble(b);
     }
 
+    @CompilerDirectives.TruffleBoundary
     private static double toDouble(Object o) {
         if (o instanceof Long l) return l.doubleValue();
         if (o instanceof Double d) return d;
         if (o instanceof Number n) return n.doubleValue();
-        CompilerDirectives.transferToInterpreterAndInvalidate();
-        throw new RuntimeException("Cannot add non-number: " + o);
+        throw nonNumberError("add", o);
+    }
+
+    @CompilerDirectives.TruffleBoundary
+    private static RuntimeException nonNumberError(String op, Object o) {
+        return new RuntimeException("Cannot " + op + " non-number: " + o);
     }
 
     public static AddNode create(ExpressionNode left, ExpressionNode right) {

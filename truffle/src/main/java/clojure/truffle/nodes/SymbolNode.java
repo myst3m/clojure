@@ -52,6 +52,7 @@ public class SymbolNode extends ExpressionNode {
         return value;
     }
 
+    @TruffleBoundary
     private static boolean isDynamicVar(String name) {
         // Convention: dynamic vars are surrounded by *earmuffs*
         String simpleName = name;

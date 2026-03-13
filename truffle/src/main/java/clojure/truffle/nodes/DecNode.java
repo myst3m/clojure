@@ -19,10 +19,15 @@ public abstract class DecNode extends ExpressionNode {
     }
 
     @Fallback
+    @CompilerDirectives.TruffleBoundary
     protected Object decGeneric(Object a) {
         if (a instanceof Number n) return n.doubleValue() - 1.0;
-        CompilerDirectives.transferToInterpreterAndInvalidate();
-        throw new RuntimeException("Cannot decrement non-number: " + a);
+        throw nonNumberError("decrement", a);
+    }
+
+    @CompilerDirectives.TruffleBoundary
+    private static RuntimeException nonNumberError(String op, Object o) {
+        return new RuntimeException("Cannot " + op + " non-number: " + o);
     }
 
     public static DecNode create(ExpressionNode operand) {
