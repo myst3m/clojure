@@ -159,6 +159,53 @@ public class ClojureContext {
             Object[] args = clojure.lang.TruffleReader.toArray(clojure.lang.RT.next(form));
             return callFunction(fn, args);
         };
+
+        // Record reader hook: handle #RecordType{:key val} and #RecordType[args] literals
+        clojure.lang.TruffleReader.recordReaderHook = (recordName, mapVals, vectorArgs) -> {
+            // recordName is e.g. "clojure.test_clojure.protocols.RecordToTestStatics1"
+            int lastDot = recordName.lastIndexOf('.');
+            String nsName = lastDot >= 0 ? recordName.substring(0, lastDot).replace('_', '-') : null;
+            String typeName = lastDot >= 0 ? recordName.substring(lastDot + 1) : recordName;
+
+            Object mapFactory = null;
+            Object ctorFactory = null;
+            if (nsName != null) {
+                ClojureNamespace ns = getNamespace(nsName);
+                if (ns != null) {
+                    mapFactory = ns.resolve("map->" + typeName);
+                    ctorFactory = ns.resolve("->" + typeName);
+                }
+            } else {
+                mapFactory = getVar("map->" + typeName);
+                ctorFactory = getVar("->" + typeName);
+            }
+
+            if (mapVals != null && mapFactory != null) {
+                // Validate all keys are keywords
+                for (clojure.lang.ISeq s = mapVals.seq(); s != null; s = s.next()) {
+                    clojure.lang.IMapEntry me = (clojure.lang.IMapEntry) s.first();
+                    if (!(me.key() instanceof clojure.lang.Keyword)) {
+                        throw new IllegalArgumentException(
+                            "Unreadable defrecord form: key must be keyword: " + me.key());
+                    }
+                }
+                try {
+                    return callFunction(mapFactory, new Object[]{mapVals});
+                } catch (ClassCastException e) {
+                    throw e; // preserve ClassCastException for type hint failures
+                }
+            }
+            if (vectorArgs != null && ctorFactory != null) {
+                Object[] args = new Object[vectorArgs.count()];
+                for (int i = 0; i < args.length; i++) args[i] = vectorArgs.nth(i);
+                try {
+                    return callFunction(ctorFactory, args);
+                } catch (ClassCastException e) {
+                    throw new IllegalArgumentException(e.getMessage(), e);
+                }
+            }
+            return null;
+        };
     }
 
     public ClojureTruffleLanguage getLanguage() {
@@ -562,7 +609,7 @@ public class ClojureContext {
                 "*print-namespace-maps*", "*data-readers*", "*default-data-reader-fn*",
                 "*read-eval*", "*command-line-args*", "*compile-path*",
                 "*compile-files*", "*assert*", "*math-context*", "*file*",
-                "*compiler-options*"}) {
+                "*compiler-options*", "*verbose-defrecords*"}) {
             globalVars.put(v, false);
             dynamicVars.add(v);
         }
@@ -1000,6 +1047,8 @@ public class ClojureContext {
             try {
                 java.io.PushbackReader r = new java.io.PushbackReader(new java.io.StringReader(s), 2);
                 return clojure.lang.TruffleReader.read(r, true, null, false, null);
+            } catch (ClassCastException | IllegalArgumentException e) {
+                throw e;
             } catch (Exception e) {
                 throw new RuntimeException("read-string: " + e.getMessage(), e);
             }
@@ -2396,10 +2445,21 @@ public class ClojureContext {
         });
 
         defBuiltin("merge", args -> {
-            Object result = clojure.lang.PersistentHashMap.EMPTY;
-            for (Object arg : args) {
-                if (arg instanceof ClojureNil) continue;
-                if (arg instanceof clojure.lang.IPersistentMap m) {
+            if (args.length == 0) return ClojureNil.INSTANCE;
+            // Use the first non-nil map as the base (preserves record type)
+            Object result = null;
+            int startIdx = 0;
+            for (int i = 0; i < args.length; i++) {
+                if (!(args[i] instanceof ClojureNil) && args[i] instanceof clojure.lang.IPersistentMap) {
+                    result = args[i];
+                    startIdx = i + 1;
+                    break;
+                }
+            }
+            if (result == null) return ClojureNil.INSTANCE;
+            for (int i = startIdx; i < args.length; i++) {
+                if (args[i] instanceof ClojureNil) continue;
+                if (args[i] instanceof clojure.lang.IPersistentMap m) {
                     for (clojure.lang.ISeq s = m.seq(); s != null; s = s.next()) {
                         clojure.lang.IMapEntry e = (clojure.lang.IMapEntry) s.first();
                         result = ((clojure.lang.IPersistentMap) result).assoc(e.key(), e.val());
@@ -2912,6 +2972,19 @@ public class ClojureContext {
                     acc = callFunction(f, new Object[]{acc, (long) i, indexed.nth(i)});
                 }
                 return acc;
+            }
+            // Handle seq of map entries (e.g., (seq {:a 1 :b 2}))
+            clojure.lang.ISeq s = seqOf(coll);
+            if (s != null) {
+                Object first = s.first();
+                if (first instanceof clojure.lang.IMapEntry) {
+                    Object acc = init;
+                    for (; s != null; s = s.next()) {
+                        clojure.lang.IMapEntry entry = (clojure.lang.IMapEntry) s.first();
+                        acc = callFunction(f, new Object[]{acc, entry.key(), entry.val()});
+                    }
+                    return acc;
+                }
             }
             throw new RuntimeException("reduce-kv: not a map or vector: " + coll);
         });
@@ -4872,6 +4945,8 @@ public class ClojureContext {
                 java.io.PushbackReader rdr = new java.io.PushbackReader(new java.io.StringReader(s));
                 Object form = clojure.lang.TruffleReader.read(rdr, true, null, false, null);
                 return form == null ? ClojureNil.INSTANCE : form;
+            } catch (ClassCastException | IllegalArgumentException e) {
+                throw e;
             } catch (Exception e) {
                 throw new RuntimeException("read-string: " + e.getMessage());
             }
@@ -5387,7 +5462,13 @@ public class ClojureContext {
                 Object protoArg = args[i];
                 Object mapArg = args[i + 1];
                 if (!(protoArg instanceof clojure.truffle.runtime.ClojureProtocol proto))
-                    throw new RuntimeException("extend: expected protocol, got: " + protoArg + " (" + (protoArg == null ? "null" : protoArg.getClass().getName()) + ")");
+                    throw new IllegalArgumentException(protoArg + " is not a protocol");
+                // Check if type already inline-implements this protocol
+                if (proto.hasInlineImplementation(typeKey)) {
+                    String typeName = typeKey instanceof Class<?> c ? c.getName() : typeKey.toString();
+                    throw new IllegalArgumentException(
+                        typeName + " already directly implements interface " + proto.getName());
+                }
                 if (!(mapArg instanceof clojure.lang.IPersistentMap pmap))
                     throw new RuntimeException("extend: expected map of methods, got: " + mapArg);
                 java.util.Map<String, Object> methods = new java.util.HashMap<>();
@@ -7095,10 +7176,80 @@ public class ClojureContext {
             return true;
         });
 
+        // Register macro functions for builtin special forms so they work with macroexpand + refer/rename
+        // with-open macro: validates bindings and expands to let/try/finally/.close
+        NamedBuiltin withOpenMacro = new NamedBuiltin("with-open", args -> {
+            // args: &form, &env, bindings, body...
+            Object form = args[0];
+            String macroName = "with-open";
+            if (form instanceof clojure.lang.ISeq s && s.first() instanceof clojure.lang.Symbol sym) {
+                macroName = sym.getName();
+            }
+            if (args.length < 3 || !(args[2] instanceof clojure.lang.IPersistentVector)) {
+                throw new IllegalArgumentException(
+                    macroName + " requires a vector for its binding");
+            }
+            clojure.lang.IPersistentVector bindings = (clojure.lang.IPersistentVector) args[2];
+            if (bindings.count() % 2 != 0) {
+                throw new IllegalArgumentException(
+                    macroName + " requires an even number of forms in binding vector");
+            }
+            // Build expansion: (let [b0 b1] (try (with-open [b2...] body...) (finally (. b0 close))))
+            // Collect body forms from args[3..]
+            java.util.List<Object> bodyForms = new java.util.ArrayList<>();
+            for (int i = 3; i < args.length; i++) bodyForms.add(args[i]);
+            if (bindings.count() == 0) {
+                // (do body...)
+                return clojure.truffle.runtime.ClojureRT.cons(
+                    clojure.lang.Symbol.intern("do"),
+                    clojure.lang.PersistentList.create(bodyForms));
+            }
+            // (let [b0 b1] (try (with-open [b2..] body..) (finally (. b0 close))))
+            clojure.lang.Symbol b0 = (clojure.lang.Symbol) bindings.nth(0);
+            Object b1 = bindings.nth(1);
+            clojure.lang.IPersistentVector restBindings = clojure.lang.PersistentVector.EMPTY;
+            for (int i = 2; i < bindings.count(); i++) {
+                restBindings = restBindings.cons(bindings.nth(i));
+            }
+            // Get the original macro name symbol from the form
+            clojure.lang.Symbol macroSym = (clojure.lang.Symbol) ((clojure.lang.ISeq) form).first();
+            // Build inner: (with-open [rest..] body..) or just body if no more bindings
+            Object innerBody;
+            if (restBindings.count() == 0) {
+                innerBody = clojure.truffle.runtime.ClojureRT.cons(
+                    clojure.lang.Symbol.intern("do"),
+                    clojure.lang.PersistentList.create(bodyForms));
+            } else {
+                java.util.List<Object> woArgs = new java.util.ArrayList<>();
+                woArgs.add(macroSym);
+                woArgs.add(restBindings);
+                woArgs.addAll(bodyForms);
+                innerBody = clojure.lang.PersistentList.create(woArgs);
+            }
+            // (. b0 close)
+            Object closeForm = clojure.lang.PersistentList.create(java.util.List.of(
+                clojure.lang.Symbol.intern("."), b0, clojure.lang.Symbol.intern("close")));
+            // (finally (. b0 close))
+            Object finallyForm = clojure.lang.PersistentList.create(java.util.List.of(
+                clojure.lang.Symbol.intern("finally"), closeForm));
+            // (try innerBody (finally ...))
+            Object tryForm = clojure.lang.PersistentList.create(java.util.List.of(
+                clojure.lang.Symbol.intern("try"), innerBody, finallyForm));
+            // (let [b0 b1] tryForm)
+            return clojure.lang.PersistentList.create(java.util.List.of(
+                clojure.lang.Symbol.intern("let"),
+                clojure.lang.PersistentVector.create(b0, b1),
+                tryForm));
+        });
+        setMacro("with-open", withOpenMacro);
+
         // Copy all builtins into clojure.core namespace
         ClojureNamespace core = namespaces.get("clojure.core");
         if (core != null) {
             globalVars.forEach(core::intern);
+            // Ensure macro functions are also in core namespace for refer/rename
+            core.intern("with-open", withOpenMacro);
+            core.intern("__macro__with-open", withOpenMacro);
         }
     }
 
@@ -7178,7 +7329,8 @@ public class ClojureContext {
             if (macro != null) {
                 java.util.List<Object> macroArgs = new java.util.ArrayList<>();
                 boolean isUserMacro = (macro instanceof clojure.truffle.runtime.ClojureFunction
-                        || macro instanceof clojure.truffle.runtime.MultiArityFunction);
+                        || macro instanceof clojure.truffle.runtime.MultiArityFunction
+                        || macro instanceof NamedBuiltin);
                 if (isUserMacro) {
                     macroArgs.add(form); // &form
                     macroArgs.add(clojure.truffle.runtime.ClojureNil.INSTANCE); // &env
@@ -7201,6 +7353,10 @@ public class ClojureContext {
                         }
                     }
                     throw ae;
+                } catch (IllegalArgumentException iae) {
+                    // Wrap in CompilerException like real Clojure does
+                    throw new clojure.lang.Compiler.CompilerException(
+                        (String) null, 0, 0, iae);
                 }
             }
         }
@@ -7583,7 +7739,7 @@ public class ClojureContext {
 
     // --- Print ---
 
-    public static String printString(Object val, boolean readably) {
+    public String printString(Object val, boolean readably) {
         if (val instanceof ClojureNil) return "nil";
         if (val instanceof String s) {
             if (readably) return "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"")
@@ -7593,6 +7749,24 @@ public class ClojureContext {
         if (val instanceof Boolean b) return b.toString();
         if (val instanceof clojure.lang.Keyword kw) return kw.toString();
         if (val instanceof clojure.lang.Symbol sym) return sym.toString();
+        // print-dup for records: positional [f1, f2] format unless *verbose-defrecords* is true
+        if (val instanceof clojure.truffle.runtime.ClojureDeftypeInstance dti && dti.isRecord()) {
+            Object printDup = getVarWithBindings("*print-dup*");
+            if (Boolean.TRUE.equals(printDup)) {
+                Object verbose = getVarWithBindings("*verbose-defrecords*");
+                if (!Boolean.TRUE.equals(verbose)) {
+                    String name = dti.getQualifiedTypeName();
+                    StringBuilder sb = new StringBuilder("#" + name + "[");
+                    Object[] fields = dti.getFields();
+                    for (int i = 0; i < fields.length; i++) {
+                        if (i > 0) sb.append(", ");
+                        sb.append(printString(fields[i], readably));
+                    }
+                    sb.append("]");
+                    return sb.toString();
+                }
+            }
+        }
         return val.toString();
     }
 

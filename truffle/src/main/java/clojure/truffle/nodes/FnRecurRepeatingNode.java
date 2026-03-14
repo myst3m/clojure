@@ -35,8 +35,12 @@ public class FnRecurRepeatingNode extends Node implements RepeatingNode {
             return false; // done, exit loop
         } catch (RecurException e) {
             Object[] newValues = e.getValues();
-            for (int i = 0; i < paramCount; i++) {
-                frame.setObject(paramSlots[i], newValues[i]);
+            // If fewer values than params (e.g., reify/deftype method where 'this' is implicit)
+            // preserve leading params and update trailing ones
+            int offset = paramCount - newValues.length;
+            if (offset < 0) offset = 0;
+            for (int i = offset; i < paramCount; i++) {
+                frame.setObject(paramSlots[i], newValues[i - offset]);
             }
             if (variadicSlot >= 0 && newValues.length > paramCount) {
                 frame.setObject(variadicSlot, newValues[paramCount]);

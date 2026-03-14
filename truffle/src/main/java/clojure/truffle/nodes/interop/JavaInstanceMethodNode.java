@@ -78,6 +78,47 @@ public class JavaInstanceMethodNode extends ExpressionNode {
                 }
             } catch (Exception ignored) {}
         }
+        // For ClojureDeftypeInstance, try field access
+        if (method == null && target instanceof clojure.truffle.runtime.ClojureDeftypeInstance dti) {
+            if (args.length == 0 && dti.hasField(methodName)) {
+                return dti.getField(methodName);
+            }
+            // Also check deftype methods
+            Object methodFn = dti.getMethod(methodName);
+            if (methodFn instanceof clojure.lang.IFn fn) {
+                Object[] fullArgs = new Object[args.length + 1];
+                fullArgs[0] = target;
+                System.arraycopy(args, 0, fullArgs, 1, args.length);
+                return fn.applyTo(clojure.lang.RT.seq(fullArgs));
+            }
+        }
+        // For ClojureReified, try method map
+        if (method == null && target instanceof clojure.truffle.runtime.ClojureReified reified) {
+            Object methodFn = null;
+            // Try type-suffixed lookup first (for overloaded methods like hinted(int) vs hinted(String))
+            if (args.length > 0) {
+                StringBuilder typedKey = new StringBuilder(methodName);
+                for (Object arg : args) {
+                    if (arg instanceof Integer || arg instanceof Long) {
+                        typedKey.append("__int");
+                    } else if (arg instanceof String) {
+                        typedKey.append("__String");
+                    } else if (arg instanceof Double || arg instanceof Float) {
+                        typedKey.append("__double");
+                    } else if (arg != null) {
+                        typedKey.append("__").append(arg.getClass().getSimpleName());
+                    }
+                }
+                methodFn = reified.getMethod(typedKey.toString());
+            }
+            if (methodFn == null) methodFn = reified.getMethod(methodName);
+            if (methodFn instanceof clojure.lang.IFn fn) {
+                Object[] fullArgs = new Object[args.length + 1];
+                fullArgs[0] = target;
+                System.arraycopy(args, 0, fullArgs, 1, args.length);
+                return fn.applyTo(clojure.lang.RT.seq(fullArgs));
+            }
+        }
         if (method == null) {
             String argWord = args.length == 1 ? "arg" : "args";
             throw new IllegalArgumentException("No matching method " + methodName +

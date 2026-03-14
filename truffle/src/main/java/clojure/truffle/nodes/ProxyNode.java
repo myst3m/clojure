@@ -99,7 +99,17 @@ public class ProxyNode extends ExpressionNode {
                                             Map<String, Object> methods, Class<?>[] interfaces,
                                             ClojureContext context) {
         String name = method.getName();
-        Object fn = methods.get(name);
+        // Try type-suffixed lookup first (for overloaded methods like hinted(int) vs hinted(String))
+        Object fn = null;
+        Class<?>[] paramTypes = method.getParameterTypes();
+        if (paramTypes.length > 0) {
+            StringBuilder typedKey = new StringBuilder(name);
+            for (Class<?> pt : paramTypes) {
+                typedKey.append("__").append(pt.getSimpleName());
+            }
+            fn = methods.get(typedKey.toString());
+        }
+        if (fn == null) fn = methods.get(name);
         if (fn != null) {
             Object[] clojureArgs;
             if (args == null) {

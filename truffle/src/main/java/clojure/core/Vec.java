@@ -59,6 +59,12 @@ public class Vec extends APersistentVector implements IObj, IEditableCollection 
     }
 
     @Override
+    public ISeq seq() {
+        // Delegate to the underlying PersistentVector so we get ChunkedSeq (IChunkedSeq support)
+        return delegate.seq();
+    }
+
+    @Override
     public IObj withMeta(IPersistentMap meta) {
         return new Vec(delegate, meta);
     }

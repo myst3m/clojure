@@ -8,19 +8,62 @@ public class ClojureProtocol {
 
     private final String name;
     private final List<String> methodNames;
+    // Per-method arity count (for getMethods() duplicate entries)
+    private Map<String, Integer> methodArityCount;
     // Type key -> { methodName -> implementation fn }
     private final ConcurrentHashMap<Object, Map<String, Object>> implementations = new ConcurrentHashMap<>();
+    // Types that inline-implement this protocol (via deftype/defrecord)
+    private final java.util.Set<Object> inlineImplementors = ConcurrentHashMap.newKeySet();
+    // Whether this protocol was created from definterface (not defprotocol)
+    private boolean fromInterface;
 
     public ClojureProtocol(String name, List<String> methodNames) {
         this.name = name;
         this.methodNames = methodNames;
     }
 
+    public void setMethodArityCount(Map<String, Integer> arityCount) {
+        this.methodArityCount = arityCount;
+    }
+
     public String getName() { return name; }
     public List<String> getMethodNames() { return methodNames; }
+    public void setFromInterface(boolean fromInterface) { this.fromInterface = fromInterface; }
+    public boolean isFromInterface() { return fromInterface; }
+    public Map<String, Integer> getMethodArityCount() { return methodArityCount; }
+
+    /**
+     * Returns method descriptors compatible with Java reflection's getMethods().
+     * Each descriptor has a getName() method.
+     * Method names use underscores instead of hyphens (Java convention).
+     * Multi-arity methods produce duplicate entries.
+     */
+    public Object[] getMethods() {
+        List<Object> result = new java.util.ArrayList<>();
+        for (String mName : methodNames) {
+            final String javaName = mName.replace('-', '_');
+            int count = (methodArityCount != null && methodArityCount.containsKey(mName))
+                    ? methodArityCount.get(mName) : 1;
+            for (int j = 0; j < count; j++) {
+                result.add(new Object() {
+                    public String getName() { return javaName; }
+                    @Override public String toString() { return javaName; }
+                });
+            }
+        }
+        return result.toArray();
+    }
 
     public void extend(Object typeKey, Map<String, Object> methods) {
         implementations.put(typeKey, methods);
+    }
+
+    public void addInlineImplementor(Object typeKey) {
+        inlineImplementors.add(typeKey);
+    }
+
+    public boolean hasInlineImplementation(Object typeKey) {
+        return inlineImplementors.contains(typeKey);
     }
 
     public Object findMethod(String methodName, Object target) {

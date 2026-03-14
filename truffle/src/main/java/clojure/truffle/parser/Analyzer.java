@@ -36,9 +36,11 @@ public class Analyzer {
                 String name = sym.getName();
                 if ("require".equals(name) || "ns".equals(name) ||
                        "use".equals(name) || "import".equals(name) ||
-                       "refer-clojure".equals(name) || "in-ns".equals(name) ||
+                       "refer".equals(name) || "refer-clojure".equals(name) || "in-ns".equals(name) ||
                        "alias".equals(name) || "defmacro".equals(name) ||
-                       "require-native".equals(name)) {
+                       "require-native".equals(name) ||
+                       "defrecord".equals(name) || "deftype".equals(name) ||
+                       "defprotocol".equals(name) || "definterface".equals(name)) {
                     return true;
                 }
                 // Check if let/do/when wraps a defmacro (e.g., (let [x ...] (defmacro ...)))
@@ -304,6 +306,7 @@ public class Analyzer {
         if (form instanceof Symbol sym) return analyzeSymbol(sym);
         if (form instanceof ISeq seq) return analyzeList(seq);
         if (form instanceof IPersistentVector vec) return analyzeVector(vec);
+        if (form instanceof clojure.truffle.runtime.ClojureDeftypeInstance) return new QuoteNode(form);
         if (form instanceof IPersistentMap map) return analyzeMap(map);
         if (form instanceof clojure.lang.IPersistentSet set) return analyzeSet(set);
         return new QuoteNode(form);
@@ -350,9 +353,13 @@ public class Analyzer {
                     if (lastDot > 0) {
                         String possibleNs = name.substring(0, lastDot);
                         String possibleVar = name.substring(lastDot + 1);
+                        // Try both underscore and dash forms for namespace lookup
                         clojure.truffle.runtime.ClojureNamespace possibleNsObj = context.getNamespace(possibleNs);
+                        if (possibleNsObj == null) {
+                            possibleNsObj = context.getNamespace(possibleNs.replace('_', '-'));
+                        }
                         if (possibleNsObj != null && possibleNsObj.resolve(possibleVar) != null) {
-                            return new SymbolNode(context, possibleNs + "/" + possibleVar);
+                            return new SymbolNode(context, possibleNsObj.getName() + "/" + possibleVar);
                         }
                     }
                 }
@@ -570,6 +577,11 @@ public class Analyzer {
             // Static method call: (Class/method args...)
             if (ns != null && isJavaClassName(ns)) {
                 return analyzeStaticCall(ns, name, seq.next());
+            }
+            // Defrecord/deftype static methods: (ns.TypeName/method args...)
+            if (ns != null && ns.contains(".") && context != null) {
+                ExpressionNode recordStatic = analyzeRecordStaticCall(ns, name, seq.next());
+                if (recordStatic != null) return recordStatic;
             }
 
             // Check for macros AFTER builtin forms - macros should not shadow builtins
@@ -813,7 +825,33 @@ public class Analyzer {
         if (args == null) throw err("var: missing symbol");
         Object sym = args.first();
         if (!(sym instanceof Symbol s)) throw err("var: argument must be a symbol");
-        String varName = s.getNamespace() != null ? s.getNamespace() + "/" + s.getName() : s.getName();
+        String varName;
+        if (s.getNamespace() != null) {
+            // Resolve namespace alias
+            String nsAlias = s.getNamespace();
+            if (context != null) {
+                ClojureNamespace curNs = context.getNamespace(context.getCurrentNamespace());
+                if (curNs != null) {
+                    ClojureNamespace resolved = curNs.resolveAlias(nsAlias);
+                    if (resolved != null) nsAlias = resolved.getName();
+                }
+            }
+            varName = nsAlias + "/" + s.getName();
+        } else {
+            // Qualify with the namespace where the var is actually defined
+            String compileNs = context != null ? context.getCurrentNamespace() : "user";
+            if (context != null) {
+                ClojureNamespace curNs = context.getNamespace(compileNs);
+                if (curNs != null) {
+                    // Check if this name is referred from another namespace
+                    String referSource = curNs.getReferSource(s.getName());
+                    if (referSource != null) {
+                        compileNs = referSource;
+                    }
+                }
+            }
+            varName = compileNs + "/" + s.getName();
+        }
         return new VarNode(context, varName);
     }
 
@@ -1298,6 +1336,9 @@ public class Analyzer {
             if (varVal instanceof Class<?> c) {
                 clazz = c;
             } else {
+                // Check if it's a defrecord/deftype static method (create, getBasis)
+                ExpressionNode recordStatic = analyzeRecordStaticCall(className, memberName, args);
+                if (recordStatic != null) return recordStatic;
                 throw e;
             }
         }
@@ -1313,6 +1354,76 @@ public class Analyzer {
             }
         }
         return new JavaStaticMethodNode(clazz, memberName, argList.toArray(new ExpressionNode[0]));
+    }
+
+    /**
+     * Handle static method calls on defrecord/deftype types (e.g., RecordName/create, RecordName/getBasis).
+     * Returns null if className is not a known defrecord/deftype.
+     */
+    private ExpressionNode analyzeRecordStaticCall(String className, String memberName, ISeq args) {
+        // Resolve simple or qualified class name to find the map-> factory
+        String simpleName = className.contains(".") ? className.substring(className.lastIndexOf('.') + 1) : className;
+        String nsPrefix = className.contains(".") ? className.substring(0, className.lastIndexOf('.')).replace('_', '-') : null;
+
+        // Check if map->TypeName or ->TypeName exist (indicating it's a defrecord/deftype)
+        String mapFactoryName = "map->" + simpleName;
+        String ctorName = "->" + simpleName;
+        Object mapFactory = null;
+        Object ctor = null;
+
+        if (nsPrefix != null) {
+            // Namespace-qualified: check specific namespace
+            var ns = context.getNamespace(nsPrefix);
+            if (ns != null) {
+                mapFactory = ns.resolve(mapFactoryName);
+                ctor = ns.resolve(ctorName);
+            }
+        } else {
+            // Unqualified: check current namespace
+            mapFactory = context.getVar(mapFactoryName);
+            ctor = context.getVar(ctorName);
+        }
+
+        if (mapFactory == null && ctor == null) return null;
+
+        switch (memberName) {
+            case "create": {
+                // RecordType/create takes a map and creates a record instance
+                List<ExpressionNode> argList = new ArrayList<>();
+                while (args != null) { argList.add(analyze(args.first())); args = args.next(); }
+                String qualifiedFactory = nsPrefix != null ? nsPrefix + "/" + mapFactoryName : mapFactoryName;
+                return new InvokeNode(new SymbolNode(context, qualifiedFactory),
+                        argList.toArray(new ExpressionNode[0]));
+            }
+            case "getBasis": {
+                // RecordType/getBasis returns a vector of field name symbols
+                // Look up the defrecord's field names from the constructor function
+                String qualifiedCtor = nsPrefix != null ? nsPrefix + "/" + ctorName : ctorName;
+                // Return a node that calls the __getBasis helper
+                String basisVarName = "__basis__" + simpleName;
+                Object basisVal = nsPrefix != null ?
+                    (context.getNamespace(nsPrefix) != null ? context.getNamespace(nsPrefix).resolve(basisVarName) : null) :
+                    context.getVar(basisVarName);
+                if (basisVal != null) {
+                    Object finalBasisVal = basisVal;
+                    return new ExpressionNode() {
+                        @Override
+                        public Object executeGeneric(com.oracle.truffle.api.frame.VirtualFrame frame) {
+                            return finalBasisVal;
+                        }
+                    };
+                }
+                // Fallback: return empty vector
+                return new ExpressionNode() {
+                    @Override
+                    public Object executeGeneric(com.oracle.truffle.api.frame.VirtualFrame frame) {
+                        return clojure.lang.PersistentVector.EMPTY;
+                    }
+                };
+            }
+            default:
+                return null;
+        }
     }
 
     private ExpressionNode analyzeConstructor(String className, ISeq args) {
@@ -1488,29 +1599,91 @@ public class Analyzer {
     // --- Protocols ---
 
     private ExpressionNode analyzeDefprotocol(ISeq seq) {
-        // (defprotocol Name (method-name [this arg1] [this arg1 arg2]) ...)
+        // (defprotocol Name "doc?" (method-name "doc?" [this arg1] [this arg1 arg2]) ...)
         ISeq args = seq.next();
         if (args == null) throw err("defprotocol: missing name");
         if (!(args.first() instanceof Symbol sym)) throw err("defprotocol: name must be a symbol");
         String protoName = sym.getName();
         args = args.next();
 
+        // Skip protocol-level docstring if present
+        if (args != null && args.first() instanceof String) {
+            args = args.next();
+        }
+
         List<String> methodNames = new ArrayList<>();
+        // methodMeta: methodName -> {arglists, doc}
+        java.util.Map<String, Object[]> methodMeta = new java.util.LinkedHashMap<>();
         while (args != null) {
             Object methodSpec = args.first();
             if (methodSpec instanceof ISeq methodSeq) {
                 if (!(methodSeq.first() instanceof Symbol methodSym))
                     throw err("defprotocol: method name must be a symbol");
-                methodNames.add(methodSym.getName());
+                String mName = methodSym.getName();
+                methodNames.add(mName);
+
+                // Get :tag from method symbol metadata (e.g., ^String baz)
+                Object methodTag = null;
+                if (methodSym.meta() != null) {
+                    methodTag = methodSym.meta().valAt(clojure.lang.Keyword.intern("tag"));
+                }
+
+                // Parse arglists and optional trailing docstring from method spec
+                // Format: (method-name [params] [params2] "docstring")
+                ISeq mArgs = methodSeq.next();
+                String methodDoc = null;
+                List<Object> arglists = new ArrayList<>();
+                while (mArgs != null) {
+                    Object form = mArgs.first();
+                    if (form instanceof IPersistentVector) {
+                        arglists.add(form);
+                    } else if (form instanceof String s) {
+                        methodDoc = s;
+                    }
+                    mArgs = mArgs.next();
+                }
+                // arglists as a PersistentList
+                clojure.lang.ISeq arglistSeq = null;
+                for (int i = arglists.size() - 1; i >= 0; i--) {
+                    arglistSeq = clojure.lang.RT.cons(arglists.get(i), arglistSeq);
+                }
+                methodMeta.put(mName, new Object[]{arglistSeq, methodDoc, methodTag});
             }
             args = args.next();
         }
 
+        // Validate: each method must take at least one arg (this)
+        for (var entry : methodMeta.entrySet()) {
+            String mName = entry.getKey();
+            Object[] meta = entry.getValue();
+            clojure.lang.ISeq arglistSeq = (clojure.lang.ISeq) meta[0];
+            if (arglistSeq != null) {
+                for (clojure.lang.ISeq s = arglistSeq; s != null; s = s.next()) {
+                    IPersistentVector params = (IPersistentVector) s.first();
+                    if (params.count() == 0) {
+                        throw new IllegalArgumentException(
+                            "Definition of function " + mName + " in protocol " + protoName +
+                            " must take at least one arg.");
+                    }
+                }
+            }
+        }
+        // Validate: method names must be unique within a protocol
+        java.util.Set<String> seenMethods = new java.util.HashSet<>();
+        for (String mName : methodNames) {
+            if (!seenMethods.add(mName)) {
+                throw new IllegalArgumentException(
+                    "Function " + mName + " in protocol " + protoName +
+                    " was redefined. Specify all arities in single definition.");
+            }
+        }
+
         List<String> capturedMethodNames = List.copyOf(methodNames);
+        java.util.Map<String, Object[]> capturedMethodMeta = new java.util.LinkedHashMap<>(methodMeta);
         return new ExpressionNode() {
             @Override
             public Object executeGeneric(com.oracle.truffle.api.frame.VirtualFrame frame) {
-                return registerDefprotocol(context, protoName, capturedMethodNames);
+                return registerDefprotocol(context, protoName, capturedMethodNames, capturedMethodMeta);
             }
         };
     }
@@ -1557,11 +1730,13 @@ public class Analyzer {
         if (args == null) throw err("deftype: missing fields");
         if (!(args.first() instanceof IPersistentVector fieldVec)) throw err("deftype: fields must be a vector");
 
-        // Parse field names
+        // Parse field names and preserve original symbols (with metadata like ^String)
         List<String> fieldNames = new ArrayList<>();
+        List<Symbol> fieldSymbols = new ArrayList<>();
         for (int i = 0; i < fieldVec.count(); i++) {
             if (!(fieldVec.nth(i) instanceof Symbol fs)) throw err("deftype: field must be a symbol");
             fieldNames.add(fs.getName());
+            fieldSymbols.add(fs);
         }
         args = args.next();
 
@@ -1618,6 +1793,7 @@ public class Analyzer {
         }
 
         List<String> capturedFieldNames = List.copyOf(fieldNames);
+        List<Symbol> capturedFieldSymbols = List.copyOf(fieldSymbols);
         // Capture proto methods
         java.util.Map<String, java.util.Map<String, ExpressionNode>> capturedProtoMethods =
                 new java.util.LinkedHashMap<>(protoMethods);
@@ -1625,7 +1801,7 @@ public class Analyzer {
         return new ExpressionNode() {
             @Override
             public Object executeGeneric(com.oracle.truffle.api.frame.VirtualFrame frame) {
-                return evalDeftype(capturedProtoMethods, frame, context, typeName, capturedFieldNames, false);
+                return evalDeftype(capturedProtoMethods, frame, context, typeName, capturedFieldNames, false, capturedFieldSymbols);
             }
         };
     }
@@ -1641,9 +1817,11 @@ public class Analyzer {
         if (!(args.first() instanceof IPersistentVector fieldVec)) throw err("defrecord: fields must be a vector");
 
         List<String> fieldNames = new ArrayList<>();
+        List<Symbol> fieldSymbols = new ArrayList<>();
         for (int i = 0; i < fieldVec.count(); i++) {
             if (!(fieldVec.nth(i) instanceof Symbol fs)) throw err("defrecord: field must be a symbol");
             fieldNames.add(fs.getName());
+            fieldSymbols.add(fs);
         }
         args = args.next();
 
@@ -1675,13 +1853,14 @@ public class Analyzer {
         }
 
         List<String> capturedFieldNames = List.copyOf(fieldNames);
+        List<Symbol> capturedFieldSymbols = List.copyOf(fieldSymbols);
         java.util.Map<String, java.util.Map<String, ExpressionNode>> capturedProtoMethods =
                 new java.util.LinkedHashMap<>(protoMethods);
 
         return new ExpressionNode() {
             @Override
             public Object executeGeneric(com.oracle.truffle.api.frame.VirtualFrame frame) {
-                return evalDeftype(capturedProtoMethods, frame, context, typeName, capturedFieldNames, true);
+                return evalDeftype(capturedProtoMethods, frame, context, typeName, capturedFieldNames, true, capturedFieldSymbols);
             }
         };
     }
@@ -4344,6 +4523,9 @@ public class Analyzer {
         List<Symbol> protocolNames = new ArrayList<>();
         java.util.Map<String, Object> methods = new java.util.LinkedHashMap<>();
         java.util.Map<String, List<List<Object>>> methodArities = new java.util.LinkedHashMap<>();
+        // Track which interface/protocol section each method was first defined in
+        java.util.Map<String, Object> methodSection = new java.util.HashMap<>();
+        Object currentSection = null;
 
         while (args != null) {
             Object item = args.first();
@@ -4353,20 +4535,31 @@ public class Analyzer {
                     Class<?> clazz = JavaInteropUtil.resolveClass(sym.getName());
                     if (clazz.isInterface()) {
                         javaInterfaces.add(clazz);
+                        currentSection = clazz;
                     } else {
                         protocolNames.add(sym);
+                        currentSection = sym;
                     }
                 } catch (RuntimeException e) {
                     Object varVal = context.getVar(sym.getName());
                     if (varVal instanceof Class<?> c && c.isInterface()) {
                         javaInterfaces.add(c);
+                        currentSection = c;
                     } else {
                         protocolNames.add(sym);
+                        currentSection = sym;
                     }
                 }
             } else if (item instanceof ISeq methodDef) {
                 String methodName = ((Symbol) methodDef.first()).getName();
                 ISeq rest = methodDef.next();
+                // Check for duplicate method across different interface sections
+                if (currentSection != null && methodSection.containsKey(methodName)
+                        && methodSection.get(methodName) != currentSection) {
+                    throw err("Can't define method " + methodName + " in both " +
+                            methodSection.get(methodName) + " and " + currentSection);
+                }
+                if (currentSection != null) methodSection.put(methodName, currentSection);
                 // Collect params and body as a single arity: ([params] body...)
                 List<Object> arityForm = new ArrayList<>();
                 while (rest != null) { arityForm.add(rest.first()); rest = rest.next(); }
@@ -4389,18 +4582,48 @@ public class Analyzer {
         for (var entry : methodArities.entrySet()) {
             String mName = entry.getKey();
             List<List<Object>> arities = entry.getValue();
-            List<Object> fnForm = new ArrayList<>();
-            fnForm.add(Symbol.intern("fn*"));
-            if (arities.size() == 1) {
-                // Single arity: (fn [params] body...)
-                fnForm.addAll(arities.get(0));
-            } else {
-                // Multi-arity: (fn ([params1] body1...) ([params2] body2...))
-                for (List<Object> arity : arities) {
-                    fnForm.add(PersistentList.create(arity));
-                }
+            // Check for same-arity type-overloaded methods (e.g., hinted [^int i] vs hinted [^String s])
+            boolean hasSameArityOverloads = false;
+            if (arities.size() > 1) {
+                int firstCount = ((IPersistentVector) arities.get(0).get(0)).count();
+                hasSameArityOverloads = arities.stream()
+                    .allMatch(a -> ((IPersistentVector) a.get(0)).count() == firstCount);
             }
-            methods.put(mName, PersistentList.create(fnForm));
+            if (hasSameArityOverloads) {
+                // Create separate type-suffixed entries for each overload
+                for (int ai = 0; ai < arities.size(); ai++) {
+                    List<Object> arity = arities.get(ai);
+                    IPersistentVector params = (IPersistentVector) arity.get(0);
+                    StringBuilder typeSuffix = new StringBuilder();
+                    for (int j = 1; j < params.count(); j++) {
+                        if (params.nth(j) instanceof Symbol ps && ps.meta() != null) {
+                            Object tag = ps.meta().valAt(Keyword.intern("tag"));
+                            if (tag != null) typeSuffix.append("__").append(tag);
+                        }
+                    }
+                    List<Object> fnForm = new ArrayList<>();
+                    fnForm.add(Symbol.intern("fn*"));
+                    fnForm.addAll(arity);
+                    if (typeSuffix.length() > 0) {
+                        methods.put(mName + typeSuffix, PersistentList.create(fnForm));
+                    }
+                    if (ai == 0) {
+                        // Also store plain name pointing to first overload as fallback
+                        methods.put(mName, PersistentList.create(fnForm));
+                    }
+                }
+            } else {
+                List<Object> fnForm = new ArrayList<>();
+                fnForm.add(Symbol.intern("fn*"));
+                if (arities.size() == 1) {
+                    fnForm.addAll(arities.get(0));
+                } else {
+                    for (List<Object> arity : arities) {
+                        fnForm.add(PersistentList.create(arity));
+                    }
+                }
+                methods.put(mName, PersistentList.create(fnForm));
+            }
         }
 
         List<ExpressionNode> methodNodeList = new ArrayList<>();
@@ -4410,12 +4633,78 @@ public class Analyzer {
             methodNodeList.add(analyze(entry.getValue()));
         }
 
-        // If there are Java interfaces, use ProxyNode for proper implementation
+        // Validate methods against Java interfaces
         if (!javaInterfaces.isEmpty()) {
+            // Collect all valid method names from interfaces
+            java.util.Set<String> validMethodNames = new java.util.HashSet<>();
+            for (Class<?> iface : javaInterfaces) {
+                for (java.lang.reflect.Method m : iface.getMethods()) {
+                    validMethodNames.add(m.getName());
+                }
+            }
+            // Check for methods not declared on any interface
+            for (String mName : methodNames) {
+                // Skip Object methods (toString, hashCode, equals)
+                if (mName.equals("toString") || mName.equals("hashCode") || mName.equals("equals")) continue;
+                // Convert hyphens to underscores for matching
+                String javaName = mName.replace('-', '_');
+                if (!validMethodNames.contains(javaName) && !validMethodNames.contains(mName)) {
+                    throw err("Can't define method not in interfaces: " + mName);
+                }
+            }
+            // Check for duplicate methods across interfaces
+            java.util.Map<String, Class<?>> methodOwner = new java.util.HashMap<>();
+            for (Class<?> iface : javaInterfaces) {
+                for (java.lang.reflect.Method m : iface.getDeclaredMethods()) {
+                    String mName = m.getName();
+                    if (methodOwner.containsKey(mName) && methodOwner.get(mName) != iface) {
+                        // Method declared in multiple interfaces — check if both are provided
+                        // Track which interface section each method was defined under
+                    }
+                }
+            }
             return new ProxyNode(context,
                     javaInterfaces.toArray(new Class<?>[0]),
                     methodNames.toArray(new String[0]),
                     methodNodeList.toArray(new ExpressionNode[0]));
+        }
+
+        // Validate methods against definterface protocols (overloaded methods need type hints)
+        for (Symbol protoSym : protocolNames) {
+            String pName = protoSym.getName();
+            // Resolve potentially namespace-qualified protocol
+            Object protoObj = null;
+            if (pName.contains("/")) {
+                String[] parts = pName.split("/", 2);
+                var ns = context.getNamespace(parts[0]);
+                if (ns != null) protoObj = ns.resolve(parts[1]);
+            } else if (pName.contains(".")) {
+                // Dot-notation: e.g., clojure.test_clojure.protocols.examples.ExampleInterface
+                int lastDot = pName.lastIndexOf('.');
+                String nsName = pName.substring(0, lastDot).replace('_', '-');
+                String varName = pName.substring(lastDot + 1);
+                var ns = context.getNamespace(nsName);
+                if (ns != null) protoObj = ns.resolve(varName);
+            } else {
+                protoObj = context.getVar(pName);
+            }
+            if (protoObj instanceof ClojureProtocol proto && proto.isFromInterface()) {
+                var overloads = proto.getMethodArityCount();
+                if (overloads != null) {
+                    for (var entry : overloads.entrySet()) {
+                        String mName = entry.getKey();
+                        int expectedCount = entry.getValue();
+                        // Count how many type-hinted implementations were provided for this method
+                        long typedCount = methodNames.stream()
+                            .filter(n -> n.startsWith(mName + "__"))
+                            .count();
+                        // If no typed variants but method is overloaded, it's an error
+                        if (typedCount == 0 && methodArities.containsKey(mName)) {
+                            throw err("Must hint overloaded method: " + mName);
+                        }
+                    }
+                }
+            }
         }
 
         // Otherwise use simple ReifyNode for protocol-only
@@ -4434,6 +4723,7 @@ public class Analyzer {
         // Parse interfaces
         IPersistentVector interfaceVec = (IPersistentVector) args.first();
         List<Class<?>> interfaces = new ArrayList<>();
+        List<String> unresolvedInterfaces = new ArrayList<>();
         for (int i = 0; i < interfaceVec.count(); i++) {
             Symbol ifaceSym = (Symbol) interfaceVec.nth(i);
             String name = ifaceSym.getName();
@@ -4444,7 +4734,7 @@ public class Analyzer {
                 if (varVal instanceof Class<?> c) {
                     interfaces.add(c);
                 } else {
-                    throw new RuntimeException("proxy: cannot resolve interface: " + name);
+                    unresolvedInterfaces.add(name);
                 }
             }
         }
@@ -4470,6 +4760,77 @@ public class Analyzer {
                 methodNodes.add(analyze(PersistentList.create(fnForm)));
             }
             args = args.next();
+        }
+
+        // Try to resolve unresolved interfaces as ClojureProtocols (from defprotocol/definterface)
+        List<Symbol> protocolsForProxy = new ArrayList<>();
+        List<String> stillUnresolved = new ArrayList<>();
+        for (String uName : unresolvedInterfaces) {
+            // Try dot-notation: ns.name.Var
+            Object protoObj = null;
+            int lastDot = uName.lastIndexOf('.');
+            if (lastDot > 0) {
+                String nsName = uName.substring(0, lastDot).replace('_', '-');
+                String varName = uName.substring(lastDot + 1);
+                var ns = context.getNamespace(nsName);
+                if (ns != null) protoObj = ns.resolve(varName);
+            }
+            if (protoObj == null) protoObj = context.getVar(uName);
+            if (protoObj instanceof ClojureProtocol) {
+                // Protocol can be handled via ReifyNode approach
+                protocolsForProxy.add(Symbol.intern(uName));
+            } else {
+                stillUnresolved.add(uName);
+            }
+        }
+        if (!stillUnresolved.isEmpty()) {
+            String msg = "proxy: cannot resolve interface: " + String.join(", ", stillUnresolved);
+            return new ExpressionNode() {
+                @Override
+                public Object executeGeneric(com.oracle.truffle.api.frame.VirtualFrame frame) {
+                    throw new RuntimeException(msg);
+                }
+            };
+        }
+        // If all "interfaces" are protocols and no real Java interfaces, use ReifyNode
+        // Proxy methods don't include 'this' param, but ReifyNode dispatch prepends 'this'
+        // Re-build fn forms with 'this' injected as the first parameter
+        if (interfaces.isEmpty() && !protocolsForProxy.isEmpty()) {
+            // Re-parse methods with 'this' added to params
+            List<ExpressionNode> reifyMethodNodes = new ArrayList<>();
+            ISeq reArgs = seq.next();
+            if (reArgs != null) reArgs = reArgs.next(); // skip interface vec
+            if (reArgs != null && reArgs.first() instanceof IPersistentVector) reArgs = reArgs.next(); // skip ctor args
+            List<String> reifyMethodNames = new ArrayList<>();
+            while (reArgs != null) {
+                Object item = reArgs.first();
+                if (item instanceof ISeq methodDef) {
+                    String mName = ((Symbol) methodDef.first()).getName();
+                    ISeq rest = methodDef.next();
+                    List<Object> fnForm = new ArrayList<>();
+                    fnForm.add(Symbol.intern("fn*"));
+                    // Inject 'this' as first param in each arity
+                    while (rest != null) {
+                        Object formItem = rest.first();
+                        if (formItem instanceof IPersistentVector params) {
+                            // Add 'this' as first param: [args...] -> [this_ args...]
+                            List<Object> newParams = new ArrayList<>();
+                            newParams.add(Symbol.intern("this__proxy"));
+                            for (int pi = 0; pi < params.count(); pi++) newParams.add(params.nth(pi));
+                            fnForm.add(PersistentVector.create(newParams));
+                        } else {
+                            fnForm.add(formItem);
+                        }
+                        rest = rest.next();
+                    }
+                    reifyMethodNames.add(mName);
+                    reifyMethodNodes.add(analyze(PersistentList.create(fnForm)));
+                }
+                reArgs = reArgs.next();
+            }
+            return new clojure.truffle.nodes.ReifyNode(context,
+                    reifyMethodNames.toArray(new String[0]),
+                    reifyMethodNodes.toArray(new ExpressionNode[0]));
         }
 
         return new ProxyNode(context,
@@ -4602,24 +4963,91 @@ public class Analyzer {
 
     @com.oracle.truffle.api.CompilerDirectives.TruffleBoundary
     static Object registerDefprotocol(ClojureContext context, String protoName, List<String> methodNames) {
+        return registerDefprotocol(context, protoName, methodNames, null);
+    }
+
+    @com.oracle.truffle.api.CompilerDirectives.TruffleBoundary
+    static Object registerDefprotocol(ClojureContext context, String protoName, List<String> methodNames,
+                                      java.util.Map<String, Object[]> methodMeta) {
         ClojureProtocol proto = new ClojureProtocol(protoName, methodNames);
+        // Set per-method arity counts for getMethods() duplicate entries
+        if (methodMeta != null) {
+            java.util.Map<String, Integer> arityCount = new java.util.HashMap<>();
+            for (var entry : methodMeta.entrySet()) {
+                Object arglists = entry.getValue()[0];
+                int count = 0;
+                if (arglists instanceof clojure.lang.ISeq s) {
+                    for (; s != null; s = s.next()) count++;
+                }
+                if (count > 1) arityCount.put(entry.getKey(), count);
+            }
+            if (!arityCount.isEmpty()) proto.setMethodArityCount(arityCount);
+        }
         context.setVar(protoName, proto);
+        String currentNsName = context.getCurrentNamespace();
+        String nsQualifiedProto = currentNsName != null ? currentNsName + "/" + protoName : protoName;
         for (String methodName : methodNames) {
             context.setVar(methodName, new ClojureContext.NamedBuiltin(
                     protoName + "/" + methodName, fnArgs -> {
                 if (fnArgs.length < 1)
                     throw new RuntimeException(protoName + "/" + methodName + ": missing target (this)");
                 Object target = fnArgs[0];
-                Object fn = proto.findMethod(methodName, target);
+                // Resolve the current protocol via var (supports protocol redefinition)
+                Object currentProtoObj = context.getVar(protoName);
+                ClojureProtocol currentProto = (currentProtoObj instanceof ClojureProtocol cp) ? cp : proto;
+                // Check if the method still exists in the protocol (may have been redefined without it)
+                if (!currentProto.getMethodNames().contains(methodName)) {
+                    String qualName = nsQualifiedProto.replace('/', '.').replace('-', '_');
+                    throw new IllegalArgumentException(
+                            "No method of interface: " + qualName +
+                            " found for function: " + methodName +
+                            " of protocol: " + protoName +
+                            " (The protocol method may have been defined before and removed.)");
+                }
+                Object fn = currentProto.findMethod(methodName, target);
                 if (fn == null) {
                     String targetType = target instanceof clojure.truffle.runtime.ClojureReified r
                             ? "ClojureReified{" + String.join(",", r.getMethods().keySet()) + "}"
                             : target.getClass().getName();
-                    throw new RuntimeException("No implementation of protocol " + protoName +
-                            " method " + methodName + " for type: " + targetType);
+                    throw new IllegalArgumentException(
+                            "No implementation of method: :" + methodName +
+                            " of protocol: #'" + nsQualifiedProto +
+                            " found for class: " + targetType);
                 }
                 return context.callFunction(fn, fnArgs);
             }));
+
+            // Set metadata on protocol method var
+            if (currentNsName != null) {
+                String methodQname = currentNsName + "/" + methodName;
+                Object[] meta = (methodMeta != null) ? methodMeta.get(methodName) : null;
+                Object arglists = (meta != null) ? meta[0] : null;
+                String doc = (meta != null) ? (String) meta[1] : null;
+                Object tag = (meta != null && meta.length > 2) ? meta[2] : null;
+                // Resolve :tag symbol (e.g., String -> java.lang.String)
+                if (tag instanceof clojure.lang.Symbol tagSym && tagSym.getNamespace() == null) {
+                    try {
+                        Class<?> cls = Class.forName("java.lang." + tagSym.getName());
+                        tag = clojure.lang.Symbol.intern(cls.getName());
+                    } catch (ClassNotFoundException ignored) {}
+                }
+                // :protocol should be the var, :ns should be namespace object
+                Object protoVar = context.getOrCreateVar(nsQualifiedProto);
+                Object nsObj = context.getOrCreateNamespace(currentNsName);
+                // Build metadata map, normalizing null → ClojureNil for Truffle consistency
+                clojure.lang.IPersistentMap metaMap = clojure.lang.PersistentArrayMap.EMPTY;
+                metaMap = metaMap.assoc(clojure.lang.Keyword.intern("protocol"), protoVar);
+                metaMap = metaMap.assoc(clojure.lang.Keyword.intern("ns"), nsObj);
+                metaMap = metaMap.assoc(clojure.lang.Keyword.intern("name"),
+                    clojure.lang.Symbol.intern(methodName));
+                metaMap = metaMap.assoc(clojure.lang.Keyword.intern("arglists"),
+                    arglists != null ? arglists : ClojureNil.INSTANCE);
+                metaMap = metaMap.assoc(clojure.lang.Keyword.intern("doc"),
+                    doc != null ? doc : ClojureNil.INSTANCE);
+                metaMap = metaMap.assoc(clojure.lang.Keyword.intern("tag"),
+                    tag != null ? tag : ClojureNil.INSTANCE);
+                context.setVarMeta(methodQname, metaMap);
+            }
         }
         return proto;
     }
@@ -4628,9 +5056,44 @@ public class Analyzer {
     static Object registerDeftype(ClojureContext context, String typeName, List<String> fieldNames,
                                   java.util.Map<String, java.util.Map<String, Object>> evaluatedMethods,
                                   boolean isRecord) {
+        return registerDeftype(context, typeName, fieldNames, evaluatedMethods, isRecord, null);
+    }
+
+    @com.oracle.truffle.api.CompilerDirectives.TruffleBoundary
+    static Object registerDeftype(ClojureContext context, String typeName, List<String> fieldNames,
+                                  java.util.Map<String, java.util.Map<String, Object>> evaluatedMethods,
+                                  boolean isRecord, List<Symbol> fieldSymbols) {
         java.util.Map<String, Integer> fieldIdx = new java.util.LinkedHashMap<>();
         for (int i = 0; i < fieldNames.size(); i++)
             fieldIdx.put(fieldNames.get(i), i);
+
+        // Extract field type hints for validation (e.g., ^long, ^double)
+        Class<?>[] fieldTypeHints = null;
+        if (fieldSymbols != null) {
+            boolean hasHints = false;
+            fieldTypeHints = new Class<?>[fieldNames.size()];
+            for (int i = 0; i < fieldSymbols.size() && i < fieldNames.size(); i++) {
+                Symbol fs = fieldSymbols.get(i);
+                if (fs.meta() != null) {
+                    Object tag = fs.meta().valAt(clojure.lang.Keyword.intern("tag"));
+                    if (tag instanceof Symbol tagSym) {
+                        Class<?> hintClass = resolvePrimitiveHint(tagSym.getName());
+                        if (hintClass != null) {
+                            fieldTypeHints[i] = hintClass;
+                            hasHints = true;
+                        }
+                    } else if (tag instanceof String tagStr) {
+                        Class<?> hintClass = resolvePrimitiveHint(tagStr);
+                        if (hintClass != null) {
+                            fieldTypeHints[i] = hintClass;
+                            hasHints = true;
+                        }
+                    }
+                }
+            }
+            if (!hasHints) fieldTypeHints = null;
+        }
+        final Class<?>[] finalFieldTypeHints = fieldTypeHints;
 
         java.util.Map<String, Object> typeMethods = new java.util.HashMap<>();
 
@@ -4639,6 +5102,7 @@ public class Analyzer {
             Object protoObj = context.getVar(protoName);
             if (protoObj instanceof ClojureProtocol proto) {
                 proto.extend(typeName, new java.util.HashMap<>(entry.getValue()));
+                proto.addInlineImplementor(typeName);
             } else {
                 for (var methodEntry : entry.getValue().entrySet()) {
                     Object fn = methodEntry.getValue();
@@ -4681,34 +5145,106 @@ public class Analyzer {
         java.util.Map<String, Object> capturedTypeMethods =
                 typeMethods.isEmpty() ? null : new java.util.HashMap<>(typeMethods);
 
+        // Compute namespace-qualified type name for printing (e.g., clojure.test_clojure.protocols.Foo)
+        String currentNsName = context.getCurrentNamespace();
+        String qualifiedName = currentNsName != null
+            ? currentNsName.replace('-', '_') + "." + typeName
+            : typeName;
+
         context.setVar("->" + typeName, (ClojureContext.BuiltinFunction) ctorArgs -> {
+            if (isRecord && ctorArgs.length == fieldNames.size() + 2) {
+                // Extended constructor: (RecordType. f1 f2 ... meta extras)
+                Object[] fieldValues = new Object[fieldNames.size()];
+                System.arraycopy(ctorArgs, 0, fieldValues, 0, fieldNames.size());
+                Object metaArg = ctorArgs[fieldNames.size()];
+                Object extrasArg = ctorArgs[fieldNames.size() + 1];
+                clojure.lang.IPersistentMap extrasMap = (extrasArg instanceof clojure.lang.IPersistentMap em) ? em
+                    : clojure.lang.PersistentArrayMap.EMPTY;
+                ClojureDeftypeInstance inst = new ClojureDeftypeInstance(typeName, fieldValues, fieldIdx, extrasMap);
+                inst.setQualifiedTypeName(qualifiedName);
+                inst.setRecord(true);
+                if (metaArg instanceof clojure.lang.IPersistentMap mm) {
+                    inst = (ClojureDeftypeInstance) inst.withMeta(mm);
+                }
+                if (capturedTypeMethods != null) inst.setMethods(capturedTypeMethods);
+                return inst;
+            }
             if (ctorArgs.length != fieldNames.size())
-                throw new RuntimeException("->" + typeName + ": expected " + fieldNames.size() + " args");
+                throw new clojure.lang.ArityException(ctorArgs.length, "->" + typeName);
+            if (finalFieldTypeHints != null)
+                validateFieldTypes(ctorArgs, finalFieldTypeHints, fieldNames);
             ClojureDeftypeInstance inst = new ClojureDeftypeInstance(typeName, ctorArgs.clone(), fieldIdx);
+            inst.setQualifiedTypeName(qualifiedName);
             if (isRecord) inst.setRecord(true);
             if (capturedTypeMethods != null) inst.setMethods(capturedTypeMethods);
             return inst;
         });
 
+        // Set :doc metadata on ->TypeName factory var
+        String ctorQname = currentNsName + "/->" + typeName;
+        context.setVarMeta(ctorQname, clojure.lang.RT.map(
+            clojure.lang.Keyword.intern("doc"),
+            "Positional factory function for class " + qualifiedName + "."));
+
         context.setVar(typeName, typeName);
+
+        // Register basis (field name symbols with metadata) for TypeName/getBasis support
+        clojure.lang.IPersistentVector basis = clojure.lang.PersistentVector.EMPTY;
+        for (int fi = 0; fi < fieldNames.size(); fi++) {
+            Symbol sym;
+            if (fieldSymbols != null && fi < fieldSymbols.size()) {
+                sym = fieldSymbols.get(fi);
+            } else {
+                sym = clojure.lang.Symbol.intern(fieldNames.get(fi));
+            }
+            basis = basis.cons(sym);
+        }
+        context.setVar("__basis__" + typeName, basis);
 
         if (isRecord) {
             context.setVar("map->" + typeName, (ClojureContext.BuiltinFunction) ctorArgs -> {
                 if (ctorArgs.length != 1)
-                    throw new RuntimeException("map->" + typeName + ": expected 1 arg (a map)");
+                    throw new clojure.lang.ArityException(ctorArgs.length, "map->" + typeName);
                 Object mapArg = ctorArgs[0];
-                if (!(mapArg instanceof clojure.lang.IPersistentMap m))
+                // Convert java.util.Map to IPersistentMap if needed
+                clojure.lang.IPersistentMap m;
+                if (mapArg instanceof clojure.lang.IPersistentMap pm) {
+                    m = pm;
+                } else if (mapArg instanceof java.util.Map jm) {
+                    m = clojure.lang.PersistentHashMap.create(jm);
+                } else {
                     throw new RuntimeException("map->" + typeName + ": arg must be a map");
+                }
                 Object[] fieldValues = new Object[fieldNames.size()];
+                // Collect extras (keys not in fieldNames)
+                java.util.Set<clojure.lang.Keyword> fieldKeywords = new java.util.HashSet<>();
                 for (int i = 0; i < fieldNames.size(); i++) {
                     clojure.lang.Keyword kw = clojure.lang.Keyword.intern(fieldNames.get(i));
+                    fieldKeywords.add(kw);
                     fieldValues[i] = m.valAt(kw);
                 }
-                ClojureDeftypeInstance inst = new ClojureDeftypeInstance(typeName, fieldValues, fieldIdx);
+                if (finalFieldTypeHints != null)
+                    validateFieldTypes(fieldValues, finalFieldTypeHints, fieldNames);
+                // Build extras map from remaining keys
+                clojure.lang.IPersistentMap extras = clojure.lang.PersistentArrayMap.EMPTY;
+                for (clojure.lang.ISeq s = m.seq(); s != null; s = s.next()) {
+                    clojure.lang.IMapEntry me = (clojure.lang.IMapEntry) s.first();
+                    if (!fieldKeywords.contains(me.key())) {
+                        extras = extras.assoc(me.key(), me.val());
+                    }
+                }
+                ClojureDeftypeInstance inst = new ClojureDeftypeInstance(typeName, fieldValues, fieldIdx, extras);
+                inst.setQualifiedTypeName(qualifiedName);
                 inst.setRecord(true);
                 if (capturedTypeMethods != null) inst.setMethods(capturedTypeMethods);
                 return inst;
             });
+
+            // Set :doc metadata on map->TypeName factory var
+            String mapCtorQname = currentNsName + "/map->" + typeName;
+            context.setVarMeta(mapCtorQname, clojure.lang.RT.map(
+                clojure.lang.Keyword.intern("doc"),
+                "Factory function for class " + qualifiedName + ", taking a map of keywords to field values."));
         }
 
         return ClojureNil.INSTANCE;
@@ -4728,6 +5264,13 @@ public class Analyzer {
     static Object evalDeftype(java.util.Map<String, java.util.Map<String, ExpressionNode>> protoMethods,
                               Object frameObj, ClojureContext context, String typeName,
                               List<String> fieldNames, boolean isRecord) {
+        return evalDeftype(protoMethods, frameObj, context, typeName, fieldNames, isRecord, null);
+    }
+
+    @com.oracle.truffle.api.CompilerDirectives.TruffleBoundary
+    static Object evalDeftype(java.util.Map<String, java.util.Map<String, ExpressionNode>> protoMethods,
+                              Object frameObj, ClojureContext context, String typeName,
+                              List<String> fieldNames, boolean isRecord, List<Symbol> fieldSymbols) {
         com.oracle.truffle.api.frame.VirtualFrame frame = (com.oracle.truffle.api.frame.VirtualFrame) frameObj;
         java.util.Map<String, java.util.Map<String, Object>> evaluatedMethods = new java.util.LinkedHashMap<>();
         for (var entry : protoMethods.entrySet()) {
@@ -4737,7 +5280,43 @@ public class Analyzer {
             }
             evaluatedMethods.put(entry.getKey(), evaluated);
         }
-        return registerDeftype(context, typeName, fieldNames, evaluatedMethods, isRecord);
+        return registerDeftype(context, typeName, fieldNames, evaluatedMethods, isRecord, fieldSymbols);
+    }
+
+    /** Resolve primitive type hint name to Class. Returns null if not a primitive hint. */
+    private static Class<?> resolvePrimitiveHint(String name) {
+        return switch (name) {
+            case "long" -> Long.class;
+            case "double" -> Double.class;
+            case "int" -> Integer.class;
+            case "float" -> Float.class;
+            case "short" -> Short.class;
+            case "byte" -> Byte.class;
+            case "boolean" -> Boolean.class;
+            case "char" -> Character.class;
+            default -> null;
+        };
+    }
+
+    /** Validate field values against type hints. Throws ClassCastException for mismatches. */
+    private static void validateFieldTypes(Object[] fieldValues, Class<?>[] typeHints, List<String> fieldNames) {
+        for (int i = 0; i < fieldValues.length && i < typeHints.length; i++) {
+            if (typeHints[i] != null && fieldValues[i] != null) {
+                Object val = fieldValues[i];
+                if (val instanceof ClojureNil) continue; // nil is acceptable
+                Class<?> expected = typeHints[i];
+                if (!expected.isInstance(val) && !(val instanceof Number && Number.class.isAssignableFrom(expected))) {
+                    throw new ClassCastException(
+                        "Cannot cast " + val.getClass().getName() + " to " + expected.getName());
+                }
+                // For numeric types, also validate specific type match
+                if (expected == Long.class && !(val instanceof Long)) {
+                    if (val instanceof Number) continue; // numeric coercion OK
+                    throw new ClassCastException(
+                        "Cannot cast " + val.getClass().getName() + " to " + expected.getName());
+                }
+            }
+        }
     }
 
     @com.oracle.truffle.api.CompilerDirectives.TruffleBoundary
@@ -4825,24 +5404,55 @@ public class Analyzer {
         ClojureNamespace reqNs = context.getNamespace(nsName);
         ClojureNamespace currentNs = context.getNamespace(context.getCurrentNamespace());
         if (reqNs == null || currentNs == null) return ClojureNil.INSTANCE;
-        if (capturedArgs.size() >= 3) {
-            Object filterKey = capturedArgs.get(1);
-            if (filterKey instanceof Keyword kw && kw.getName().equals("only")) {
-                Object symsArg = capturedArgs.get(2);
-                if (symsArg instanceof ISeq qs2 && qs2.first() instanceof Symbol s2 && s2.getName().equals("quote")) {
-                    symsArg = qs2.next().first();
-                }
-                if (symsArg instanceof IPersistentVector pv) {
-                    List<String> names = new ArrayList<>();
-                    for (int i = 0; i < pv.count(); i++) {
-                        names.add(((Symbol) pv.nth(i)).getName());
+        // Parse keyword options: :only, :exclude, :rename
+        java.util.Map<String, String> renames = null;
+        java.util.List<String> onlyNames = null;
+        java.util.Set<String> excludeNames = null;
+        for (int i = 1; i + 1 < capturedArgs.size(); i += 2) {
+            Object filterKey = capturedArgs.get(i);
+            if (!(filterKey instanceof Keyword kw)) continue;
+            Object valArg = capturedArgs.get(i + 1);
+            // Unquote if needed
+            if (valArg instanceof ISeq qs2 && qs2.first() instanceof Symbol s2 && s2.getName().equals("quote")) {
+                valArg = qs2.next().first();
+            }
+            switch (kw.getName()) {
+                case "only":
+                    if (valArg instanceof IPersistentVector pv) {
+                        onlyNames = new ArrayList<>();
+                        for (int j = 0; j < pv.count(); j++) {
+                            onlyNames.add(((Symbol) pv.nth(j)).getName());
+                        }
                     }
-                    currentNs.referOnly(reqNs, names);
-                    return ClojureNil.INSTANCE;
-                }
+                    break;
+                case "exclude":
+                    if (valArg instanceof IPersistentVector pv2) {
+                        excludeNames = new java.util.HashSet<>();
+                        for (int j = 0; j < pv2.count(); j++) {
+                            excludeNames.add(((Symbol) pv2.nth(j)).getName());
+                        }
+                    }
+                    break;
+                case "rename":
+                    if (valArg instanceof IPersistentMap m) {
+                        renames = new java.util.HashMap<>();
+                        for (ISeq ms = m.seq(); ms != null; ms = ms.next()) {
+                            IMapEntry me = (IMapEntry) ms.first();
+                            renames.put(((Symbol) me.key()).getName(), ((Symbol) me.val()).getName());
+                        }
+                    }
+                    break;
             }
         }
-        currentNs.referAll(reqNs);
+        if (onlyNames != null) {
+            currentNs.referOnly(reqNs, onlyNames);
+        } else if (excludeNames != null) {
+            currentNs.referWithExclude(reqNs, excludeNames);
+        } else if (renames != null) {
+            currentNs.referWithRename(reqNs, renames);
+        } else {
+            currentNs.referAll(reqNs);
+        }
         return ClojureNil.INSTANCE;
     }
 
@@ -4862,7 +5472,20 @@ public class Analyzer {
 
     @com.oracle.truffle.api.CompilerDirectives.TruffleBoundary
     static Object doDefinterface(ClojureContext context, String ifaceName, List<String> methodNames) {
-        ClojureProtocol proto = new ClojureProtocol(ifaceName, methodNames);
+        // Deduplicate method names for the protocol, but track overload counts
+        java.util.Map<String, Integer> overloadCounts = new java.util.LinkedHashMap<>();
+        for (String name : methodNames) {
+            overloadCounts.merge(name, 1, Integer::sum);
+        }
+        List<String> uniqueNames = new ArrayList<>(overloadCounts.keySet());
+        ClojureProtocol proto = new ClojureProtocol(ifaceName, uniqueNames);
+        // Set overload counts for methods with multiple signatures
+        java.util.Map<String, Integer> multiOverloads = new java.util.HashMap<>();
+        for (var entry : overloadCounts.entrySet()) {
+            if (entry.getValue() > 1) multiOverloads.put(entry.getKey(), entry.getValue());
+        }
+        if (!multiOverloads.isEmpty()) proto.setMethodArityCount(multiOverloads);
+        proto.setFromInterface(true);
         context.setVar(ifaceName, proto);
         return proto;
     }

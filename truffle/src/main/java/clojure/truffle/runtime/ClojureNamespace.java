@@ -71,7 +71,16 @@ public class ClojureNamespace {
 
     public void referWithRename(ClojureNamespace other, java.util.Map<String, String> renames) {
         for (var entry : other.interns.entrySet()) {
-            String newName = renames.getOrDefault(entry.getKey(), entry.getKey());
+            String key = entry.getKey();
+            String newName;
+            if (key.startsWith("__macro__")) {
+                // Also rename the __macro__ prefixed entry when the base name is renamed
+                String baseName = key.substring("__macro__".length());
+                String renamedBase = renames.get(baseName);
+                newName = renamedBase != null ? "__macro__" + renamedBase : key;
+            } else {
+                newName = renames.getOrDefault(key, key);
+            }
             refers.put(newName, entry.getValue());
             referSources.put(newName, other.getName());
         }

@@ -153,6 +153,18 @@ public final static Var READER_RESOLVER = Var.intern(CLOJURE_NS, Symbol.intern("
  */
 public static volatile java.util.function.Function<IPersistentList, Object> readEvalHook;
 
+/**
+ * Hook for constructing defrecord/deftype instances from reader literals.
+ * Called when classForNameNonLoading fails.
+ * For map form (#Type{:k v}): receives (recordName, mapVals, null)
+ * For vector form (#Type[a b]): receives (recordName, null, vectorArgs)
+ * Returns the constructed instance, or null if not a known type.
+ */
+public interface RecordReaderHook {
+    Object create(String recordName, IPersistentMap mapVals, IPersistentVector vectorArgs);
+}
+public static volatile RecordReaderHook recordReaderHook;
+
 static java.util.concurrent.atomic.AtomicInteger id = new java.util.concurrent.atomic.AtomicInteger(1);
 
 // ======== Helper methods formerly from RT ========
@@ -1694,8 +1706,12 @@ public static class CtorReader extends AFn{
 		    throw Util.runtimeException("Record construction syntax can only be used when *read-eval* == true");
 		    }
 
-		Class recordClass = TruffleReader.classForNameNonLoading(recordName.toString());
-
+		Class recordClass = null;
+		try {
+			recordClass = TruffleReader.classForNameNonLoading(recordName.toString());
+		} catch (Exception e) {
+			// Not a real Java class - try recordReaderHook for defrecord types
+		}
 
 		boolean shortForm = true;
 
@@ -1705,6 +1721,20 @@ public static class CtorReader extends AFn{
 			shortForm = true;
 		} else {
 			throw Util.runtimeException("Unreadable constructor form starting with \"#" + recordName + "\"");
+		}
+
+		// If no Java class found, try recordReaderHook for Truffle defrecord/deftype types
+		if (recordClass == null) {
+			if (recordReaderHook != null) {
+				Object result;
+				if (shortForm) {
+					result = recordReaderHook.create(recordName.toString(), null, (IPersistentVector) form);
+				} else {
+					result = recordReaderHook.create(recordName.toString(), (IPersistentMap) form, null);
+				}
+				if (result != null) return result;
+			}
+			throw Util.runtimeException("Cannot resolve record type: " + recordName.toString());
 		}
 
 		Object ret = null;
