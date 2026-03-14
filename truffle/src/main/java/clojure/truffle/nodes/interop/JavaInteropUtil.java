@@ -61,6 +61,9 @@ public class JavaInteropUtil {
             } catch (ClassNotFoundException ignored) {}
         }
         // clojure.lang.* (needed for native-image where Class.forName may fail)
+        // Use Class.forName(name, false, loader) to avoid triggering class initialization
+        // (RT's static initializer tries to load clojure/core which isn't on the classpath at build time)
+        ClassLoader cl = JavaInteropUtil.class.getClassLoader();
         for (String name : new String[]{
                 "MapEntry", "RT", "Keyword", "Symbol", "Var", "Namespace",
                 "PersistentVector", "PersistentHashMap", "PersistentArrayMap",
@@ -84,7 +87,7 @@ public class JavaInteropUtil {
                 "IEditableCollection", "Reduced", "Reversible", "Sorted"
         }) {
             try {
-                CLASS_CACHE.put("clojure.lang." + name, Class.forName("clojure.lang." + name));
+                CLASS_CACHE.put("clojure.lang." + name, Class.forName("clojure.lang." + name, false, cl));
             } catch (ClassNotFoundException ignored) {}
         }
     }

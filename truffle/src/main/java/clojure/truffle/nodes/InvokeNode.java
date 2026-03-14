@@ -94,7 +94,8 @@ public class InvokeNode extends ExpressionNode {
                     clojure.truffle.runtime.ClojureNil.INSTANCE;
         }
         if (function instanceof clojure.lang.IPersistentMap m) {
-            if (argValues.length < 1 || argValues.length > 2)
+            if (argValues.length == 0) return function; // ({:a 1}) -> return the map itself
+            if (argValues.length > 2)
                 throw new RuntimeException("Map lookup expects 1 or 2 args");
             Object val = m.valAt(argValues[0],
                     argValues.length == 2 ? argValues[1] : clojure.truffle.runtime.ClojureNil.INSTANCE);

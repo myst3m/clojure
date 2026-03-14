@@ -2432,6 +2432,8 @@ public class ClojureContext {
 
         defBuiltin("select-keys", args -> {
             checkArity(args, 2, "select-keys");
+            if (args[0] instanceof ClojureNil || args[0] == null)
+                return ClojureNil.INSTANCE;
             if (!(args[0] instanceof clojure.lang.IPersistentMap m))
                 throw new RuntimeException("select-keys: first arg must be a map");
             Object result = clojure.lang.PersistentHashMap.EMPTY;
@@ -6539,6 +6541,8 @@ public class ClojureContext {
         // select-keys
         defBuiltin("select-keys", args -> {
             checkArity(args, 2, "select-keys");
+            if (args[0] instanceof ClojureNil || args[0] == null)
+                return ClojureNil.INSTANCE;
             clojure.lang.IPersistentMap m = (clojure.lang.IPersistentMap) args[0];
             clojure.lang.IPersistentMap result = clojure.lang.PersistentArrayMap.EMPTY;
             for (clojure.lang.ISeq s = seqOf(args[1]); s != null; s = s.next()) {
@@ -7179,41 +7183,31 @@ public class ClojureContext {
         // Register macro functions for builtin special forms so they work with macroexpand + refer/rename
         // with-open macro: validates bindings and expands to let/try/finally/.close
         NamedBuiltin withOpenMacro = new NamedBuiltin("with-open", args -> {
-            // args: &form, &env, bindings, body...
-            Object form = args[0];
-            String macroName = "with-open";
-            if (form instanceof clojure.lang.ISeq s && s.first() instanceof clojure.lang.Symbol sym) {
-                macroName = sym.getName();
-            }
-            if (args.length < 3 || !(args[2] instanceof clojure.lang.IPersistentVector)) {
+            // NamedBuiltin macros are called WITHOUT &form/&env (not ClojureFunction),
+            // so args[0]=bindings, args[1..]=body
+            if (args.length < 1 || !(args[0] instanceof clojure.lang.IPersistentVector)) {
                 throw new IllegalArgumentException(
-                    macroName + " requires a vector for its binding");
+                    "with-open requires a vector for its binding");
             }
-            clojure.lang.IPersistentVector bindings = (clojure.lang.IPersistentVector) args[2];
+            clojure.lang.IPersistentVector bindings = (clojure.lang.IPersistentVector) args[0];
             if (bindings.count() % 2 != 0) {
                 throw new IllegalArgumentException(
-                    macroName + " requires an even number of forms in binding vector");
+                    "with-open requires an even number of forms in binding vector");
             }
             // Build expansion: (let [b0 b1] (try (with-open [b2...] body...) (finally (. b0 close))))
-            // Collect body forms from args[3..]
             java.util.List<Object> bodyForms = new java.util.ArrayList<>();
-            for (int i = 3; i < args.length; i++) bodyForms.add(args[i]);
+            for (int i = 1; i < args.length; i++) bodyForms.add(args[i]);
             if (bindings.count() == 0) {
-                // (do body...)
                 return clojure.truffle.runtime.ClojureRT.cons(
                     clojure.lang.Symbol.intern("do"),
                     clojure.lang.PersistentList.create(bodyForms));
             }
-            // (let [b0 b1] (try (with-open [b2..] body..) (finally (. b0 close))))
             clojure.lang.Symbol b0 = (clojure.lang.Symbol) bindings.nth(0);
             Object b1 = bindings.nth(1);
             clojure.lang.IPersistentVector restBindings = clojure.lang.PersistentVector.EMPTY;
             for (int i = 2; i < bindings.count(); i++) {
                 restBindings = restBindings.cons(bindings.nth(i));
             }
-            // Get the original macro name symbol from the form
-            clojure.lang.Symbol macroSym = (clojure.lang.Symbol) ((clojure.lang.ISeq) form).first();
-            // Build inner: (with-open [rest..] body..) or just body if no more bindings
             Object innerBody;
             if (restBindings.count() == 0) {
                 innerBody = clojure.truffle.runtime.ClojureRT.cons(
@@ -7221,21 +7215,17 @@ public class ClojureContext {
                     clojure.lang.PersistentList.create(bodyForms));
             } else {
                 java.util.List<Object> woArgs = new java.util.ArrayList<>();
-                woArgs.add(macroSym);
+                woArgs.add(clojure.lang.Symbol.intern("with-open"));
                 woArgs.add(restBindings);
                 woArgs.addAll(bodyForms);
                 innerBody = clojure.lang.PersistentList.create(woArgs);
             }
-            // (. b0 close)
             Object closeForm = clojure.lang.PersistentList.create(java.util.List.of(
                 clojure.lang.Symbol.intern("."), b0, clojure.lang.Symbol.intern("close")));
-            // (finally (. b0 close))
             Object finallyForm = clojure.lang.PersistentList.create(java.util.List.of(
                 clojure.lang.Symbol.intern("finally"), closeForm));
-            // (try innerBody (finally ...))
             Object tryForm = clojure.lang.PersistentList.create(java.util.List.of(
                 clojure.lang.Symbol.intern("try"), innerBody, finallyForm));
-            // (let [b0 b1] tryForm)
             return clojure.lang.PersistentList.create(java.util.List.of(
                 clojure.lang.Symbol.intern("let"),
                 clojure.lang.PersistentVector.create(b0, b1),
@@ -7408,7 +7398,8 @@ public class ClojureContext {
                 Object val = s.get(args[0]);
                 return val == null ? ClojureNil.INSTANCE : val;
             } else if (fn instanceof clojure.lang.IPersistentMap m) {
-                if (args.length < 1 || args.length > 2)
+                if (args.length == 0) return fn; // ({:a 1}) -> return the map itself
+                if (args.length > 2)
                     throw new RuntimeException("Map lookup expects 1 or 2 args");
                 Object val = m.valAt(args[0],
                         args.length == 2 ? args[1] : ClojureNil.INSTANCE);

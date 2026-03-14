@@ -1405,21 +1405,10 @@ public class Analyzer {
                     (context.getNamespace(nsPrefix) != null ? context.getNamespace(nsPrefix).resolve(basisVarName) : null) :
                     context.getVar(basisVarName);
                 if (basisVal != null) {
-                    Object finalBasisVal = basisVal;
-                    return new ExpressionNode() {
-                        @Override
-                        public Object executeGeneric(com.oracle.truffle.api.frame.VirtualFrame frame) {
-                            return finalBasisVal;
-                        }
-                    };
+                    return new QuoteNode(basisVal);
                 }
                 // Fallback: return empty vector
-                return new ExpressionNode() {
-                    @Override
-                    public Object executeGeneric(com.oracle.truffle.api.frame.VirtualFrame frame) {
-                        return clojure.lang.PersistentVector.EMPTY;
-                    }
-                };
+                return new QuoteNode(clojure.lang.PersistentVector.EMPTY);
             }
             default:
                 return null;
@@ -4554,10 +4543,26 @@ public class Analyzer {
                 String methodName = ((Symbol) methodDef.first()).getName();
                 ISeq rest = methodDef.next();
                 // Check for duplicate method across different interface sections
+                // Allow same-named methods from different interfaces if they have different arities
                 if (currentSection != null && methodSection.containsKey(methodName)
                         && methodSection.get(methodName) != currentSection) {
-                    throw err("Can't define method " + methodName + " in both " +
-                            methodSection.get(methodName) + " and " + currentSection);
+                    // Check if this is a different-arity overload (which is allowed)
+                    IPersistentVector newParams = (rest != null && rest.first() instanceof IPersistentVector pv) ? pv : null;
+                    int newArity = newParams != null ? newParams.count() : -1;
+                    boolean sameArity = false;
+                    if (methodArities.containsKey(methodName)) {
+                        @SuppressWarnings("unchecked")
+                        List<List<Object>> existing = (List<List<Object>>) methodArities.get(methodName);
+                        for (List<Object> ea : existing) {
+                            if (!ea.isEmpty() && ea.get(0) instanceof IPersistentVector ev) {
+                                if (ev.count() == newArity) { sameArity = true; break; }
+                            }
+                        }
+                    }
+                    if (sameArity) {
+                        throw err("Can't define method " + methodName + " in both " +
+                                methodSection.get(methodName) + " and " + currentSection);
+                    }
                 }
                 if (currentSection != null) methodSection.put(methodName, currentSection);
                 // Collect params and body as a single arity: ([params] body...)
@@ -4642,14 +4647,28 @@ public class Analyzer {
                     validMethodNames.add(m.getName());
                 }
             }
-            // Check for methods not declared on any interface
-            for (String mName : methodNames) {
-                // Skip Object methods (toString, hashCode, equals)
-                if (mName.equals("toString") || mName.equals("hashCode") || mName.equals("equals")) continue;
-                // Convert hyphens to underscores for matching
-                String javaName = mName.replace('-', '_');
-                if (!validMethodNames.contains(javaName) && !validMethodNames.contains(mName)) {
-                    throw err("Can't define method not in interfaces: " + mName);
+            // Also include protocol method names (protocols are not Java interfaces)
+            for (Symbol protoSym : protocolNames) {
+                Object protoVal = context.getVar(protoSym.getName());
+                if (protoVal instanceof clojure.truffle.runtime.ClojureProtocol cp) {
+                    for (String pm : cp.getMethodNames()) {
+                        validMethodNames.add(pm);
+                        validMethodNames.add(pm.replace('-', '_'));
+                    }
+                }
+            }
+            // Check for methods not declared on any interface (only when no protocols are involved)
+            if (protocolNames.isEmpty()) {
+                for (String mName : methodNames) {
+                    // Skip Object methods (toString, hashCode, equals)
+                    if (mName.equals("toString") || mName.equals("hashCode") || mName.equals("equals")) continue;
+                    // Skip type-suffixed method names (overloaded dispatch keys)
+                    if (mName.contains("__")) continue;
+                    // Convert hyphens to underscores for matching
+                    String javaName = mName.replace('-', '_');
+                    if (!validMethodNames.contains(javaName) && !validMethodNames.contains(mName)) {
+                        throw err("Can't define method not in interfaces: " + mName);
+                    }
                 }
             }
             // Check for duplicate methods across interfaces
