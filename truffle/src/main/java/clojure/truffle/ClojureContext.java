@@ -3025,6 +3025,7 @@ public class ClojureContext {
         // --- Phase 8: String operations (clojure.string equivalents as builtins) ---
         defBuiltin("str/split", args -> {
             if (args.length < 2) throw new RuntimeException("str/split: expected 2-3 args");
+            if (args[0] == null || args[0] instanceof ClojureNil) throw new NullPointerException();
             String s = args[0].toString();
             Pattern pat = (args[1] instanceof Pattern p) ? p : Pattern.compile(args[1].toString());
             String[] parts = args.length > 2
@@ -3056,21 +3057,25 @@ public class ClojureContext {
 
         defBuiltin("str/trim", args -> {
             checkArity(args, 1, "str/trim");
-            return args[0].toString().trim();
+            if (args[0] == null || args[0] instanceof ClojureNil) throw new NullPointerException();
+            return args[0].toString().strip();
         });
 
         defBuiltin("str/triml", args -> {
             checkArity(args, 1, "str/triml");
+            if (args[0] == null || args[0] instanceof ClojureNil) throw new NullPointerException();
             return args[0].toString().stripLeading();
         });
 
         defBuiltin("str/trimr", args -> {
             checkArity(args, 1, "str/trimr");
+            if (args[0] == null || args[0] instanceof ClojureNil) throw new NullPointerException();
             return args[0].toString().stripTrailing();
         });
 
         defBuiltin("str/capitalize", args -> {
             checkArity(args, 1, "str/capitalize");
+            if (args[0] == null || args[0] instanceof ClojureNil) throw new NullPointerException();
             String s = args[0].toString();
             if (s.isEmpty()) return s;
             return Character.toUpperCase(s.charAt(0)) + s.substring(1).toLowerCase();
@@ -3078,16 +3083,19 @@ public class ClojureContext {
 
         defBuiltin("str/upper-case", args -> {
             checkArity(args, 1, "str/upper-case");
+            if (args[0] == null || args[0] instanceof ClojureNil) throw new NullPointerException();
             return args[0].toString().toUpperCase();
         });
 
         defBuiltin("str/lower-case", args -> {
             checkArity(args, 1, "str/lower-case");
+            if (args[0] == null || args[0] instanceof ClojureNil) throw new NullPointerException();
             return args[0].toString().toLowerCase();
         });
 
         defBuiltin("str/replace", args -> {
             checkArity(args, 3, "str/replace");
+            if (args[0] == null || args[0] instanceof ClojureNil) throw new NullPointerException();
             String s = args[0].toString();
             Object replacement = args[2];
             if (args[1] instanceof Pattern pat) {
@@ -3116,7 +3124,7 @@ public class ClojureContext {
                     m.appendTail(sb);
                     return sb.toString();
                 }
-                return pat.matcher(s).replaceAll(java.util.regex.Matcher.quoteReplacement(replacement.toString()));
+                return pat.matcher(s).replaceAll(replacement.toString());
             }
             if (args[1] instanceof Character c) {
                 if (replacement instanceof Character r) {
@@ -3129,6 +3137,7 @@ public class ClojureContext {
 
         defBuiltin("str/replace-first", args -> {
             checkArity(args, 3, "str/replace-first");
+            if (args[0] == null || args[0] instanceof ClojureNil) throw new NullPointerException();
             String s = args[0].toString();
             Object replacement = args[2];
             if (args[1] instanceof Pattern pat) {
@@ -3155,9 +3164,9 @@ public class ClojureContext {
                     }
                     return s;
                 }
-                return pat.matcher(s).replaceFirst(java.util.regex.Matcher.quoteReplacement(replacement.toString()));
+                return pat.matcher(s).replaceFirst(replacement.toString());
             }
-            return s.replaceFirst(Pattern.quote(args[1].toString()), java.util.regex.Matcher.quoteReplacement(replacement.toString()));
+            return s.replaceFirst(Pattern.quote(args[1].toString()), replacement.toString());
         });
 
         defBuiltin("str/starts-with?", args -> {
@@ -3204,11 +3213,13 @@ public class ClojureContext {
 
         defBuiltin("str/reverse", args -> {
             checkArity(args, 1, "str/reverse");
+            if (args[0] == null || args[0] instanceof ClojureNil) throw new NullPointerException();
             return new StringBuilder(args[0].toString()).reverse().toString();
         });
 
         defBuiltin("str/trim-newline", args -> {
             checkArity(args, 1, "str/trim-newline");
+            if (args[0] == null || args[0] instanceof ClojureNil) throw new NullPointerException();
             String s = args[0].toString();
             int len = s.length();
             while (len > 0) {
@@ -3221,6 +3232,7 @@ public class ClojureContext {
 
         defBuiltin("str/split-lines", args -> {
             checkArity(args, 1, "str/split-lines");
+            if (args[0] == null || args[0] instanceof ClojureNil) throw new NullPointerException();
             String s = args[0].toString();
             String[] lines = s.split("\\r?\\n|\\r", -1);
             return clojure.lang.PersistentVector.create(java.util.Arrays.asList((Object[]) lines));
@@ -3228,6 +3240,7 @@ public class ClojureContext {
 
         defBuiltin("str/re-quote-replacement", args -> {
             checkArity(args, 1, "str/re-quote-replacement");
+            if (args[0] == null || args[0] instanceof ClojureNil) throw new NullPointerException();
             return java.util.regex.Matcher.quoteReplacement(args[0].toString());
         });
 
