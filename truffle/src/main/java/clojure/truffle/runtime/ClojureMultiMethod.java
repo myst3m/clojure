@@ -69,37 +69,24 @@ public class ClojureMultiMethod {
     }
 
     private boolean isaCheck(Object child, Object parent) {
-        if (child == null || parent == null) return false;
-        if (child.equals(parent)) return true;
-        // Vector dispatch values: check element-wise
-        if (child instanceof clojure.lang.IPersistentVector cv &&
-                parent instanceof clojure.lang.IPersistentVector pv) {
-            if (cv.count() != pv.count()) return false;
-            for (int i = 0; i < cv.count(); i++) {
-                if (!isaCheck(cv.nth(i), pv.nth(i))) return false;
-            }
-            return true;
-        }
-        // Check hierarchy (ancestors of child contain parent?)
-        Object hier = context.getGlobalVar("*hierarchy*");
-        if (hier instanceof clojure.lang.IPersistentMap h) {
-            Object ancestors = ((clojure.lang.IPersistentMap) h.valAt(
-                    clojure.lang.Keyword.intern("ancestors"))).valAt(child);
-            if (ancestors instanceof clojure.lang.IPersistentSet s) {
-                if (s.contains(parent)) return true;
-            }
-        }
-        // Java class hierarchy
-        if (child instanceof Class<?> cc && parent instanceof Class<?> pc) {
-            return pc.isAssignableFrom(cc);
-        }
-        return false;
+        return context.isaCheckPublic(child, parent);
     }
 
     private boolean isPreferred(Object x, Object y) {
+        // Direct preference
         java.util.Set<Object> prefs = preferences.get(x);
         if (prefs != null && prefs.contains(y)) return true;
-        // Also check if x is derived from y
+        // x preferred over ancestor of y?
+        if (prefs != null) {
+            for (Object pref : prefs) {
+                if (isaCheck(y, pref)) return true;
+            }
+        }
+        // Ancestor of x preferred over y?
+        for (var entry : preferences.entrySet()) {
+            if (isaCheck(x, entry.getKey()) && entry.getValue().contains(y)) return true;
+        }
+        // Also check if x is derived from y (more specific)
         return isaCheck(x, y);
     }
 
@@ -135,6 +122,16 @@ public class ClojureMultiMethod {
             return defaultMethod;
         }
         return methods.get(dispatchVal);
+    }
+
+    public clojure.lang.IPersistentMap getPreferTable() {
+        clojure.lang.IPersistentMap result = clojure.lang.PersistentArrayMap.EMPTY;
+        for (var entry : preferences.entrySet()) {
+            clojure.lang.IPersistentSet vals = clojure.lang.PersistentHashSet.create(
+                    new java.util.ArrayList<>(entry.getValue()));
+            result = result.assoc(entry.getKey(), vals);
+        }
+        return result;
     }
 
     public String getName() { return name; }

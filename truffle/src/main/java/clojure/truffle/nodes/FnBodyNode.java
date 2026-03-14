@@ -62,6 +62,10 @@ public class FnBodyNode extends RootNode {
             CompilerDirectives.transferToInterpreterAndInvalidate();
             throwArityError(args);
         }
+        if (variadicSlot < 0 && args.length > paramCount + 1) {
+            CompilerDirectives.transferToInterpreterAndInvalidate();
+            throwArityError(args);
+        }
         for (int i = 0; i < paramCount; i++) {
             frame.setObject(paramSlots[i], args[i + 1]);
         }
@@ -95,11 +99,7 @@ public class FnBodyNode extends RootNode {
     @TruffleBoundary
     private void throwArityError(Object[] args) {
         String fnName = name != null ? name : "<anon>";
-        StringBuilder detail = new StringBuilder();
-        detail.append("Wrong number of args (").append(args.length - 1)
-            .append(") passed to fn ").append(fnName)
-            .append(", expected ").append(paramCount);
-        throw new RuntimeException(detail.toString());
+        throw new clojure.lang.ArityException(args.length - 1, fnName);
     }
 
     private void collectVariadic(VirtualFrame frame, Object[] args, int restStart) {

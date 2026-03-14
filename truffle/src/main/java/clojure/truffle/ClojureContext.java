@@ -884,10 +884,22 @@ public class ClojureContext {
             Object acc;
             clojure.lang.ISeq seq;
             if (args.length == 3) {
+                Object coll = args[2];
+                // Check IReduceInit first (reify, custom types)
+                if (coll instanceof clojure.lang.IReduceInit ri) {
+                    clojure.lang.IFn rfn = toIFn(fn);
+                    return ri.reduce(rfn, args[1]);
+                }
                 acc = args[1];
-                seq = seqOf(args[2]);
+                seq = seqOf(coll);
             } else {
-                seq = seqOf(args[1]);
+                Object coll = args[1];
+                // Check IReduce first
+                if (coll instanceof clojure.lang.IReduce ir) {
+                    clojure.lang.IFn rfn = toIFn(fn);
+                    return ir.reduce(rfn);
+                }
+                seq = seqOf(coll);
                 if (seq == null) return callFunction(fn, new Object[0]);
                 acc = seq.first();
                 seq = seq.next();
@@ -954,7 +966,8 @@ public class ClojureContext {
 
         defBuiltin("map?", args -> {
             checkArity(args, 1, "map?");
-            return args[0] instanceof clojure.lang.IPersistentMap;
+            return args[0] instanceof clojure.lang.IPersistentMap ||
+                    (args[0] instanceof ClojureDeftypeInstance dti && dti.isRecord());
         });
 
         defBuiltin("keyword?", args -> {
@@ -1098,11 +1111,25 @@ public class ClojureContext {
             return clojure.lang.PersistentArrayMap.createAsIfByAssoc(args);
         });
 
+        // Internal: convert seq source to map for map destructuring
+        defBuiltin("clojure.core/__destructure-map__", args -> {
+            Object source = args[0];
+            if (source == ClojureNil.INSTANCE || source == null) return clojure.lang.PersistentArrayMap.EMPTY;
+            if (source instanceof clojure.lang.IPersistentMap) return source;
+            // Convert sequential source (list, vector) to map: (:a 1 :b 2) -> {:a 1, :b 2}
+            if (source instanceof clojure.lang.Seqable seqable) {
+                clojure.lang.ISeq s = seqable.seq();
+                if (s == null) return clojure.lang.PersistentArrayMap.EMPTY;
+                return clojure.lang.PersistentHashMap.create(s);
+            }
+            return source;
+        });
+
         defBuiltin("get", args -> {
             if (args.length < 2 || args.length > 3)
                 throw new RuntimeException("get: expected 2 or 3 args");
             Object coll = args[0];
-            Object key = args[1];
+            Object key = (args[1] == ClojureNil.INSTANCE) ? null : args[1];
             Object notFound = args.length == 3 ? args[2] : ClojureNil.INSTANCE;
             if (coll instanceof ClojureNil) return notFound;
             if (coll instanceof clojure.lang.ILookup lookup) {
@@ -1112,6 +1139,11 @@ public class ClojureContext {
             // IPersistentSet doesn't implement ILookup but supports get()
             if (coll instanceof clojure.lang.IPersistentSet s) {
                 Object val = s.get(key);
+                return val == null ? notFound : val;
+            }
+            // Transient sets
+            if (coll instanceof clojure.lang.ITransientSet ts) {
+                Object val = ts.get(key);
                 return val == null ? notFound : val;
             }
             // String indexing: (get "foo" 0) => \f
@@ -1131,7 +1163,8 @@ public class ClojureContext {
             if (!(map instanceof clojure.lang.Associative a))
                 throw new RuntimeException("assoc: not associative: " + map);
             for (int i = 1; i < args.length; i += 2) {
-                a = a.assoc(args[i], args[i + 1]);
+                Object key = (args[i] == ClojureNil.INSTANCE) ? null : args[i];
+                a = a.assoc(key, args[i + 1]);
             }
             return a;
         });
@@ -1151,7 +1184,8 @@ public class ClojureContext {
         defBuiltin("contains?", args -> {
             checkArity(args, 2, "contains?");
             if (args[0] instanceof ClojureNil) return false;
-            if (args[0] instanceof clojure.lang.Associative a) return a.containsKey(args[1]);
+            Object containsKey = (args[1] == ClojureNil.INSTANCE) ? null : args[1];
+            if (args[0] instanceof clojure.lang.Associative a) return a.containsKey(containsKey);
             return false;
         });
 
@@ -1583,6 +1617,7 @@ public class ClojureContext {
             Object val = args[1];
             if (val instanceof ClojureNil) return false;
             if (c == clojure.lang.Atom.class && val instanceof ClojureAtom) return true;
+            if (c == clojure.lang.IRecord.class && val instanceof ClojureDeftypeInstance dti && dti.isRecord()) return true;
             return c.isInstance(val);
         });
 
@@ -2336,7 +2371,8 @@ public class ClojureContext {
 
         // --- Type predicates ---
 
-        defBuiltin("map?", a -> a[0] instanceof clojure.lang.IPersistentMap);
+        defBuiltin("map?", a -> a[0] instanceof clojure.lang.IPersistentMap ||
+                (a[0] instanceof ClojureDeftypeInstance dti && dti.isRecord()));
         defBuiltin("vector?", a -> a[0] instanceof clojure.lang.IPersistentVector);
         defBuiltin("list?", a -> a[0] instanceof clojure.lang.IPersistentList);
         defBuiltin("seq?", a -> a[0] instanceof clojure.lang.ISeq);
@@ -2348,7 +2384,9 @@ public class ClojureContext {
         defBuiltin("ifn?", a ->
                 a[0] instanceof ClojureFunction || a[0] instanceof MultiArityFunction ||
                         a[0] instanceof BuiltinFunction || a[0] instanceof clojure.lang.Keyword ||
-                        a[0] instanceof clojure.lang.IPersistentMap || a[0] instanceof clojure.lang.IPersistentSet);
+                        a[0] instanceof clojure.lang.IPersistentMap || a[0] instanceof clojure.lang.IPersistentSet ||
+                        a[0] instanceof clojure.lang.IPersistentVector || a[0] instanceof clojure.lang.Symbol ||
+                        a[0] instanceof clojure.truffle.runtime.ClojureVar || a[0] instanceof clojure.lang.IFn);
         defBuiltin("number?", a -> a[0] instanceof Number);
         defBuiltin("integer?", a -> a[0] instanceof Long || a[0] instanceof Integer
                 || a[0] instanceof java.math.BigInteger || a[0] instanceof clojure.lang.BigInt
@@ -3007,8 +3045,15 @@ public class ClojureContext {
             }
             m = m.assoc(clojure.lang.Keyword.intern("trace"),
                 clojure.lang.PersistentVector.create(traceList));
-            if (t.getMessage() != null) {
-                m = m.assoc(clojure.lang.Keyword.intern("cause"), t.getMessage());
+            // :cause is the root cause message (innermost exception in the chain)
+            Throwable root = t;
+            while (root.getCause() != null) root = root.getCause();
+            if (root.getMessage() != null) {
+                m = m.assoc(clojure.lang.Keyword.intern("cause"), root.getMessage());
+            }
+            // Also add :data at top level for ex-info
+            if (t instanceof clojure.lang.IExceptionInfo ei) {
+                m = m.assoc(clojure.lang.Keyword.intern("data"), ei.getData());
             }
             return m;
         });
@@ -3166,7 +3211,7 @@ public class ClojureContext {
                 }
                 return pat.matcher(s).replaceFirst(replacement.toString());
             }
-            return s.replaceFirst(Pattern.quote(args[1].toString()), replacement.toString());
+            return s.replaceFirst(Pattern.quote(args[1].toString()), java.util.regex.Matcher.quoteReplacement(replacement.toString()));
         });
 
         defBuiltin("str/starts-with?", args -> {
@@ -3315,6 +3360,7 @@ public class ClojureContext {
                 return ta.valAt(key, sentinel) != sentinel;
             }
             if (coll instanceof clojure.lang.Indexed indexed) {
+                if (!(key instanceof Number)) return false;
                 int idx = ((Number) key).intValue();
                 return idx >= 0 && idx < indexed.count();
             }
@@ -3469,6 +3515,8 @@ public class ClojureContext {
             if (args[1] instanceof ClojureNil) return false;
             // ClojureAtom should be recognized as clojure.lang.Atom
             if (clazz == clojure.lang.Atom.class && args[1] instanceof ClojureAtom) return true;
+            // ClojureDeftypeInstance records should be recognized as IRecord
+            if (clazz == clojure.lang.IRecord.class && args[1] instanceof ClojureDeftypeInstance dti && dti.isRecord()) return true;
             return clazz.isInstance(args[1]);
         });
 
@@ -3941,6 +3989,18 @@ public class ClojureContext {
             clojure.lang.Keyword kAncestors = clojure.lang.Keyword.intern("ancestors");
             clojure.lang.Keyword kDescendants = clojure.lang.Keyword.intern("descendants");
 
+            // Validate: tag cannot equal parent
+            if (tag.equals(parent))
+                throw new IllegalArgumentException("Assert failed: (not= tag parent)");
+            // Validate: parent cannot already be a descendant of tag (cyclic)
+            clojure.lang.IPersistentMap preAnc = (clojure.lang.IPersistentMap) h.valAt(kAncestors);
+            if (preAnc != null) {
+                // Check if parent already has tag as ancestor
+                Object parentAncs = preAnc.valAt(parent);
+                if (parentAncs instanceof clojure.lang.IPersistentSet ps && ps.contains(tag))
+                    throw new RuntimeException("Cyclic derivation: " + parent + " has " + tag + " as ancestor");
+            }
+
             // Update parents
             clojure.lang.IPersistentMap parents = (clojure.lang.IPersistentMap) h.valAt(kParents);
             Object tagParents = parents.valAt(tag);
@@ -3955,6 +4015,11 @@ public class ClojureContext {
             // Update ancestors (tag -> all ancestors including parent's ancestors)
             clojure.lang.IPersistentMap ancestors = (clojure.lang.IPersistentMap) h.valAt(kAncestors);
             java.util.Set<Object> tagAnc = new java.util.HashSet<>();
+            // Preserve existing ancestors of tag
+            Object existingAnc = ancestors.valAt(tag);
+            if (existingAnc instanceof clojure.lang.IPersistentSet es) {
+                for (clojure.lang.ISeq s = es.seq(); s != null; s = s.next()) tagAnc.add(s.first());
+            }
             tagAnc.add(parent);
             Object parentAnc = ancestors.valAt(parent);
             if (parentAnc instanceof clojure.lang.IPersistentSet ps) {
@@ -3992,19 +4057,7 @@ public class ClojureContext {
             Object hier;
             if (args.length == 3) { hier = args[0]; child = args[1]; parent = args[2]; }
             else { child = args[0]; parent = args[1]; hier = globalVars.get("*hierarchy*"); }
-            if (child.equals(parent)) return true;
-            if (hier instanceof clojure.lang.IPersistentMap h) {
-                Object ancestors = ((clojure.lang.IPersistentMap) h.valAt(
-                        clojure.lang.Keyword.intern("ancestors"))).valAt(child);
-                if (ancestors instanceof clojure.lang.IPersistentSet s) {
-                    return s.contains(parent);
-                }
-            }
-            // Java class hierarchy
-            if (child instanceof Class<?> cc && parent instanceof Class<?> pc) {
-                return pc.isAssignableFrom(cc);
-            }
-            return false;
+            return isaCheck(child, parent, hier);
         });
 
         defBuiltin("parents", args -> {
@@ -4146,10 +4199,7 @@ public class ClojureContext {
             checkArity(args, 1, "empty");
             Object coll = args[0];
             if (coll instanceof ClojureNil) return ClojureNil.INSTANCE;
-            if (coll instanceof clojure.lang.IPersistentVector) return clojure.lang.PersistentVector.EMPTY;
-            if (coll instanceof clojure.lang.IPersistentMap) return clojure.lang.PersistentArrayMap.EMPTY;
-            if (coll instanceof clojure.lang.IPersistentSet) return clojure.lang.PersistentHashSet.EMPTY;
-            if (coll instanceof clojure.lang.IPersistentList) return clojure.lang.PersistentList.EMPTY;
+            if (coll instanceof clojure.lang.IPersistentCollection pc) return pc.empty();
             return clojure.lang.PersistentList.EMPTY;
         });
 
@@ -4218,6 +4268,17 @@ public class ClojureContext {
             checkArity(args, 1, "vec");
             if (args[0] instanceof ClojureNil) return clojure.lang.PersistentVector.EMPTY;
             if (args[0] instanceof clojure.lang.IPersistentVector v) return v;
+            // Handle IReduceInit (reify)
+            if (args[0] instanceof clojure.lang.IReduceInit ri) {
+                java.util.List<Object> items = new ArrayList<>();
+                ri.reduce((clojure.lang.IFn) new clojure.lang.AFn() {
+                    public Object invoke(Object acc, Object val) {
+                        items.add(val);
+                        return items;
+                    }
+                }, items);
+                return clojure.lang.PersistentVector.create(items);
+            }
             java.util.List<Object> items = new ArrayList<>();
             for (clojure.lang.ISeq seq = seqOf(args[0]); seq != null; seq = seq.next()) {
                 items.add(seq.first());
@@ -4274,6 +4335,11 @@ public class ClojureContext {
         defBuiltin("vector-of", args -> {
             if (args.length < 1) throw new RuntimeException("vector-of: expected type keyword");
             // args[0] is type keyword (:int, :long, :float, :double, :byte, :short, :char, :boolean)
+            Object typeArg = args[0];
+            if (!(typeArg instanceof clojure.lang.Keyword kw) ||
+                !java.util.Set.of("int", "long", "float", "double", "byte", "short", "char", "boolean").contains(kw.getName())) {
+                throw new IllegalArgumentException("vector-of: unsupported type: " + typeArg);
+            }
             // Remaining args are optional initial values
             if (args.length == 1) return clojure.lang.PersistentVector.EMPTY;
             Object[] vals = new Object[args.length - 1];
@@ -5272,6 +5338,13 @@ public class ClojureContext {
             if (!(args[0] instanceof ClojureMultiMethod mm))
                 throw new RuntimeException("methods: first arg must be a multimethod");
             return mm.getMethodTable();
+        });
+
+        defBuiltin("prefers", args -> {
+            checkArity(args, 1, "prefers");
+            if (!(args[0] instanceof ClojureMultiMethod mm))
+                throw new RuntimeException("prefers: first arg must be a multimethod");
+            return mm.getPreferTable();
         });
 
         // --- Phase 12: Misc ---
@@ -7023,6 +7096,10 @@ public class ClojureContext {
         return globalVars.get(name);
     }
 
+    public boolean isaCheckPublic(Object child, Object parent) {
+        return isaCheck(child, parent, globalVars.get("*hierarchy*"));
+    }
+
     public Object callFunction(Object fn, Object[] args) {
         // Dereference ClojureVar to its value
         if (fn instanceof clojure.truffle.runtime.ClojureVar cvar) {
@@ -7046,8 +7123,10 @@ public class ClojureContext {
                 return mm.invoke(args);
             } else if (fn instanceof clojure.lang.Keyword kw) {
                 // Keyword as function: (:key map) → (get map :key)
-                if (args.length < 1 || args.length > 2)
-                    throw new IllegalArgumentException("Wrong number of args (" + args.length + ") passed to: " + kw);
+                if (args.length < 1 || args.length > 2) {
+                    String count = args.length > 20 ? "> 20" : String.valueOf(args.length);
+                    throw new IllegalArgumentException("Wrong number of args (" + count + ") passed to: " + kw);
+                }
                 Object map = args[0];
                 if (map instanceof clojure.lang.ILookup lookup) {
                         Object notFound = args.length == 2 ? args[1] : ClojureNil.INSTANCE;
@@ -7076,6 +7155,16 @@ public class ClojureContext {
                     throw new RuntimeException("Vector lookup expects 1 arg");
                 int idx = ((Number) args[0]).intValue();
                 return v.nth(idx);
+            } else if (fn instanceof clojure.lang.IFn ifn) {
+                // Handle Clojure IFn instances (AFn, etc.)
+                return switch (args.length) {
+                    case 0 -> ifn.invoke();
+                    case 1 -> ifn.invoke(args[0]);
+                    case 2 -> ifn.invoke(args[0], args[1]);
+                    case 3 -> ifn.invoke(args[0], args[1], args[2]);
+                    case 4 -> ifn.invoke(args[0], args[1], args[2], args[3]);
+                    default -> ifn.applyTo(clojure.lang.RT.seq(args));
+                };
             }
             throw new RuntimeException("Not a function: " + fn);
     }
@@ -7107,6 +7196,20 @@ public class ClojureContext {
         } catch (IllegalArgumentException e) {
             throw new RuntimeException("Not seqable: " + coll);
         }
+    }
+
+    /**
+     * Wraps a Truffle function as clojure.lang.IFn for interop with Clojure persistent collections.
+     */
+    private clojure.lang.IFn toIFn(Object fn) {
+        if (fn instanceof clojure.lang.IFn ifn) return ifn;
+        final ClojureContext ctx = this;
+        return new clojure.lang.AFn() {
+            @Override public Object invoke() { return ctx.callFunction(fn, new Object[0]); }
+            @Override public Object invoke(Object a) { return ctx.callFunction(fn, new Object[]{a}); }
+            @Override public Object invoke(Object a, Object b) { return ctx.callFunction(fn, new Object[]{a, b}); }
+            @Override public Object invoke(Object a, Object b, Object c) { return ctx.callFunction(fn, new Object[]{a, b, c}); }
+        };
     }
 
     // --- Lazy helpers ---
@@ -7460,6 +7563,53 @@ public class ClojureContext {
         throw new RuntimeException("cons: not a sequence: " + coll);
     }
 
+    private boolean isaCheck(Object child, Object parent, Object hier) {
+        if (child == null || parent == null) return false;
+        if (child.equals(parent)) return true;
+        // Vector dispatch values: element-wise
+        if (child instanceof clojure.lang.IPersistentVector cv &&
+                parent instanceof clojure.lang.IPersistentVector pv) {
+            if (cv.count() != pv.count()) return false;
+            for (int i = 0; i < cv.count(); i++) {
+                if (!isaCheck(cv.nth(i), pv.nth(i), hier)) return false;
+            }
+            return true;
+        }
+        // Check hierarchy ancestors
+        if (hier instanceof clojure.lang.IPersistentMap h) {
+            Object ancestorsMap = h.valAt(clojure.lang.Keyword.intern("ancestors"));
+            if (ancestorsMap instanceof clojure.lang.IPersistentMap am) {
+                Object anc = am.valAt(child);
+                if (anc instanceof clojure.lang.IPersistentSet s && s.contains(parent)) return true;
+            }
+            // If child is a Java class, check if any Java superclass/interface is in hierarchy
+            if (child instanceof Class<?> cc) {
+                Object parentsMap = h.valAt(clojure.lang.Keyword.intern("parents"));
+                if (parentsMap instanceof clojure.lang.IPersistentMap pm) {
+                    // Walk Java class hierarchy and check if any class/interface has parent as ancestor
+                    java.util.Queue<Class<?>> toCheck = new java.util.LinkedList<>();
+                    Class<?> sup = cc.getSuperclass();
+                    if (sup != null) toCheck.add(sup);
+                    for (Class<?> iface : cc.getInterfaces()) toCheck.add(iface);
+                    java.util.Set<Class<?>> visited = new java.util.HashSet<>();
+                    while (!toCheck.isEmpty()) {
+                        Class<?> cls = toCheck.poll();
+                        if (!visited.add(cls)) continue;
+                        if (isaCheck(cls, parent, hier)) return true;
+                        sup = cls.getSuperclass();
+                        if (sup != null) toCheck.add(sup);
+                        for (Class<?> iface : cls.getInterfaces()) toCheck.add(iface);
+                    }
+                }
+            }
+        }
+        // Java class hierarchy
+        if (child instanceof Class<?> cc && parent instanceof Class<?> pc) {
+            return pc.isAssignableFrom(cc);
+        }
+        return false;
+    }
+
     private static long clojureCount(Object coll) {
         if (coll instanceof ClojureNil) return 0L;
         if (coll instanceof clojure.lang.Counted c) return (long) c.count();
@@ -7469,6 +7619,9 @@ public class ClojureContext {
             return count;
         }
         if (coll instanceof String str) return (long) str.length();
+        if (coll.getClass().isArray()) return (long) java.lang.reflect.Array.getLength(coll);
+        if (coll instanceof java.util.Collection<?> c) return (long) c.size();
+        if (coll instanceof java.util.Map<?,?> m) return (long) m.size();
         throw new RuntimeException("count: not countable: " + coll);
     }
 
@@ -7690,7 +7843,7 @@ public class ClojureContext {
             return result;
         });
         ns.intern("intersection", (BuiltinFunction) args -> {
-            if (args.length == 0) return clojure.lang.PersistentHashSet.EMPTY;
+            if (args.length == 0) throw new clojure.lang.ArityException(0, "clojure.set/intersection");
             clojure.lang.IPersistentSet result = (clojure.lang.IPersistentSet) args[0];
             for (int i = 1; i < args.length; i++) {
                 clojure.lang.IPersistentSet other = (clojure.lang.IPersistentSet) args[i];
@@ -7744,24 +7897,129 @@ public class ClojureContext {
             checkArity(args, 2, "rename-keys");
             clojure.lang.IPersistentMap m = (clojure.lang.IPersistentMap) args[0];
             clojure.lang.IPersistentMap kmap = (clojure.lang.IPersistentMap) args[1];
-            clojure.lang.IPersistentMap result = m;
+            // Collect all renames first, then apply (to handle key swaps)
+            java.util.List<Object[]> renames = new ArrayList<>();
             for (clojure.lang.ISeq seq = kmap.seq(); seq != null; seq = seq.next()) {
-                clojure.lang.MapEntry entry = (clojure.lang.MapEntry) seq.first();
+                clojure.lang.IMapEntry entry = (clojure.lang.IMapEntry) seq.first();
                 Object oldKey = entry.key();
                 Object newKey = entry.val();
-                if (result.containsKey(oldKey)) {
-                    Object val = result.valAt(oldKey);
-                    result = result.without(oldKey);
-                    result = result.assoc(newKey, val);
+                if (m.containsKey(oldKey)) {
+                    renames.add(new Object[]{oldKey, newKey, m.valAt(oldKey)});
                 }
+            }
+            clojure.lang.IPersistentMap result = m;
+            for (Object[] r : renames) {
+                result = result.without(r[0]);
+            }
+            for (Object[] r : renames) {
+                result = result.assoc(r[1], r[2]);
+            }
+            return result;
+        });
+        ns.intern("project", (BuiltinFunction) args -> {
+            checkArity(args, 2, "clojure.set/project");
+            Object xrel = args[0];
+            Object ks = args[1];
+            clojure.lang.IPersistentSet result = clojure.lang.PersistentHashSet.EMPTY;
+            for (clojure.lang.ISeq s = seqOf(xrel); s != null; s = s.next()) {
+                clojure.lang.IPersistentMap row = (clojure.lang.IPersistentMap) s.first();
+                clojure.lang.IPersistentMap projected = clojure.lang.PersistentArrayMap.EMPTY;
+                for (clojure.lang.ISeq ks2 = seqOf(ks); ks2 != null; ks2 = ks2.next()) {
+                    Object k = ks2.first();
+                    if (row.containsKey(k)) {
+                        projected = projected.assoc(k, row.valAt(k));
+                    }
+                }
+                result = (clojure.lang.IPersistentSet) result.cons(projected);
+            }
+            return result;
+        });
+        ns.intern("rename", (BuiltinFunction) args -> {
+            checkArity(args, 2, "clojure.set/rename");
+            Object xrel = args[0];
+            clojure.lang.IPersistentMap kmap = (clojure.lang.IPersistentMap) args[1];
+            clojure.lang.IPersistentSet result = clojure.lang.PersistentHashSet.EMPTY;
+            for (clojure.lang.ISeq s = seqOf(xrel); s != null; s = s.next()) {
+                clojure.lang.IPersistentMap row = (clojure.lang.IPersistentMap) s.first();
+                clojure.lang.IPersistentMap newRow = row;
+                for (clojure.lang.ISeq ks = kmap.seq(); ks != null; ks = ks.next()) {
+                    clojure.lang.IMapEntry e = (clojure.lang.IMapEntry) ks.first();
+                    Object oldKey = e.key();
+                    Object newKey = e.val();
+                    if (newRow.containsKey(oldKey)) {
+                        Object val = newRow.valAt(oldKey);
+                        newRow = newRow.without(oldKey).assoc(newKey, val);
+                    }
+                }
+                result = (clojure.lang.IPersistentSet) result.cons(newRow);
             }
             return result;
         });
         ns.intern("join", (BuiltinFunction) args -> {
-            // clojure.set/join: natural join of two relations
-            if (args.length < 2) throw new RuntimeException("clojure.set/join: expected 2+ args");
-            // Simplified: return first arg
-            return args[0];
+            if (args.length < 2 || args.length > 3) throw new RuntimeException("clojure.set/join: expected 2-3 args");
+            Object xrel = args[0];
+            Object yrel = args[1];
+            if (args.length == 3) {
+                // join with key mapping
+                clojure.lang.IPersistentMap km = (clojure.lang.IPersistentMap) args[2];
+                clojure.lang.IPersistentSet result = clojure.lang.PersistentHashSet.EMPTY;
+                for (clojure.lang.ISeq xs = seqOf(xrel); xs != null; xs = xs.next()) {
+                    clojure.lang.IPersistentMap x = (clojure.lang.IPersistentMap) xs.first();
+                    for (clojure.lang.ISeq ys = seqOf(yrel); ys != null; ys = ys.next()) {
+                        clojure.lang.IPersistentMap y = (clojure.lang.IPersistentMap) ys.first();
+                        boolean match = true;
+                        for (clojure.lang.ISeq ks = km.seq(); ks != null; ks = ks.next()) {
+                            clojure.lang.IMapEntry e = (clojure.lang.IMapEntry) ks.first();
+                            Object xv = x.valAt(e.key());
+                            Object yv = y.valAt(e.val());
+                            if (xv == null || !xv.equals(yv)) { match = false; break; }
+                        }
+                        if (match) {
+                            clojure.lang.IPersistentMap merged = x;
+                            for (clojure.lang.ISeq ys2 = y.seq(); ys2 != null; ys2 = ys2.next()) {
+                                clojure.lang.IMapEntry me = (clojure.lang.IMapEntry) ys2.first();
+                                merged = merged.assoc(me.key(), me.val());
+                            }
+                            result = (clojure.lang.IPersistentSet) result.cons(merged);
+                        }
+                    }
+                }
+                return result;
+            }
+            // Natural join: find common keys
+            java.util.Set<Object> commonKeys = new java.util.HashSet<>();
+            clojure.lang.ISeq xs0 = seqOf(xrel);
+            clojure.lang.ISeq ys0 = seqOf(yrel);
+            if (xs0 != null && ys0 != null) {
+                clojure.lang.IPersistentMap x0 = (clojure.lang.IPersistentMap) xs0.first();
+                clojure.lang.IPersistentMap y0 = (clojure.lang.IPersistentMap) ys0.first();
+                for (clojure.lang.ISeq xks = x0.seq(); xks != null; xks = xks.next()) {
+                    Object k = ((clojure.lang.IMapEntry) xks.first()).key();
+                    if (y0.containsKey(k)) commonKeys.add(k);
+                }
+            }
+            clojure.lang.IPersistentSet result = clojure.lang.PersistentHashSet.EMPTY;
+            for (clojure.lang.ISeq xs = seqOf(xrel); xs != null; xs = xs.next()) {
+                clojure.lang.IPersistentMap x = (clojure.lang.IPersistentMap) xs.first();
+                for (clojure.lang.ISeq ys = seqOf(yrel); ys != null; ys = ys.next()) {
+                    clojure.lang.IPersistentMap y = (clojure.lang.IPersistentMap) ys.first();
+                    boolean match = true;
+                    for (Object k : commonKeys) {
+                        Object xv = x.valAt(k);
+                        Object yv = y.valAt(k);
+                        if (xv == null ? yv != null : !xv.equals(yv)) { match = false; break; }
+                    }
+                    if (match) {
+                        clojure.lang.IPersistentMap merged = x;
+                        for (clojure.lang.ISeq ys2 = y.seq(); ys2 != null; ys2 = ys2.next()) {
+                            clojure.lang.IMapEntry me = (clojure.lang.IMapEntry) ys2.first();
+                            merged = merged.assoc(me.key(), me.val());
+                        }
+                        result = (clojure.lang.IPersistentSet) result.cons(merged);
+                    }
+                }
+            }
+            return result;
         });
         ns.intern("index", (BuiltinFunction) args -> {
             checkArity(args, 2, "clojure.set/index");
@@ -7774,7 +8032,9 @@ public class ClojureContext {
                 clojure.lang.IPersistentMap indexKey = clojure.lang.PersistentHashMap.EMPTY;
                 for (clojure.lang.ISeq ks2 = seqOf(ks); ks2 != null; ks2 = ks2.next()) {
                     Object k = ks2.first();
-                    indexKey = indexKey.assoc(k, row.valAt(k));
+                    if (row.containsKey(k)) {
+                        indexKey = indexKey.assoc(k, row.valAt(k));
+                    }
                 }
                 clojure.lang.IPersistentSet existing = (clojure.lang.IPersistentSet) result.valAt(indexKey);
                 if (existing == null) existing = clojure.lang.PersistentHashSet.EMPTY;

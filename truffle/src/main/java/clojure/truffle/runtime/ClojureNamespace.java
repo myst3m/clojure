@@ -30,6 +30,10 @@ public class ClojureNamespace {
         return imported;
     }
 
+    public Object resolveIntern(String sym) {
+        return interns.get(sym);
+    }
+
     public void refer(String sym, Object val) {
         refers.put(sym, val);
     }

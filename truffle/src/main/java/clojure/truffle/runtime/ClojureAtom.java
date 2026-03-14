@@ -12,7 +12,12 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicReference;
 
 @ExportLibrary(InteropLibrary.class)
-public class ClojureAtom implements TruffleObject {
+public class ClojureAtom implements TruffleObject,
+        java.util.function.Supplier<Object>,
+        java.util.function.BooleanSupplier,
+        java.util.function.IntSupplier,
+        java.util.function.LongSupplier,
+        java.util.function.DoubleSupplier {
 
     private final AtomicReference<Object> value;
     private volatile Object validator;
@@ -63,6 +68,38 @@ public class ClojureAtom implements TruffleObject {
 
     public void setMeta(Object newMeta) {
         this.meta = newMeta;
+    }
+
+    // java.util.function.Supplier
+    @Override
+    public Object get() {
+        return deref();
+    }
+
+    // java.util.function.BooleanSupplier
+    @Override
+    public boolean getAsBoolean() {
+        Object v = deref();
+        if (v instanceof Boolean b) return b;
+        return v != null && !(v instanceof ClojureNil);
+    }
+
+    // java.util.function.IntSupplier
+    @Override
+    public int getAsInt() {
+        return ((Number) deref()).intValue();
+    }
+
+    // java.util.function.LongSupplier
+    @Override
+    public long getAsLong() {
+        return ((Number) deref()).longValue();
+    }
+
+    // java.util.function.DoubleSupplier
+    @Override
+    public double getAsDouble() {
+        return ((Number) deref()).doubleValue();
     }
 
     @ExportMessage

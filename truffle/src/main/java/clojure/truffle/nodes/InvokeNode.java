@@ -58,8 +58,11 @@ public class InvokeNode extends ExpressionNode {
     private static Object invokeBuiltin(ClojureContext.BuiltinFunction builtin, Object[] argValues) {
         try {
             return builtin.execute(argValues);
-        } catch (Exception e) {
-            throw new RuntimeException("in builtin '" + builtin.name() + "': " + e.getMessage(), e);
+        } catch (RuntimeException e) {
+            throw e;
+        } catch (Throwable t) {
+            // Use sneaky throw to preserve exception identity (important for delay caching)
+            throw clojure.lang.Util.sneakyThrow(t);
         }
     }
 
@@ -71,8 +74,10 @@ public class InvokeNode extends ExpressionNode {
     @TruffleBoundary
     private static Object invokeSlowPath(Object function, Object[] argValues, ExpressionNode functionNode) {
         if (function instanceof clojure.lang.Keyword kw) {
-            if (argValues.length < 1 || argValues.length > 2)
-                throw new IllegalArgumentException("Wrong number of args (" + argValues.length + ") passed to: " + kw);
+            if (argValues.length < 1 || argValues.length > 2) {
+                String count = argValues.length > 20 ? "> 20" : String.valueOf(argValues.length);
+                throw new IllegalArgumentException("Wrong number of args (" + count + ") passed to: " + kw);
+            }
             Object map = argValues[0];
             if (map instanceof clojure.lang.ILookup lookup) {
                 Object notFound = argValues.length == 2 ? argValues[1] :

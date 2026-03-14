@@ -15,7 +15,13 @@ package clojure.lang;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 
-public class Delay implements IDeref, IPending{
+@SuppressWarnings("rawtypes")
+public class Delay implements IDeref, IPending,
+        java.util.function.Supplier,
+        java.util.function.BooleanSupplier,
+        java.util.function.IntSupplier,
+        java.util.function.LongSupplier,
+        java.util.function.DoubleSupplier {
 Object val;
 Throwable exception;
 IFn fn;
@@ -64,5 +70,35 @@ public Object deref() {
 
 public boolean isRealized(){
 	return lock == null;
+}
+
+// java.util.function.Supplier
+public Object get() {
+	return deref();
+}
+
+// java.util.function.BooleanSupplier
+public boolean getAsBoolean() {
+	Object v = deref();
+	if (v instanceof Boolean b) return b;
+	if (v == null || v == Boolean.FALSE) return false;
+	// Check for Clojure nil
+	if (v.getClass().getName().equals("clojure.truffle.runtime.ClojureNil")) return false;
+	return true;
+}
+
+// java.util.function.IntSupplier
+public int getAsInt() {
+	return ((Number) deref()).intValue();
+}
+
+// java.util.function.LongSupplier
+public long getAsLong() {
+	return ((Number) deref()).longValue();
+}
+
+// java.util.function.DoubleSupplier
+public double getAsDouble() {
+	return ((Number) deref()).doubleValue();
 }
 }

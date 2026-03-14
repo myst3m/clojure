@@ -2103,8 +2103,20 @@ public class Analyzer {
             formList.add(args.first());
             args = args.next();
         }
+        java.util.Set<Object> seenConstants = new java.util.HashSet<>();
         for (int i = 0; i < formList.size() - 1; i += 2) {
-            clauses.add(new Object[]{formList.get(i), formList.get(i + 1)});
+            Object testVal = formList.get(i);
+            // Check for duplicate test constants
+            if (testVal instanceof IPersistentList || (testVal instanceof ISeq && !(testVal instanceof IPersistentVector))) {
+                for (ISeq s = ClojureRT.seq(testVal); s != null; s = s.next()) {
+                    if (!seenConstants.add(s.first()))
+                        throw compilerError("Duplicate case test constant: " + s.first());
+                }
+            } else {
+                if (!seenConstants.add(testVal))
+                    throw compilerError("Duplicate case test constant: " + testVal);
+            }
+            clauses.add(new Object[]{testVal, formList.get(i + 1)});
         }
         boolean hasDefault = formList.size() % 2 == 1;
 
@@ -2132,7 +2144,8 @@ public class Analyzer {
             ExpressionNode resultNode = analyze(clauses.get(i)[1]);
 
             // Handle grouped test values: (case x (:a :b) "match" ...)
-            if (matchVal instanceof ISeq || matchVal instanceof IPersistentVector) {
+            // Only lists are group test values; vectors/maps/sets are literal match values
+            if (matchVal instanceof IPersistentList || (matchVal instanceof ISeq && !(matchVal instanceof IPersistentVector))) {
                 // Multiple test values — generate (or (= tmp v1) (= tmp v2) ...)
                 List<ExpressionNode> tests = new ArrayList<>();
                 for (ISeq s = ClojureRT.seq(matchVal); s != null; s = s.next()) {
@@ -2647,7 +2660,7 @@ public class Analyzer {
         } else if (bindingForm instanceof IPersistentMap map) {
             expandMapDestructuring(map, sourceSlot, slots, values);
         } else {
-            throw err("Unsupported destructuring form: " + bindingForm);
+            throw specError("let", "Unsupported destructuring form: " + bindingForm);
         }
     }
 
@@ -2682,6 +2695,9 @@ public class Analyzer {
                 values.add(new ReadLocalNode(sourceSlot));
             } else if (elem instanceof Symbol sym) {
                 // Simple positional binding
+                if (sym.getNamespace() != null) {
+                    throw specError("let", "Can't let qualified name: " + sym);
+                }
                 slots.add(currentScope.addLocal(sym.getName()));
                 values.add(makeNthNode(sourceSlot, positionalIndex));
                 positionalIndex++;
@@ -2698,6 +2714,14 @@ public class Analyzer {
 
     private void expandMapDestructuring(IPersistentMap pattern, int sourceSlot,
                                         List<Integer> slots, List<ExpressionNode> values) {
+        // Convert seq source to map: '(:a 1 :b 2) -> {:a 1 :b 2}, '() -> {}
+        // This mirrors Clojure's destructure behavior for map patterns applied to seqs
+        int mapSlotConverted = currentScope.addLocal("__map_destruct__" + sourceSlot);
+        slots.add(mapSlotConverted);
+        values.add(new InvokeNode(new SymbolNode(context, "clojure.core/__destructure-map__"),
+                new ExpressionNode[]{new ReadLocalNode(sourceSlot)}));
+        sourceSlot = mapSlotConverted;
+
         // {:keys [a b] :strs [c] :or {a 1} :as all}
         // or {localName :mapKey, ...}
         // Also supports ::keys (namespace-qualified) e.g. {::keys [a]} -> bind a to (::a source)
@@ -2708,15 +2732,22 @@ public class Analyzer {
         Object asName = pattern.valAt(Keyword.intern("as"));
         IPersistentMap defaults = (orMap instanceof IPersistentMap m) ? m : null;
 
-        // Check for ::keys (namespace-qualified keys) - scan for :ns/keys patterns
+        // Check for ::keys and :ns/keys and :ns/syms patterns
         String nsKeysNs = null;
         Object nsKeysVec = null;
+        String nsSymsNs = null;
+        Object nsSymsVec = null;
         for (ISeq scanSeq = pattern.seq(); scanSeq != null; scanSeq = scanSeq.next()) {
             IMapEntry entry = (IMapEntry) scanSeq.first();
             Object k = entry.key();
-            if (k instanceof Keyword kw && kw.getName().equals("keys") && kw.getNamespace() != null) {
-                nsKeysNs = kw.getNamespace();
-                nsKeysVec = entry.val();
+            if (k instanceof Keyword kw && kw.getNamespace() != null) {
+                if (kw.getName().equals("keys")) {
+                    nsKeysNs = kw.getNamespace();
+                    nsKeysVec = entry.val();
+                } else if (kw.getName().equals("syms")) {
+                    nsSymsNs = kw.getNamespace();
+                    nsSymsVec = entry.val();
+                }
             }
         }
 
@@ -2774,14 +2805,34 @@ public class Analyzer {
             }
         }
 
+        // :ns/syms [a b] -> bind a to ('ns/a source), b to ('ns/b source)
+        if (nsSymsVec instanceof IPersistentVector nsv) {
+            for (int i = 0; i < nsv.count(); i++) {
+                Object elem = nsv.nth(i);
+                String localName;
+                Symbol key;
+                if (elem instanceof Symbol sym) {
+                    localName = sym.getName();
+                    key = Symbol.intern(nsSymsNs, localName);
+                } else {
+                    throw err("Unsupported :ns/syms element: " + elem);
+                }
+                ExpressionNode getExpr = makeGetNodeQuoted(sourceSlot, key, defaults, Symbol.intern(localName));
+                slots.add(currentScope.addLocal(localName));
+                values.add(getExpr);
+            }
+        }
+
         // :syms [a b] -> bind a to ('a source), b to ('b source)
         // :syms [a/b] -> bind b to ('a/b source)
         if (symsVec instanceof IPersistentVector yv) {
             for (int i = 0; i < yv.count(); i++) {
                 Symbol sym = (Symbol) yv.nth(i);
                 Symbol key = sym; // preserve namespace if present
+                // For :or defaults, use local name (without namespace) as lookup key
+                Symbol localSym = Symbol.intern(sym.getName());
                 // Use QuoteNode directly so the symbol is treated as a literal value, not a var reference
-                ExpressionNode getExpr = makeGetNodeQuoted(sourceSlot, key, defaults, sym);
+                ExpressionNode getExpr = makeGetNodeQuoted(sourceSlot, key, defaults, localSym);
                 slots.add(currentScope.addLocal(sym.getName()));
                 values.add(getExpr);
             }
@@ -3022,6 +3073,9 @@ public class Analyzer {
                 slotList.add(currentScope.addLocal("__nil_bind_" + i));
                 valueList.add(initExpr);
             } else if (bindingForm instanceof Symbol sym) {
+                if (sym.getNamespace() != null) {
+                    throw specError("let", "Can't let qualified name: " + sym);
+                }
                 slotList.add(currentScope.addLocal(sym.getName()));
                 valueList.add(initExpr);
             } else {
@@ -3045,25 +3099,25 @@ public class Analyzer {
 
     private ExpressionNode analyzeFn(ISeq seq) {
         ISeq args = seq.next();
-        if (args == null) throw err("fn*: missing parameters");
+        if (args == null) throw fnSpecError("fn*: missing parameters");
 
         String fnName = null;
         if (args.first() instanceof Symbol) {
             fnName = ((Symbol) args.first()).getName();
             args = args.next();
-            if (args == null) throw err("fn*: missing parameters after name");
+            if (args == null) throw fnSpecError("fn*: missing parameters after name");
         }
 
         // Skip docstring if present
         if (args.first() instanceof String) {
             args = args.next();
-            if (args == null) throw err("fn*: missing parameters after docstring");
+            if (args == null) throw fnSpecError("fn*: missing parameters after docstring");
         }
 
         // Skip metadata map if present (e.g., {:added "1.1"})
         if (args.first() instanceof clojure.lang.IPersistentMap && !(args.first() instanceof clojure.lang.IPersistentVector)) {
             args = args.next();
-            if (args == null) throw err("fn*: missing parameters after metadata map");
+            if (args == null) throw fnSpecError("fn*: missing parameters after metadata map");
         }
 
         // Multi-arity: first arg is a list, not a vector
@@ -3077,7 +3131,7 @@ public class Analyzer {
 
     private ExpressionNode analyzeSingleArityFn(String fnName, ISeq args) {
         if (!(args.first() instanceof IPersistentVector))
-            throw err("fn*: parameters must be a vector");
+            throw fnSpecError("fn*: parameters must be a vector");
         IPersistentVector params = (IPersistentVector) args.first();
 
         Scope outerScope = currentScope;
@@ -3129,10 +3183,10 @@ public class Analyzer {
         while (clauses != null) {
             Object clause = clauses.first();
             if (!(clause instanceof ISeq clauseSeq))
-                throw err("fn*: arity clause must be a list");
+                throw fnSpecError("fn*: arity clause must be a list");
 
             if (!(clauseSeq.first() instanceof IPersistentVector))
-                throw err("fn*: arity parameters must be a vector");
+                throw fnSpecError("fn*: arity parameters must be a vector");
             IPersistentVector params = (IPersistentVector) clauseSeq.first();
             ISeq body = clauseSeq.next();
 
@@ -3256,6 +3310,7 @@ public class Analyzer {
     private ExpressionNode analyzeQuote(ISeq seq) {
         ISeq args = seq.next();
         if (args == null) throw err("quote: missing form");
+        if (args.next() != null) throw compilerError("quote: too many arguments");
         return new QuoteNode(convertToRuntime(args.first()));
     }
 
@@ -3608,6 +3663,14 @@ public class Analyzer {
             case "NullPointerException" -> NullPointerException.class;
             case "IndexOutOfBoundsException" -> IndexOutOfBoundsException.class;
             case "IllegalArgumentException" -> IllegalArgumentException.class;
+            case "IllegalAccessError" -> IllegalAccessError.class;
+            case "IllegalStateException" -> IllegalStateException.class;
+            case "UnsupportedOperationException" -> UnsupportedOperationException.class;
+            case "ClassCastException" -> ClassCastException.class;
+            case "StackOverflowError" -> StackOverflowError.class;
+            case "AssertionError" -> AssertionError.class;
+            case "ArityException" -> clojure.lang.ArityException.class;
+            case "NumberFormatException" -> NumberFormatException.class;
             default -> {
                 try {
                     ClassLoader cl = Thread.currentThread().getContextClassLoader();
@@ -4401,6 +4464,22 @@ public class Analyzer {
 
     private static RuntimeException err(String msg) {
         return new RuntimeException(msg);
+    }
+
+    private static RuntimeException compilerError(String msg) {
+        return new clojure.lang.Compiler.CompilerException((String)null, 0, 0, new RuntimeException(msg));
+    }
+
+    private static RuntimeException specError(String macro, String detail) {
+        return new clojure.lang.ExceptionInfo(
+                "Call to clojure.core/" + macro + " did not conform to spec",
+                clojure.lang.PersistentArrayMap.EMPTY);
+    }
+
+    private static RuntimeException fnSpecError(String detail) {
+        return new clojure.lang.ExceptionInfo(
+                "Call to clojure.core/fn did not conform to spec",
+                clojure.lang.PersistentArrayMap.EMPTY);
     }
 
     @com.oracle.truffle.api.CompilerDirectives.TruffleBoundary

@@ -31,8 +31,9 @@ public class JavaStaticMethodNode extends ExpressionNode {
     private static Object invokeStaticMethod(Class<?> clazz, String methodName, Object[] args) {
         Method method = JavaInteropUtil.findMethod(clazz, methodName, args, true);
         if (method == null) {
-            throw new RuntimeException("No such static method: " + clazz.getName() + "/" +
-                    methodName + " with " + args.length + " args");
+            String argWord = args.length == 1 ? "arg" : "args";
+            throw new IllegalArgumentException("No matching method " + methodName +
+                    " found taking " + args.length + " " + argWord + " for " + clazz.getName());
         }
 
         try {

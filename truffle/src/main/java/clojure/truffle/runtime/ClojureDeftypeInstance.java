@@ -172,6 +172,37 @@ public class ClojureDeftypeInstance implements TruffleObject, clojure.lang.ILook
         return equals(o);
     }
 
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (!(o instanceof ClojureDeftypeInstance other)) {
+            // Also compare with regular maps
+            if (o instanceof clojure.lang.IPersistentMap m) {
+                if (m.count() != count()) return false;
+                for (clojure.lang.ISeq s = seq(); s != null; s = s.next()) {
+                    clojure.lang.MapEntry me = (clojure.lang.MapEntry) s.first();
+                    Object v = m.valAt(me.key());
+                    if (v == null || !clojure.lang.Util.equals(me.val(), v)) return false;
+                }
+                return true;
+            }
+            return false;
+        }
+        if (!typeName.equals(other.typeName)) return false;
+        if (fields.length != other.fields.length) return false;
+        for (int i = 0; i < fields.length; i++) {
+            if (!clojure.lang.Util.equals(fields[i], other.fields[i])) return false;
+        }
+        return clojure.lang.Util.equals(extras, other.extras);
+    }
+
+    @Override
+    public int hashCode() {
+        int h = typeName.hashCode();
+        for (Object f : fields) h = h * 31 + (f == null ? 0 : f.hashCode());
+        return h;
+    }
+
     @ExportMessage
     boolean hasLanguage() { return true; }
 

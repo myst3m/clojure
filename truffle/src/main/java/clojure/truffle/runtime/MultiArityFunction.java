@@ -35,8 +35,10 @@ public class MultiArityFunction extends AFn {
     }
 
     @com.oracle.truffle.api.CompilerDirectives.TruffleBoundary
-    private static void throwArityError(int argCount) {
-        throw new RuntimeException("Wrong number of args (" + argCount + ") passed to fn");
+    private void throwArityError(int argCount) {
+        String fnName = (functions.length > 0 && functions[0] != null && functions[0].getName() != null)
+                ? functions[0].getName() : "<anon>";
+        throw new clojure.lang.ArityException(argCount, fnName);
     }
 
     private Object doInvoke(Object... args) {

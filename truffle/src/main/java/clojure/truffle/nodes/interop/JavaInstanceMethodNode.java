@@ -79,8 +79,9 @@ public class JavaInstanceMethodNode extends ExpressionNode {
             } catch (Exception ignored) {}
         }
         if (method == null) {
-            throw new RuntimeException("No such method: " + clazz.getName() + "." + methodName
-                    + " with " + args.length + " args");
+            String argWord = args.length == 1 ? "arg" : "args";
+            throw new IllegalArgumentException("No matching method " + methodName +
+                    " found taking " + args.length + " " + argWord + " for " + clazz.getName());
         }
         try {
             try { method.setAccessible(true); } catch (Exception ignored) {}

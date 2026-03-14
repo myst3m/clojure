@@ -22,6 +22,7 @@ public class SymbolNode extends ExpressionNode {
      */
     @CompilationFinal private Object cachedValue;
     @CompilationFinal private Assumption cachedAssumption;
+    @CompilationFinal private String cachedNs;  // namespace when value was cached
 
     public SymbolNode(ClojureContext context, String name) {
         this.context = context;
@@ -32,8 +33,11 @@ public class SymbolNode extends ExpressionNode {
     @Override
     public Object executeGeneric(VirtualFrame frame) {
         // Fast path: return cached value if assumption still valid
+        // For unqualified symbols, also verify namespace hasn't changed
         if (cachedAssumption != null && cachedAssumption.isValid()) {
-            return cachedValue;
+            if (name.contains("/") || cachedNs == null || cachedNs.equals(getCurrentNs())) {
+                return cachedValue;
+            }
         }
 
         Object value = resolveSymbol(context, name, compileNs);
@@ -46,10 +50,16 @@ public class SymbolNode extends ExpressionNode {
             if (varAssumption != null) {
                 cachedValue = value;
                 cachedAssumption = varAssumption.getAssumption();
+                cachedNs = getCurrentNs();
             }
         }
 
         return value;
+    }
+
+    @TruffleBoundary
+    private String getCurrentNs() {
+        return context != null ? context.getCurrentNamespace() : null;
     }
 
     @TruffleBoundary
@@ -63,6 +73,22 @@ public class SymbolNode extends ExpressionNode {
 
     @TruffleBoundary
     private static Object resolveSymbol(ClojureContext context, String name, String compileNs) {
+        // For unqualified, non-dynamic symbols: prefer compileNs when current ns differs
+        // This prevents namespace shadowing (e.g., deftest walk shadowing clojure.walk/walk)
+        if (compileNs != null && !name.contains("/") && !isDynamicVar(name)) {
+            String currentNs = context.getCurrentNamespace();
+            if (!compileNs.equals(currentNs)) {
+                // First check thread bindings for dynamic vars
+                Object bound = context.getThreadBinding(name);
+                if (bound != null) return bound;
+                // Then resolve in compile-time namespace
+                clojure.truffle.runtime.ClojureNamespace ns = context.getNamespace(compileNs);
+                if (ns != null) {
+                    Object value = ns.resolve(name);
+                    if (value != null) return value;
+                }
+            }
+        }
         Object value = context.getVarWithBindings(name);
         if (value == null && compileNs != null && !name.contains("/")) {
             clojure.truffle.runtime.ClojureNamespace ns = context.getNamespace(compileNs);
