@@ -4341,10 +4341,39 @@ public class ClojureContext {
                 throw new IllegalArgumentException("vector-of: unsupported type: " + typeArg);
             }
             // Remaining args are optional initial values
-            if (args.length == 1) return clojure.lang.PersistentVector.EMPTY;
+            if (args.length == 1) return new clojure.core.Vec(clojure.lang.PersistentVector.EMPTY);
+            // Validate elements match the declared type
+            String type = kw.getName();
             Object[] vals = new Object[args.length - 1];
-            System.arraycopy(args, 1, vals, 0, vals.length);
-            return clojure.lang.PersistentVector.create(java.util.Arrays.asList(vals));
+            for (int vi = 0; vi < vals.length; vi++) {
+                Object v = args[vi + 1];
+                if (v == null || v instanceof ClojureNil) {
+                    throw new NullPointerException("Can't cast nil to primitive " + type);
+                }
+                switch (type) {
+                    case "int": case "long": case "short": case "byte":
+                        if (v instanceof Character c) { v = (int) c.charValue(); }
+                        else if (!(v instanceof Number)) throw new ClassCastException(
+                            v.getClass().getName() + " cannot be cast to java.lang.Number");
+                        else { v = ((Number) v).intValue(); }
+                        break;
+                    case "float": case "double":
+                        if (!(v instanceof Number)) throw new ClassCastException(
+                            v.getClass().getName() + " cannot be cast to java.lang.Number");
+                        v = ((Number) v).doubleValue();
+                        break;
+                    case "char":
+                        if (!(v instanceof Character)) throw new ClassCastException(
+                            v.getClass().getName() + " cannot be cast to java.lang.Character");
+                        break;
+                    case "boolean":
+                        if (!(v instanceof Boolean)) throw new ClassCastException(
+                            v.getClass().getName() + " cannot be cast to java.lang.Boolean");
+                        break;
+                }
+                vals[vi] = v;
+            }
+            return new clojure.core.Vec(clojure.lang.PersistentVector.create(java.util.Arrays.asList(vals)));
         });
 
         defBuiltin("subvec", args -> {
@@ -7458,6 +7487,10 @@ public class ClojureContext {
         if (a instanceof ClojureNil || b instanceof ClojureNil) return false;
         if (a instanceof Number && b instanceof Number) {
             return compareNumbers(a, b) == 0;
+        }
+        // Use Clojure's equiv for IPersistentCollection to handle cross-type numeric equality
+        if (a instanceof clojure.lang.IPersistentCollection ipc) {
+            return ipc.equiv(b);
         }
         return a.equals(b);
     }

@@ -350,7 +350,8 @@ public class Analyzer {
                     if (lastDot > 0) {
                         String possibleNs = name.substring(0, lastDot);
                         String possibleVar = name.substring(lastDot + 1);
-                        if (context.getNamespace(possibleNs) != null) {
+                        clojure.truffle.runtime.ClojureNamespace possibleNsObj = context.getNamespace(possibleNs);
+                        if (possibleNsObj != null && possibleNsObj.resolve(possibleVar) != null) {
                             return new SymbolNode(context, possibleNs + "/" + possibleVar);
                         }
                     }
