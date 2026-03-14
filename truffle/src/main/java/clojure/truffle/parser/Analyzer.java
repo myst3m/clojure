@@ -2053,10 +2053,18 @@ public class Analyzer {
         args = args.next();
         Object thenForm = args != null ? args.first() : null;
         Object elseForm = (args != null && args.next() != null) ? args.next().first() : null;
-        return analyze(ClojureRT.list(Symbol.intern("let"), bindings,
+        Object bindForm = bindings.nth(0);
+        Object exprForm = bindings.nth(1);
+        Symbol tmpSym = Symbol.intern("__if_some_tmp__");
+        // (let [tmp expr] (if (not (nil? tmp)) (let [bindForm tmp] then) else))
+        return analyze(ClojureRT.list(Symbol.intern("let"),
+                PersistentVector.create(java.util.Arrays.asList(tmpSym, exprForm)),
                 ClojureRT.list(Symbol.intern("if"),
-                        ClojureRT.list(Symbol.intern("not"), ClojureRT.list(Symbol.intern("nil?"), bindings.nth(0))),
-                        thenForm, elseForm)));
+                        ClojureRT.list(Symbol.intern("not"), ClojureRT.list(Symbol.intern("nil?"), tmpSym)),
+                        ClojureRT.list(Symbol.intern("let"),
+                                PersistentVector.create(java.util.Arrays.asList(bindForm, tmpSym)),
+                                thenForm),
+                        elseForm)));
     }
 
     private ExpressionNode analyzeWhenSome(ISeq seq) {
@@ -2064,12 +2072,21 @@ public class Analyzer {
         if (args == null) throw err("when-some: missing bindings");
         IPersistentVector bindings = (IPersistentVector) args.first();
         ISeq body = args.next();
-        java.util.List<Object> whenForm = new ArrayList<>();
-        whenForm.add(Symbol.intern("when"));
-        whenForm.add(ClojureRT.list(Symbol.intern("not"), ClojureRT.list(Symbol.intern("nil?"), bindings.nth(0))));
-        while (body != null) { whenForm.add(body.first()); body = body.next(); }
-        return analyze(ClojureRT.list(Symbol.intern("let"), bindings,
-                PersistentList.create(whenForm)));
+        Object bindForm = bindings.nth(0);
+        Object exprForm = bindings.nth(1);
+        Symbol tmpSym = Symbol.intern("__when_some_tmp__");
+        // Build body as do form
+        java.util.List<Object> doBody = new ArrayList<>();
+        doBody.add(Symbol.intern("do"));
+        while (body != null) { doBody.add(body.first()); body = body.next(); }
+        // (let [tmp expr] (when (not (nil? tmp)) (let [bindForm tmp] body...)))
+        return analyze(ClojureRT.list(Symbol.intern("let"),
+                PersistentVector.create(java.util.Arrays.asList(tmpSym, exprForm)),
+                ClojureRT.list(Symbol.intern("when"),
+                        ClojureRT.list(Symbol.intern("not"), ClojureRT.list(Symbol.intern("nil?"), tmpSym)),
+                        ClojureRT.list(Symbol.intern("let"),
+                                PersistentVector.create(java.util.Arrays.asList(bindForm, tmpSym)),
+                                PersistentList.create(doBody)))));
     }
 
     private ExpressionNode analyzeCase(ISeq seq) {
@@ -2704,6 +2721,7 @@ public class Analyzer {
         }
 
         // :keys [a b] or :keys [:a :b] -> bind a to (:a source), b to (:b source)
+        // :keys [a/b] -> bind b to (:a/b source)
         if (keysVec instanceof IPersistentVector kv) {
             for (int i = 0; i < kv.count(); i++) {
                 Object elem = kv.nth(i);
@@ -2711,7 +2729,7 @@ public class Analyzer {
                 Keyword key;
                 if (elem instanceof Symbol sym) {
                     localName = sym.getName();
-                    key = Keyword.intern(localName);
+                    key = Keyword.intern(sym.getNamespace(), sym.getName());
                 } else if (elem instanceof Keyword kw) {
                     localName = kw.getName();
                     key = kw;
@@ -2757,10 +2775,11 @@ public class Analyzer {
         }
 
         // :syms [a b] -> bind a to ('a source), b to ('b source)
+        // :syms [a/b] -> bind b to ('a/b source)
         if (symsVec instanceof IPersistentVector yv) {
             for (int i = 0; i < yv.count(); i++) {
                 Symbol sym = (Symbol) yv.nth(i);
-                Symbol key = Symbol.intern(sym.getName());
+                Symbol key = sym; // preserve namespace if present
                 // Use QuoteNode directly so the symbol is treated as a literal value, not a var reference
                 ExpressionNode getExpr = makeGetNodeQuoted(sourceSlot, key, defaults, sym);
                 slots.add(currentScope.addLocal(sym.getName()));
@@ -3778,46 +3797,69 @@ public class Analyzer {
         Object expr = args.first(); args = args.next();
 
         Symbol tmpSym = Symbol.intern("__condp_val__");
-        List<Object> body = new ArrayList<>();
+        Symbol tmpPredResult = Symbol.intern("__condp_pr__");
+        Keyword arrowKw = Keyword.intern(null, ">>");
+        // Collect clauses as triples: (testVal, isArrow, result/fn)
+        // plus optional default
+        List<Object[]> clauses = new ArrayList<>();
+        Object defaultVal = null;
+        boolean hasDefault = false;
         while (args != null) {
             Object testVal = args.first();
             args = args.next();
             if (args == null) {
-                // Default clause (no pair) — testVal is the default result
-                body.add(testVal);
+                // Default clause (no pair)
+                defaultVal = testVal;
+                hasDefault = true;
                 break;
             }
-            Object result = args.first();
+            Object second = args.first();
             args = args.next();
-            // (if (pred testVal tmpSym) result ...)
-            body.add(0, ClojureRT.list(Symbol.intern("if"),
-                    ClojureRT.list(pred, testVal, tmpSym),
-                    result,
-                    null)); // placeholder
+            if (arrowKw.equals(second)) {
+                // :>> clause: test-val :>> fn
+                if (args == null) throw err("condp: :>> expects a function");
+                Object fn = args.first();
+                args = args.next();
+                clauses.add(new Object[]{testVal, Boolean.TRUE, fn});
+            } else {
+                clauses.add(new Object[]{testVal, Boolean.FALSE, second});
+            }
         }
-        // Chain the conditions: replace null placeholders
-        if (body.isEmpty()) return new NilNode();
-        // Build nested if from inside out
-        Object result = body.get(body.size() - 1);
-        // Check if last element is a standalone default or an if
-        for (int i = body.size() - 1; i >= 0; i--) {
-            Object item = body.get(i);
-            if (item instanceof ISeq s && Symbol.intern("if").equals(s.first())) {
-                // Replace the nil (else) with the current accumulated result
-                // (if test then nil) -> (if test then result)
-                ISeq ifArgs = s.next();
-                Object cond = ifArgs.first();
-                Object then = ifArgs.next().first();
-                item = ClojureRT.list(Symbol.intern("if"), cond, then, result);
-                result = item;
-            } else if (i < body.size() - 1) {
-                // shouldn't happen
-                result = item;
+        // Build from inside out
+        Object elseExpr;
+        if (hasDefault) {
+            elseExpr = defaultVal;
+        } else {
+            // throw IllegalArgumentException if no match
+            elseExpr = ClojureRT.list(Symbol.intern("throw"),
+                    ClojureRT.list(Symbol.intern("new"), Symbol.intern("IllegalArgumentException"),
+                            ClojureRT.list(Symbol.intern("str"), "No matching clause: ", tmpSym)));
+        }
+        // Build nested ifs from last clause to first
+        Object result = elseExpr;
+        for (int i = clauses.size() - 1; i >= 0; i--) {
+            Object[] clause = clauses.get(i);
+            Object testVal = clause[0];
+            boolean isArrow = (Boolean) clause[1];
+            Object resultOrFn = clause[2];
+            if (isArrow) {
+                // (let [pr (pred testVal tmpSym)] (if pr (fn pr) <else>))
+                result = ClojureRT.list(Symbol.intern("let"),
+                        PersistentVector.create(java.util.List.of(tmpPredResult, ClojureRT.list(pred, testVal, tmpSym))),
+                        ClojureRT.list(Symbol.intern("if"), tmpPredResult,
+                                ClojureRT.list(resultOrFn, tmpPredResult),
+                                result));
+            } else {
+                // (if (pred testVal tmpSym) result <else>)
+                result = ClojureRT.list(Symbol.intern("if"),
+                        ClojureRT.list(pred, testVal, tmpSym),
+                        resultOrFn,
+                        result);
             }
         }
         // Wrap in let to evaluate expr once
         return analyze(ClojureRT.list(Symbol.intern("let"),
-                PersistentVector.create(java.util.List.of(tmpSym, expr)),
+                PersistentVector.create(java.util.Arrays.asList(tmpSym, expr)),
                 result));
     }
 

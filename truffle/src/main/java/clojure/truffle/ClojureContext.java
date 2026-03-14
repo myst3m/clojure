@@ -1454,7 +1454,10 @@ public class ClojureContext {
         defBuiltin("ex-info", args -> {
             if (args.length < 2) throw new RuntimeException("ex-info: expected at least 2 args");
             String msg = args[0].toString();
-            return new clojure.lang.ExceptionInfo(msg, (clojure.lang.IPersistentMap) args[1]);
+            clojure.lang.IPersistentMap data = (args[1] == null || args[1] instanceof ClojureNil)
+                ? clojure.lang.PersistentArrayMap.EMPTY
+                : (clojure.lang.IPersistentMap) args[1];
+            return new clojure.lang.ExceptionInfo(msg, data);
         });
 
         defBuiltin("ex-message", args -> {
@@ -2940,7 +2943,9 @@ public class ClojureContext {
         defBuiltin("ex-info", args -> {
             if (args.length < 2) throw new RuntimeException("ex-info: expected 2-3 args");
             String msg = args[0].toString();
-            clojure.lang.IPersistentMap data = (clojure.lang.IPersistentMap) args[1];
+            clojure.lang.IPersistentMap data = (args[1] == null || args[1] instanceof ClojureNil)
+                ? clojure.lang.PersistentArrayMap.EMPTY
+                : (clojure.lang.IPersistentMap) args[1];
             Throwable cause = args.length > 2 && args[2] instanceof Throwable t ? t : null;
             return new clojure.lang.ExceptionInfo(msg, data, cause);
         });
@@ -2960,6 +2965,52 @@ public class ClojureContext {
                 return msg == null ? ClojureNil.INSTANCE : msg;
             }
             return ClojureNil.INSTANCE;
+        });
+
+        defBuiltin("Throwable->map", args -> {
+            checkArity(args, 1, "Throwable->map");
+            if (!(args[0] instanceof Throwable t)) {
+                throw new RuntimeException("Throwable->map: expected a Throwable");
+            }
+            clojure.lang.IPersistentMap m = clojure.lang.PersistentArrayMap.EMPTY;
+            m = m.assoc(clojure.lang.Keyword.intern("via"),
+                clojure.lang.PersistentVector.EMPTY);
+            m = m.assoc(clojure.lang.Keyword.intern("trace"),
+                clojure.lang.PersistentVector.EMPTY);
+            Throwable cur = t;
+            java.util.List<Object> viaList = new java.util.ArrayList<>();
+            while (cur != null) {
+                clojure.lang.IPersistentMap via = clojure.lang.PersistentArrayMap.EMPTY;
+                via = via.assoc(clojure.lang.Keyword.intern("type"),
+                    clojure.lang.Symbol.intern(cur.getClass().getName()));
+                String msg = cur.getMessage();
+                if (msg != null) {
+                    via = via.assoc(clojure.lang.Keyword.intern("message"), msg);
+                }
+                if (cur instanceof clojure.lang.IExceptionInfo ei) {
+                    via = via.assoc(clojure.lang.Keyword.intern("data"), ei.getData());
+                }
+                viaList.add(via);
+                cur = cur.getCause();
+            }
+            m = m.assoc(clojure.lang.Keyword.intern("via"),
+                clojure.lang.PersistentVector.create(viaList));
+            // Build trace from top exception
+            StackTraceElement[] st = t.getStackTrace();
+            java.util.List<Object> traceList = new java.util.ArrayList<>();
+            for (StackTraceElement e : st) {
+                traceList.add(clojure.lang.PersistentVector.create(
+                    clojure.lang.Symbol.intern(e.getClassName()),
+                    clojure.lang.Symbol.intern(e.getMethodName()),
+                    e.getFileName() != null ? e.getFileName() : "NO_SOURCE_FILE",
+                    e.getLineNumber()));
+            }
+            m = m.assoc(clojure.lang.Keyword.intern("trace"),
+                clojure.lang.PersistentVector.create(traceList));
+            if (t.getMessage() != null) {
+                m = m.assoc(clojure.lang.Keyword.intern("cause"), t.getMessage());
+            }
+            return m;
         });
 
         defBuiltin("ex-cause", args -> {
@@ -3038,19 +3089,75 @@ public class ClojureContext {
         defBuiltin("str/replace", args -> {
             checkArity(args, 3, "str/replace");
             String s = args[0].toString();
+            Object replacement = args[2];
             if (args[1] instanceof Pattern pat) {
-                return pat.matcher(s).replaceAll(args[2].toString());
+                if (replacement instanceof BuiltinFunction || replacement instanceof ClojureFunction || replacement instanceof MultiArityFunction) {
+                    // Function replacement: call fn with match result
+                    java.util.regex.Matcher m = pat.matcher(s);
+                    StringBuilder sb = new StringBuilder();
+                    while (m.find()) {
+                        String match = m.group();
+                        Object fnResult;
+                        if (m.groupCount() > 0) {
+                            // Create vector of [full-match, group1, group2, ...]
+                            java.util.List<Object> groups = new ArrayList<>();
+                            groups.add(match);
+                            for (int i = 1; i <= m.groupCount(); i++) {
+                                String g = m.group(i);
+                                groups.add(g == null ? (Object) ClojureNil.INSTANCE : g);
+                            }
+                            Object matchVec = clojure.lang.PersistentVector.create(groups);
+                            fnResult = callFunction(replacement, new Object[]{matchVec});
+                        } else {
+                            fnResult = callFunction(replacement, new Object[]{match});
+                        }
+                        m.appendReplacement(sb, java.util.regex.Matcher.quoteReplacement(fnResult.toString()));
+                    }
+                    m.appendTail(sb);
+                    return sb.toString();
+                }
+                return pat.matcher(s).replaceAll(java.util.regex.Matcher.quoteReplacement(replacement.toString()));
             }
-            return s.replace(args[1].toString(), args[2].toString());
+            if (args[1] instanceof Character c) {
+                if (replacement instanceof Character r) {
+                    return s.replace(c, r);
+                }
+                return s.replace(c.toString(), replacement.toString());
+            }
+            return s.replace(args[1].toString(), replacement.toString());
         });
 
         defBuiltin("str/replace-first", args -> {
             checkArity(args, 3, "str/replace-first");
             String s = args[0].toString();
+            Object replacement = args[2];
             if (args[1] instanceof Pattern pat) {
-                return pat.matcher(s).replaceFirst(args[2].toString());
+                if (replacement instanceof BuiltinFunction || replacement instanceof ClojureFunction || replacement instanceof MultiArityFunction) {
+                    java.util.regex.Matcher m = pat.matcher(s);
+                    if (m.find()) {
+                        String match = m.group();
+                        Object fnResult;
+                        if (m.groupCount() > 0) {
+                            java.util.List<Object> groups = new ArrayList<>();
+                            groups.add(match);
+                            for (int i = 1; i <= m.groupCount(); i++) {
+                                String g = m.group(i);
+                                groups.add(g == null ? (Object) ClojureNil.INSTANCE : g);
+                            }
+                            fnResult = callFunction(replacement, new Object[]{clojure.lang.PersistentVector.create(groups)});
+                        } else {
+                            fnResult = callFunction(replacement, new Object[]{match});
+                        }
+                        StringBuilder sb = new StringBuilder();
+                        m.appendReplacement(sb, java.util.regex.Matcher.quoteReplacement(fnResult.toString()));
+                        m.appendTail(sb);
+                        return sb.toString();
+                    }
+                    return s;
+                }
+                return pat.matcher(s).replaceFirst(java.util.regex.Matcher.quoteReplacement(replacement.toString()));
             }
-            return s.replaceFirst(Pattern.quote(args[1].toString()), args[2].toString());
+            return s.replaceFirst(Pattern.quote(args[1].toString()), java.util.regex.Matcher.quoteReplacement(replacement.toString()));
         });
 
         defBuiltin("str/starts-with?", args -> {
@@ -3098,6 +3205,30 @@ public class ClojureContext {
         defBuiltin("str/reverse", args -> {
             checkArity(args, 1, "str/reverse");
             return new StringBuilder(args[0].toString()).reverse().toString();
+        });
+
+        defBuiltin("str/trim-newline", args -> {
+            checkArity(args, 1, "str/trim-newline");
+            String s = args[0].toString();
+            int len = s.length();
+            while (len > 0) {
+                char c = s.charAt(len - 1);
+                if (c == '\n' || c == '\r') len--;
+                else break;
+            }
+            return s.substring(0, len);
+        });
+
+        defBuiltin("str/split-lines", args -> {
+            checkArity(args, 1, "str/split-lines");
+            String s = args[0].toString();
+            String[] lines = s.split("\\r?\\n|\\r", -1);
+            return clojure.lang.PersistentVector.create(java.util.Arrays.asList((Object[]) lines));
+        });
+
+        defBuiltin("str/re-quote-replacement", args -> {
+            checkArity(args, 1, "str/re-quote-replacement");
+            return java.util.regex.Matcher.quoteReplacement(args[0].toString());
         });
 
         defBuiltin("str/escape", args -> {
@@ -3165,6 +3296,11 @@ public class ClojureContext {
             Object key = args[1];
             if (coll instanceof clojure.lang.IPersistentSet s) return s.contains(key);
             if (coll instanceof clojure.lang.IPersistentMap m) return m.containsKey(key);
+            if (coll instanceof clojure.lang.ITransientSet ts) return ts.contains(key);
+            if (coll instanceof clojure.lang.ITransientAssociative ta) {
+                Object sentinel = new Object();
+                return ta.valAt(key, sentinel) != sentinel;
+            }
             if (coll instanceof clojure.lang.Indexed indexed) {
                 int idx = ((Number) key).intValue();
                 return idx >= 0 && idx < indexed.count();
@@ -3214,6 +3350,31 @@ public class ClojureContext {
             throw new RuntimeException("keyword: expected 1-2 args");
         });
 
+        defBuiltin("find-keyword", args -> {
+            if (args.length == 1) {
+                if (args[0] instanceof clojure.lang.Keyword k) return k;
+                if (args[0] instanceof clojure.lang.Symbol sym) {
+                    clojure.lang.Keyword found = clojure.lang.Keyword.find(sym.getNamespace(), sym.getName());
+                    return found == null ? ClojureNil.INSTANCE : found;
+                }
+                String s = args[0].toString();
+                if (s.startsWith(":")) s = s.substring(1);
+                int slash = s.indexOf('/');
+                if (slash >= 0) {
+                    clojure.lang.Keyword found = clojure.lang.Keyword.find(s.substring(0, slash), s.substring(slash + 1));
+                    return found == null ? ClojureNil.INSTANCE : found;
+                }
+                clojure.lang.Keyword found = clojure.lang.Keyword.find(null, s);
+                return found == null ? ClojureNil.INSTANCE : found;
+            }
+            if (args.length == 2) {
+                String ns = args[0] instanceof ClojureNil ? null : args[0].toString();
+                clojure.lang.Keyword found = clojure.lang.Keyword.find(ns, args[1].toString());
+                return found == null ? ClojureNil.INSTANCE : found;
+            }
+            throw new RuntimeException("find-keyword: expected 1-2 args");
+        });
+
         defBuiltin("gensym", args -> {
             String prefix = args.length > 0 ? args[0].toString() : "G__";
             return clojure.lang.Symbol.intern(prefix + gensymCounter.incrementAndGet());
@@ -3227,9 +3388,14 @@ public class ClojureContext {
 
         defBuiltin("compare", args -> {
             checkArity(args, 2, "compare");
+            Object x = args[0] instanceof ClojureNil ? null : args[0];
+            Object y = args[1] instanceof ClojureNil ? null : args[1];
+            if (x == null && y == null) return 0L;
+            if (x == null) return -1L;
+            if (y == null) return 1L;
             @SuppressWarnings("unchecked")
-            Comparable<Object> a = (Comparable<Object>) args[0];
-            return (long) a.compareTo(args[1]);
+            Comparable<Object> a = (Comparable<Object>) x;
+            return (long) a.compareTo(y);
         });
 
         defBuiltin("type", args -> {
@@ -3864,6 +4030,51 @@ public class ClojureContext {
             return ClojureNil.INSTANCE;
         });
 
+        defBuiltin("underive", args -> {
+            if (args.length != 2 && args.length != 3)
+                throw new RuntimeException("underive: expected 2 or 3 args");
+            boolean custom = args.length == 3;
+            clojure.lang.IPersistentMap h;
+            Object tag, parent;
+            if (custom) {
+                h = (clojure.lang.IPersistentMap) args[0];
+                tag = args[1]; parent = args[2];
+            } else {
+                tag = args[0]; parent = args[1];
+                h = (clojure.lang.IPersistentMap) globalVars.get("*hierarchy*");
+            }
+            // Rebuild hierarchy without this relationship
+            // Simple approach: remove parent from tag's parents, then rebuild ancestors/descendants
+            clojure.lang.Keyword kParents = clojure.lang.Keyword.intern("parents");
+            clojure.lang.IPersistentMap parents = (clojure.lang.IPersistentMap) h.valAt(kParents);
+            Object tagParents = parents.valAt(tag);
+            if (tagParents instanceof clojure.lang.IPersistentSet s) {
+                clojure.lang.IPersistentSet newParents = s.disjoin(parent);
+                if (newParents.count() == 0) {
+                    parents = parents.without(tag);
+                } else {
+                    parents = parents.assoc(tag, newParents);
+                }
+            }
+            // Rebuild from scratch using derive
+            clojure.lang.IPersistentMap newH = (clojure.lang.IPersistentMap)
+                    ((BuiltinFunction) globalVars.get("make-hierarchy")).execute(new Object[0]);
+            for (clojure.lang.ISeq seq = parents.seq(); seq != null; seq = seq.next()) {
+                clojure.lang.IMapEntry entry = (clojure.lang.IMapEntry) seq.first();
+                Object t = entry.key();
+                Object ps = entry.val();
+                if (ps instanceof clojure.lang.IPersistentSet pset) {
+                    for (clojure.lang.ISeq s2 = pset.seq(); s2 != null; s2 = s2.next()) {
+                        newH = (clojure.lang.IPersistentMap) callFunction(
+                                globalVars.get("derive"), new Object[]{newH, t, s2.first()});
+                    }
+                }
+            }
+            if (custom) return newH;
+            globalVars.put("*hierarchy*", newH);
+            return ClojureNil.INSTANCE;
+        });
+
         // --- Phase 9: Misc utilities ---
         defBuiltin("tree-seq", args -> {
             checkArity(args, 3, "tree-seq");
@@ -4044,6 +4255,17 @@ public class ClojureContext {
             checkArity(args, 1, "pop");
             if (args[0] instanceof clojure.lang.IPersistentStack s) return s.pop();
             throw new RuntimeException("pop: not a stack");
+        });
+
+        // vector-of: creates a vector (in standard Clojure creates primitive vectors, here we use regular vectors)
+        defBuiltin("vector-of", args -> {
+            if (args.length < 1) throw new RuntimeException("vector-of: expected type keyword");
+            // args[0] is type keyword (:int, :long, :float, :double, :byte, :short, :char, :boolean)
+            // Remaining args are optional initial values
+            if (args.length == 1) return clojure.lang.PersistentVector.EMPTY;
+            Object[] vals = new Object[args.length - 1];
+            System.arraycopy(args, 1, vals, 0, vals.length);
+            return clojure.lang.PersistentVector.create(java.util.Arrays.asList(vals));
         });
 
         defBuiltin("subvec", args -> {
@@ -4539,6 +4761,25 @@ public class ClojureContext {
             if (args[0] instanceof clojure.lang.IPersistentMap m) {
                 clojure.lang.IMapEntry entry = m.entryAt(args[1]);
                 return entry == null ? ClojureNil.INSTANCE : entry;
+            }
+            if (args[0] instanceof clojure.lang.Associative a) {
+                clojure.lang.IMapEntry entry = a.entryAt(args[1]);
+                return entry == null ? ClojureNil.INSTANCE : entry;
+            }
+            // Transient vectors support find via index
+            if (args[0] instanceof clojure.lang.ITransientVector tv && args[1] instanceof Number n) {
+                int idx = n.intValue();
+                if (idx >= 0 && idx < tv.count()) {
+                    return clojure.lang.MapEntry.create(args[1], tv.valAt(idx));
+                }
+                return ClojureNil.INSTANCE;
+            }
+            // Transient maps via ILookup
+            if (args[0] instanceof clojure.lang.ILookup lookup) {
+                Object sentinel = new Object();
+                Object val = lookup.valAt(args[1], sentinel);
+                if (val == sentinel) return ClojureNil.INSTANCE;
+                return clojure.lang.MapEntry.create(args[1], val);
             }
             return ClojureNil.INSTANCE;
         });
@@ -5450,6 +5691,16 @@ public class ClojureContext {
             throw new RuntimeException("dissoc!: not a transient map");
         });
 
+        defBuiltin("disj!", args -> {
+            if (args.length < 2) throw new RuntimeException("disj!: expected at least 2 args");
+            if (!(args[0] instanceof clojure.lang.ITransientSet ts))
+                throw new RuntimeException("disj!: not a transient set");
+            for (int i = 1; i < args.length; i++) {
+                ts = (clojure.lang.ITransientSet) ts.disjoin(args[i]);
+            }
+            return ts;
+        });
+
         defBuiltin("pop!", args -> {
             checkArity(args, 1, "pop!");
             if (args[0] instanceof clojure.lang.ITransientVector tv)
@@ -5712,7 +5963,9 @@ public class ClojureContext {
             checkArity(args, 1, "macroexpand-1");
             Object form = args[0];
             if (form instanceof clojure.lang.ISeq seq && seq.first() instanceof clojure.lang.Symbol sym) {
-                Object macro = getMacro(sym.getName());
+                Object macro = sym.getNamespace() != null
+                    ? getMacroFromNs(sym.getNamespace(), sym.getName())
+                    : getMacro(sym.getName());
                 if (macro != null) {
                     java.util.List<Object> macroArgs = new java.util.ArrayList<>();
                     // User-defined macros expect &form and &env as first two args
@@ -6499,14 +6752,16 @@ public class ClojureContext {
             checkArity(args, 1, "NaN?");
             if (args[0] instanceof Double d) return Double.isNaN(d);
             if (args[0] instanceof Float f) return Float.isNaN(f);
-            return false;
+            if (args[0] instanceof Number) return false;
+            throw new ClassCastException("Cannot cast " + (args[0] == null || args[0] instanceof ClojureNil ? "null" : args[0].getClass().getName()) + " to java.lang.Number");
         });
 
         defBuiltin("infinite?", args -> {
             checkArity(args, 1, "infinite?");
             if (args[0] instanceof Double d) return Double.isInfinite(d);
             if (args[0] instanceof Float f) return Float.isInfinite(f);
-            return false;
+            if (args[0] instanceof Number) return false;
+            throw new ClassCastException("Cannot cast " + (args[0] == null || args[0] instanceof ClojureNil ? "null" : args[0].getClass().getName()) + " to java.lang.Number");
         });
 
         defBuiltin("pos-int?", args -> {
@@ -6751,6 +7006,10 @@ public class ClojureContext {
     }
 
     @TruffleBoundary
+    public Object getGlobalVar(String name) {
+        return globalVars.get(name);
+    }
+
     public Object callFunction(Object fn, Object[] args) {
         // Dereference ClojureVar to its value
         if (fn instanceof clojure.truffle.runtime.ClojureVar cvar) {
@@ -7398,7 +7657,8 @@ public class ClojureContext {
         // Map str/xxx builtins to clojure.string/xxx
         String[] fns = {"split", "join", "trim", "triml", "trimr", "upper-case", "lower-case",
                 "capitalize", "replace", "replace-first", "starts-with?", "ends-with?", "includes?",
-                "blank?", "index-of", "last-index-of", "reverse"};
+                "blank?", "index-of", "last-index-of", "reverse", "trim-newline", "split-lines",
+                "re-quote-replacement", "escape"};
         for (String fn : fns) {
             Object val = globalVars.get("str/" + fn);
             if (val != null) ns.intern(fn, val);
