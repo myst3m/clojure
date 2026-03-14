@@ -2137,6 +2137,8 @@ public class Analyzer {
             }
             clauses.add(new Object[]{testVal, formList.get(i + 1)});
         }
+        // Emit performance warnings to *err*
+        emitCaseWarnings(seenConstants);
         boolean hasDefault = formList.size() % 2 == 1;
 
         // Build: set tmp, then chain of if (= tmp val) result ...
@@ -4498,6 +4500,48 @@ public class Analyzer {
 
     private static RuntimeException err(String msg) {
         return new RuntimeException(msg);
+    }
+
+    private void emitCaseWarnings(java.util.Set<Object> testConstants) {
+        if (context == null) return;
+        // Check if all test constants are integers
+        boolean allInts = !testConstants.isEmpty();
+        for (Object c : testConstants) {
+            if (!(c instanceof Integer || c instanceof Long)) {
+                allInts = false;
+                break;
+            }
+        }
+        if (allInts) {
+            printCaseWarning("case has int tests, but tested expression is not primitive.");
+        }
+        // Check for hash collisions
+        java.util.Set<Integer> hashes = new java.util.HashSet<>();
+        boolean hasCollision = false;
+        for (Object c : testConstants) {
+            if (c != null && !hashes.add(c.hashCode())) {
+                hasCollision = true;
+                break;
+            }
+        }
+        if (hasCollision) {
+            printCaseWarning("hash collision of some case test constants; if selected, those entries will be tested sequentially.");
+        }
+    }
+
+    private void printCaseWarning(String msg) {
+        try {
+            Object errWriter = context.getVarWithBindings("*err*");
+            if (errWriter instanceof java.io.Writer w) {
+                w.write("Performance warning, NO_SOURCE_PATH:0 - " + msg + "\n");
+                w.flush();
+            } else if (errWriter instanceof java.io.PrintWriter pw) {
+                pw.println("Performance warning, NO_SOURCE_PATH:0 - " + msg);
+                pw.flush();
+            }
+        } catch (Exception e) {
+            // ignore
+        }
     }
 
     private static RuntimeException compilerError(String msg) {
