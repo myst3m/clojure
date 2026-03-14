@@ -28,17 +28,40 @@ public class JavaInstanceMethodNode extends ExpressionNode {
         return invokeMethod(target, methodName, args);
     }
 
+    private static boolean isAccessibleClass(Class<?> clazz) {
+        int mod = clazz.getModifiers();
+        if (!java.lang.reflect.Modifier.isPublic(mod)) return false;
+        Module module = clazz.getModule();
+        if (module != null && module.isNamed()) {
+            String pkg = clazz.getPackageName();
+            // Check if the package is exported to everyone (or at least to unnamed modules)
+            if (!module.isExported(pkg)) return false;
+        }
+        return true;
+    }
+
     @TruffleBoundary
     private static Object invokeMethod(Object target, String methodName, Object[] args) {
         Class<?> clazz = target.getClass();
         Method method = JavaInteropUtil.findMethod(clazz, methodName, args, false);
-        if (method == null || !java.lang.reflect.Modifier.isPublic(method.getDeclaringClass().getModifiers())) {
+        // Prefer interface/superclass method when declaring class is non-public
+        // or in a non-exported module package (avoids InaccessibleObjectException)
+        if (method == null || !isAccessibleClass(method.getDeclaringClass())) {
             Method ifaceMethod = null;
             for (Class<?> iface : JavaInteropUtil.getAllInterfaces(clazz)) {
                 ifaceMethod = JavaInteropUtil.findMethod(iface, methodName, args, false);
                 if (ifaceMethod != null) break;
             }
             if (ifaceMethod != null) method = ifaceMethod;
+            // Also check public superclasses
+            if (method == null || !isAccessibleClass(method.getDeclaringClass())) {
+                for (Class<?> sup = clazz.getSuperclass(); sup != null; sup = sup.getSuperclass()) {
+                    if (isAccessibleClass(sup)) {
+                        Method supMethod = JavaInteropUtil.findMethod(sup, methodName, args, false);
+                        if (supMethod != null) { method = supMethod; break; }
+                    }
+                }
+            }
         }
         if (method == null && java.lang.reflect.Proxy.isProxyClass(clazz)) {
             for (Class<?> iface : clazz.getInterfaces()) {
@@ -60,7 +83,7 @@ public class JavaInstanceMethodNode extends ExpressionNode {
                     + " with " + args.length + " args");
         }
         try {
-            method.setAccessible(true);
+            try { method.setAccessible(true); } catch (Exception ignored) {}
             Object[] coerced = JavaInteropUtil.coerceArgs(method, args);
             Object result = method.invoke(target, coerced);
             return JavaInteropUtil.wrapResult(result);

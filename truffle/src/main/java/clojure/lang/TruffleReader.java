@@ -146,6 +146,13 @@ final static public Var DEFAULT_DATA_READERS = Var.intern(CLOJURE_NS, Symbol.int
 final static public Var SUPPRESS_READ = Var.intern(CLOJURE_NS, Symbol.intern("*suppress-read*"), null).setDynamic();
 final static Var READER_RESOLVER = Var.intern(CLOJURE_NS, Symbol.intern("*reader-resolver*"), null).setDynamic();
 
+/**
+ * Hook for evaluating #= read-eval forms via the Truffle runtime.
+ * Set by ClojureContext during initialization.
+ * Signature: (IPersistentList form) -> Object
+ */
+public static volatile java.util.function.Function<IPersistentList, Object> readEvalHook;
+
 static java.util.concurrent.atomic.AtomicInteger id = new java.util.concurrent.atomic.AtomicInteger(1);
 
 // ======== Helper methods formerly from RT ========
@@ -1548,7 +1555,14 @@ public static class EvalReader extends AFn{
 			Object v = Compiler.maybeResolveIn(Compiler.currentNS(), fs);
 			if(v instanceof Var)
 				{
-				return ((IFn) v).applyTo(TruffleReader.next(o));
+				if(((Var)v).isBound())
+					return ((IFn) v).applyTo(TruffleReader.next(o));
+				// Var is unbound — fall through to readEvalHook
+				}
+			// Try Truffle runtime hook for unbound vars or unresolved symbols
+			if(readEvalHook != null)
+				{
+				return readEvalHook.apply((IPersistentList) o);
 				}
 			throw Util.runtimeException("Can't resolve " + fs);
 			}

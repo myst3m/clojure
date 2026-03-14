@@ -859,20 +859,20 @@ public class Analyzer {
         if (args == null) throw err("when-first: missing binding");
         IPersistentVector bindings = (IPersistentVector) args.first();
         if (bindings.count() != 2) throw err("when-first: binding must have 2 forms");
-        Symbol sym = (Symbol) bindings.nth(0);
+        Object bindForm = bindings.nth(0); // can be Symbol or destructuring form (vector/map)
         Object coll = bindings.nth(1);
         ISeq body = args.next();
 
-        // Build: (let [s__temp (seq coll)] (when s__temp (let [sym (first s__temp)] body...)))
+        // Build: (let [s__temp (seq coll)] (when s__temp (let [bindForm (first s__temp)] body...)))
         Symbol tempSym = Symbol.intern("__when-first-temp__" + System.nanoTime());
         // (seq coll)
         Object seqCall = ClojureRT.list(Symbol.intern("seq"), coll);
         // (first s__temp)
         Object firstCall = ClojureRT.list(Symbol.intern("first"), tempSym);
-        // (let [sym (first s__temp)] body...)
+        // (let [bindForm (first s__temp)] body...)
         List<Object> innerLetForms = new ArrayList<>();
         innerLetForms.add(Symbol.intern("let"));
-        innerLetForms.add(PersistentVector.create(sym, firstCall));
+        innerLetForms.add(PersistentVector.create(bindForm, firstCall));
         while (body != null) { innerLetForms.add(body.first()); body = body.next(); }
         Object innerLet = PersistentList.create(innerLetForms);
         // (when s__temp innerLet)
@@ -1131,10 +1131,10 @@ public class Analyzer {
                 if (v.nth(i) instanceof Keyword kw && i + 1 < v.count()) {
                     switch (kw.getName()) {
                         case "only":
-                            onlySyms = extractSymbolNames((IPersistentVector) v.nth(i + 1));
+                            onlySyms = extractSymbolNames(v.nth(i + 1));
                             break;
                         case "exclude":
-                            excludeSyms = new java.util.HashSet<>(extractSymbolNames((IPersistentVector) v.nth(i + 1)));
+                            excludeSyms = new java.util.HashSet<>(extractSymbolNames(v.nth(i + 1)));
                             break;
                         case "rename":
                             renames = extractRenameMap((IPersistentMap) v.nth(i + 1));
@@ -1217,10 +1217,10 @@ public class Analyzer {
         };
     }
 
-    private List<String> extractSymbolNames(IPersistentVector v) {
+    private List<String> extractSymbolNames(Object coll) {
         List<String> names = new ArrayList<>();
-        for (int i = 0; i < v.count(); i++) {
-            names.add(((Symbol) v.nth(i)).getName());
+        for (ISeq s = clojure.lang.RT.seq(coll); s != null; s = s.next()) {
+            names.add(((Symbol) s.first()).getName());
         }
         return names;
     }
@@ -2683,12 +2683,25 @@ public class Analyzer {
                                         List<Integer> slots, List<ExpressionNode> values) {
         // {:keys [a b] :strs [c] :or {a 1} :as all}
         // or {localName :mapKey, ...}
+        // Also supports ::keys (namespace-qualified) e.g. {::keys [a]} -> bind a to (::a source)
         Object keysVec = pattern.valAt(Keyword.intern("keys"));
         Object strsVec = pattern.valAt(Keyword.intern("strs"));
         Object symsVec = pattern.valAt(Keyword.intern("syms"));
         Object orMap = pattern.valAt(Keyword.intern("or"));
         Object asName = pattern.valAt(Keyword.intern("as"));
         IPersistentMap defaults = (orMap instanceof IPersistentMap m) ? m : null;
+
+        // Check for ::keys (namespace-qualified keys) - scan for :ns/keys patterns
+        String nsKeysNs = null;
+        Object nsKeysVec = null;
+        for (ISeq scanSeq = pattern.seq(); scanSeq != null; scanSeq = scanSeq.next()) {
+            IMapEntry entry = (IMapEntry) scanSeq.first();
+            Object k = entry.key();
+            if (k instanceof Keyword kw && kw.getName().equals("keys") && kw.getNamespace() != null) {
+                nsKeysNs = kw.getNamespace();
+                nsKeysVec = entry.val();
+            }
+        }
 
         // :keys [a b] or :keys [:a :b] -> bind a to (:a source), b to (:b source)
         if (keysVec instanceof IPersistentVector kv) {
@@ -2704,6 +2717,27 @@ public class Analyzer {
                     key = kw;
                 } else {
                     throw err("Unsupported :keys element: " + elem);
+                }
+                ExpressionNode getExpr = makeGetNode(sourceSlot, key, defaults, Symbol.intern(localName));
+                slots.add(currentScope.addLocal(localName));
+                values.add(getExpr);
+            }
+        }
+
+        // ::keys [a b] -> bind a to (:ns/a source), b to (:ns/b source)
+        if (nsKeysVec instanceof IPersistentVector nkv) {
+            for (int i = 0; i < nkv.count(); i++) {
+                Object elem = nkv.nth(i);
+                String localName;
+                Keyword key;
+                if (elem instanceof Symbol sym) {
+                    localName = sym.getName();
+                    key = Keyword.intern(nsKeysNs, localName);
+                } else if (elem instanceof Keyword kw) {
+                    localName = kw.getName();
+                    key = Keyword.intern(nsKeysNs, localName);
+                } else {
+                    throw err("Unsupported ::keys element: " + elem);
                 }
                 ExpressionNode getExpr = makeGetNode(sourceSlot, key, defaults, Symbol.intern(localName));
                 slots.add(currentScope.addLocal(localName));
@@ -2911,11 +2945,38 @@ public class Analyzer {
             context.declareDynamic(name);
         }
 
-        // Store var metadata
+        // Process var metadata: split into static (compile-time) and dynamic (runtime) entries
         if (context != null && meta != null && meta.count() > 0) {
-            String ns = context.getCurrentNamespace();
-            String qname = ns + "/" + name;
-            context.setVarMeta(qname, (clojure.lang.IPersistentMap) resolveVarRefsInMeta(meta));
+            clojure.lang.IPersistentMap staticMeta = clojure.lang.PersistentArrayMap.EMPTY;
+            java.util.List<Object> dynKeys = new java.util.ArrayList<>();
+            java.util.List<ExpressionNode> dynNodes = new java.util.ArrayList<>();
+
+            for (ISeq s = meta.seq(); s != null; s = s.next()) {
+                clojure.lang.IMapEntry entry = (clojure.lang.IMapEntry) s.first();
+                Object k = entry.key();
+                Object v = entry.val();
+                if (v instanceof ISeq formSeq) {
+                    // Form values like (fn [] ...) need runtime evaluation
+                    dynKeys.add(k);
+                    dynNodes.add(analyze(formSeq));
+                } else {
+                    staticMeta = staticMeta.assoc(k, resolveVarRefsInMeta(v));
+                }
+            }
+
+            if (dynNodes.isEmpty()) {
+                // All static - set at compile time
+                String ns = context.getCurrentNamespace();
+                String qname = ns + "/" + name;
+                context.setVarMeta(qname, staticMeta);
+                return new DefNode(context, name, valueNode);
+            } else {
+                // Has dynamic entries - evaluate at runtime
+                return new DefNode(context, name, valueNode,
+                    staticMeta,
+                    dynKeys.toArray(),
+                    dynNodes.toArray(new ExpressionNode[0]));
+            }
         }
 
         return new DefNode(context, name, valueNode);
@@ -4647,6 +4708,6 @@ public class Analyzer {
 
     @com.oracle.truffle.api.CompilerDirectives.TruffleBoundary
     static RuntimeException caseNoMatchError(Object val) {
-        return new RuntimeException("No matching clause in case for: " + val + " (type: " + (val != null ? val.getClass().getName() : "null") + ")");
+        return new IllegalArgumentException("No matching clause: " + val);
     }
 }

@@ -72,13 +72,18 @@ public class InvokeNode extends ExpressionNode {
     private static Object invokeSlowPath(Object function, Object[] argValues, ExpressionNode functionNode) {
         if (function instanceof clojure.lang.Keyword kw) {
             if (argValues.length < 1 || argValues.length > 2)
-                throw new RuntimeException("Keyword lookup expects 1 or 2 args");
+                throw new IllegalArgumentException("Wrong number of args (" + argValues.length + ") passed to: " + kw);
             Object map = argValues[0];
             if (map instanceof clojure.lang.ILookup lookup) {
                 Object notFound = argValues.length == 2 ? argValues[1] :
                         clojure.truffle.runtime.ClojureNil.INSTANCE;
                 Object val = lookup.valAt(kw, notFound);
                 return val == null ? clojure.truffle.runtime.ClojureNil.INSTANCE : val;
+            }
+            if (map instanceof clojure.lang.IPersistentSet s) {
+                Object val = s.get(kw);
+                return val == null ? (argValues.length == 2 ? argValues[1] :
+                        clojure.truffle.runtime.ClojureNil.INSTANCE) : val;
             }
             return argValues.length == 2 ? argValues[1] :
                     clojure.truffle.runtime.ClojureNil.INSTANCE;

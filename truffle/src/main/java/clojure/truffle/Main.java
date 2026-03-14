@@ -62,7 +62,7 @@ public class Main {
             builder.option("compiler.TraceCompilation", "true");
         }
         // Lower compilation threshold for faster JIT
-        builder.option("engine.CompilationThreshold", "100");
+        builder.option("engine.SingleTierCompilationThreshold", "100");
 
         try (Context context = builder.build()) {
             Value result = context.eval("clj", code);

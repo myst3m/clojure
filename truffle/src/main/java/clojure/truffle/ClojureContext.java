@@ -151,6 +151,14 @@ public class ClojureContext {
         registerClojureCoreVars();
         // User namespace refers all of clojure.core
         namespaces.get("user").referAll(namespaces.get("clojure.core"));
+        // Set up TruffleReader #= read-eval hook so builtins like * are available
+        clojure.lang.TruffleReader.readEvalHook = (form) -> {
+            Object fnSym = clojure.lang.RT.first(form);
+            Object fn = getVar(fnSym.toString());
+            if (fn == null) throw new RuntimeException("Can't resolve " + fnSym + " in #= form");
+            Object[] args = clojure.lang.TruffleReader.toArray(clojure.lang.RT.next(form));
+            return callFunction(fn, args);
+        };
     }
 
     public ClojureTruffleLanguage getLanguage() {
@@ -505,6 +513,27 @@ public class ClojureContext {
                 clojure.lang.Keyword.intern("qualifier"), ClojureNil.INSTANCE);
         globalVars.put("*clojure-version*", versionMap);
         dynamicVars.add("*clojure-version*");
+        // Standard I/O vars
+        globalVars.put("*out*", new java.io.OutputStreamWriter(System.out));
+        dynamicVars.add("*out*");
+        globalVars.put("*err*", new java.io.PrintWriter(System.err, true));
+        dynamicVars.add("*err*");
+        globalVars.put("*in*", new java.io.InputStreamReader(System.in));
+        dynamicVars.add("*in*");
+        globalVars.put("*flush-on-newline*", true);
+        dynamicVars.add("*flush-on-newline*");
+        globalVars.put("*print-readably*", true);
+        dynamicVars.add("*print-readably*");
+        globalVars.put("*print-dup*", false);
+        dynamicVars.add("*print-dup*");
+        globalVars.put("*print-meta*", false);
+        dynamicVars.add("*print-meta*");
+        globalVars.put("*print-length*", ClojureNil.INSTANCE);
+        dynamicVars.add("*print-length*");
+        globalVars.put("*print-level*", ClojureNil.INSTANCE);
+        dynamicVars.add("*print-level*");
+        globalVars.put("*print-namespace-maps*", true);
+        dynamicVars.add("*print-namespace-maps*");
         // Macro special vars: &env and &form (nil by default, set during macro expansion)
         globalVars.put("&env", ClojureNil.INSTANCE);
         globalVars.put("&form", ClojureNil.INSTANCE);
@@ -865,6 +894,7 @@ public class ClojureContext {
             }
             while (seq != null) {
                 acc = callFunction(fn, new Object[]{acc, seq.first()});
+                if (acc instanceof Reduced r) return r.value;
                 seq = seq.next();
             }
             return acc;
@@ -1079,6 +1109,11 @@ public class ClojureContext {
                 Object val = lookup.valAt(key, notFound);
                 return val == null ? ClojureNil.INSTANCE : val;
             }
+            // IPersistentSet doesn't implement ILookup but supports get()
+            if (coll instanceof clojure.lang.IPersistentSet s) {
+                Object val = s.get(key);
+                return val == null ? notFound : val;
+            }
             // String indexing: (get "foo" 0) => \f
             if (coll instanceof String s && key instanceof Number n) {
                 int idx = n.intValue();
@@ -1201,11 +1236,7 @@ public class ClojureContext {
             return a;
         });
 
-        defBuiltin("deref", args -> {
-            checkArity(args, 1, "deref");
-            if (args[0] instanceof ClojureAtom a) return a.deref();
-            throw new RuntimeException("deref: not an atom: " + args[0]);
-        });
+        // deref for atoms (overridden below with full implementation)
 
         defBuiltin("reset!", args -> {
             checkArity(args, 2, "reset!");
@@ -2401,31 +2432,7 @@ public class ClojureContext {
             return future;
         });
 
-        defBuiltin("deref", dargs -> {
-            if (dargs.length < 1 || dargs.length > 3)
-                throw new RuntimeException("deref: expected 1-3 args");
-            Object target = dargs[0];
-            if (target instanceof ClojureAtom a) return a.deref();
-            if (target instanceof java.util.concurrent.Future<?> f) {
-                try {
-                    if (dargs.length >= 2) {
-                        long timeout = ((Number) dargs[1]).longValue();
-                        Object timeoutVal = dargs.length == 3 ? dargs[2] : ClojureNil.INSTANCE;
-                        try {
-                            Object result = f.get(timeout, java.util.concurrent.TimeUnit.MILLISECONDS);
-                            return result == null ? ClojureNil.INSTANCE : result;
-                        } catch (java.util.concurrent.TimeoutException e) {
-                            return timeoutVal;
-                        }
-                    }
-                    Object result = f.get();
-                    return result == null ? ClojureNil.INSTANCE : result;
-                } catch (Exception e) {
-                    throw new RuntimeException("deref failed: " + e.getMessage(), e);
-                }
-            }
-            throw new RuntimeException("deref: not a dereferenceable: " + target);
-        });
+        // deref for futures (merged into final deref builtin below)
 
         defBuiltin("future-done?", args -> {
             checkArity(args, 1, "future-done?");
@@ -3465,7 +3472,16 @@ public class ClojureContext {
                 }
             }
             if (ref instanceof clojure.truffle.runtime.ClojureVar v) return v.deref();
-            if (ref instanceof clojure.lang.IDeref d) return d.deref();
+            // IBlockingDeref supports timed deref (3-arg)
+            if (args.length == 3 && ref instanceof clojure.lang.IBlockingDeref bd) {
+                long timeout = ((Number) args[1]).longValue();
+                Object result = bd.deref(timeout, args[2]);
+                return result == null ? ClojureNil.INSTANCE : result;
+            }
+            if (ref instanceof clojure.lang.IDeref d) {
+                Object result = d.deref();
+                return result == null ? ClojureNil.INSTANCE : result;
+            }
             // deftype/defrecord instances implementing IDeref protocol via method map
             if (ref instanceof clojure.truffle.runtime.ClojureDeftypeInstance dt) {
                 Object derefMethod = dt.getMethod("deref");
@@ -5597,6 +5613,11 @@ public class ClojureContext {
             return args[0] instanceof java.util.concurrent.Future;
         });
 
+        defBuiltin("delay?", args -> {
+            checkArity(args, 1, "delay?");
+            return args[0] instanceof clojure.lang.Delay;
+        });
+
         // realized? enhancement for futures
         // (already exists, but ensure it handles futures)
 
@@ -6145,7 +6166,13 @@ public class ClojureContext {
         defBuiltin("ns-interns", args -> {
             checkArity(args, 1, "ns-interns");
             ClojureNamespace ns = resolveNsArg(args[0]);
-            return nsMapToClojure(ns.getInterns());
+            String nsName = ns.getName();
+            clojure.lang.IPersistentMap result = clojure.lang.PersistentArrayMap.EMPTY;
+            for (var entry : ns.getInterns().entrySet()) {
+                result = result.assoc(clojure.lang.Symbol.intern(entry.getKey()),
+                    new clojure.truffle.runtime.ClojureVar(this, nsName, entry.getKey()));
+            }
+            return result;
         });
 
         defBuiltin("ns-refers", args -> {
@@ -6235,6 +6262,32 @@ public class ClojureContext {
             Object val = getVarWithBindings(symName);
             if (val == null) return ClojureNil.INSTANCE;
             return new clojure.truffle.runtime.ClojureVar(this, currentNamespace, symName);
+        });
+
+        defBuiltin("find-var", args -> {
+            checkArity(args, 1, "find-var");
+            if (!(args[0] instanceof clojure.lang.Symbol sym)) {
+                throw new RuntimeException("find-var: expected a qualified symbol, got " + args[0]);
+            }
+            String ns = sym.getNamespace();
+            String name = sym.getName();
+            if (ns == null) {
+                throw new RuntimeException("find-var: symbol must be namespace-qualified: " + sym);
+            }
+            ClojureNamespace targetNs = namespaces.get(ns);
+            if (targetNs == null) return ClojureNil.INSTANCE;
+            Object val = targetNs.resolve(name);
+            if (val == null) return ClojureNil.INSTANCE;
+            return new clojure.truffle.runtime.ClojureVar(this, ns, name);
+        });
+
+        defBuiltin("var-get", args -> {
+            checkArity(args, 1, "var-get");
+            if (args[0] instanceof clojure.truffle.runtime.ClojureVar cvar) {
+                Object val = cvar.deref();
+                return val == null ? ClojureNil.INSTANCE : val;
+            }
+            throw new RuntimeException("var-get: expected a Var, got " + args[0].getClass().getName());
         });
 
         defBuiltin("requiring-resolve", args -> {
@@ -6722,12 +6775,17 @@ public class ClojureContext {
             } else if (fn instanceof clojure.lang.Keyword kw) {
                 // Keyword as function: (:key map) → (get map :key)
                 if (args.length < 1 || args.length > 2)
-                    throw new RuntimeException("Keyword lookup expects 1 or 2 args");
+                    throw new IllegalArgumentException("Wrong number of args (" + args.length + ") passed to: " + kw);
                 Object map = args[0];
                 if (map instanceof clojure.lang.ILookup lookup) {
                         Object notFound = args.length == 2 ? args[1] : ClojureNil.INSTANCE;
                     Object val = lookup.valAt(kw, notFound);
                     return val == null ? ClojureNil.INSTANCE : val;
+                }
+                // IPersistentSet doesn't implement ILookup but supports get()
+                if (map instanceof clojure.lang.IPersistentSet s) {
+                    Object val = s.get(kw);
+                    return val == null ? (args.length == 2 ? args[1] : ClojureNil.INSTANCE) : val;
                 }
                 return args.length == 2 ? args[1] : ClojureNil.INSTANCE;
             } else if (fn instanceof clojure.lang.IPersistentSet s) {
