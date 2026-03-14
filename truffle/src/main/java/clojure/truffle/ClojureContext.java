@@ -309,7 +309,68 @@ public class ClojureContext {
     }
 
     public String getCurrentNamespace() { return currentNamespace; }
-    public void setCurrentNamespace(String ns) { this.currentNamespace = ns; }
+    public void setCurrentNamespace(String ns) {
+        this.currentNamespace = ns;
+        // Sync READER_RESOLVER for syntax-quote symbol resolution
+        syncReaderResolver(ns);
+    }
+
+    @com.oracle.truffle.api.CompilerDirectives.TruffleBoundary
+    private void syncReaderResolver(String ns) {
+        try {
+            ClojureContext ctx = this;
+            clojure.lang.TruffleReader.Resolver resolver = new clojure.lang.TruffleReader.Resolver() {
+                @Override public clojure.lang.Symbol currentNS() {
+                    return clojure.lang.Symbol.intern(ctx.getCurrentNamespace());
+                }
+                @Override public clojure.lang.Symbol resolveClass(clojure.lang.Symbol sym) {
+                    try {
+                        Class<?> cls = Class.forName(sym.getName());
+                        return clojure.lang.Symbol.intern(cls.getName());
+                    } catch (ClassNotFoundException e) {
+                        // Check imports
+                        Object imported = ctx.getVar(sym.getName());
+                        if (imported instanceof Class<?> cls) {
+                            return clojure.lang.Symbol.intern(cls.getName());
+                        }
+                        return null;
+                    }
+                }
+                @Override public clojure.lang.Symbol resolveAlias(clojure.lang.Symbol sym) {
+                    ClojureNamespace curNs = ctx.getNamespace(ctx.getCurrentNamespace());
+                    if (curNs != null) {
+                        ClojureNamespace aliased = curNs.resolveAlias(sym.getName());
+                        if (aliased != null) {
+                            return clojure.lang.Symbol.intern(aliased.getName());
+                        }
+                    }
+                    return null;
+                }
+                @Override public clojure.lang.Symbol resolveVar(clojure.lang.Symbol sym) {
+                    // Check if symbol is referred from another namespace
+                    String curNsName = ctx.getCurrentNamespace();
+                    ClojureNamespace curNs = ctx.getNamespace(curNsName);
+                    if (curNs != null) {
+                        // Check refers first
+                        String sourceNs = curNs.getReferSource(sym.getName());
+                        if (sourceNs != null) {
+                            return clojure.lang.Symbol.intern(sourceNs, sym.getName());
+                        }
+                        // Check if it exists in current namespace
+                        Object val = curNs.resolve(sym.getName());
+                        if (val != null) {
+                            return clojure.lang.Symbol.intern(curNsName, sym.getName());
+                        }
+                    }
+                    // Fallback: qualify with current namespace
+                    return clojure.lang.Symbol.intern(curNsName, sym.getName());
+                }
+            };
+            clojure.lang.TruffleReader.READER_RESOLVER.set(resolver);
+        } catch (Exception e) {
+            // ignore
+        }
+    }
 
     public ClojureNamespace getOrCreateNamespace(String name) {
         return namespaces.computeIfAbsent(name, ClojureNamespace::new);
@@ -4477,7 +4538,7 @@ public class ClojureContext {
         Object origAssoc = globalVars.get("assoc");
         defBuiltin("assoc", args -> {
             if (args.length < 3 || args.length % 2 != 1)
-                throw new RuntimeException("assoc: expected odd number of args (coll k v ...)");
+                throw new clojure.lang.ArityException(args.length, "clojure.core/assoc");
             Object coll = args[0];
             if (coll instanceof ClojureNil) coll = clojure.lang.PersistentArrayMap.EMPTY;
             for (int i = 1; i < args.length; i += 2) {
@@ -6076,27 +6137,7 @@ public class ClojureContext {
         // macroexpand-1
         defBuiltin("macroexpand-1", args -> {
             checkArity(args, 1, "macroexpand-1");
-            Object form = args[0];
-            if (form instanceof clojure.lang.ISeq seq && seq.first() instanceof clojure.lang.Symbol sym) {
-                Object macro = sym.getNamespace() != null
-                    ? getMacroFromNs(sym.getNamespace(), sym.getName())
-                    : getMacro(sym.getName());
-                if (macro != null) {
-                    java.util.List<Object> macroArgs = new java.util.ArrayList<>();
-                    // User-defined macros expect &form and &env as first two args
-                    boolean isUserMacro = (macro instanceof clojure.truffle.runtime.ClojureFunction
-                            || macro instanceof clojure.truffle.runtime.MultiArityFunction);
-                    if (isUserMacro) {
-                        macroArgs.add(form); // &form
-                        macroArgs.add(clojure.truffle.runtime.ClojureNil.INSTANCE); // &env
-                    }
-                    for (clojure.lang.ISeq s = seq.next(); s != null; s = s.next()) {
-                        macroArgs.add(s.first());
-                    }
-                    return callFunction(macro, macroArgs.toArray());
-                }
-            }
-            return form; // not a macro call, return as-is
+            return macroexpand1(args[0]);
         });
 
         // macroexpand - repeatedly expand until form doesn't change
@@ -6104,7 +6145,7 @@ public class ClojureContext {
             checkArity(args, 1, "macroexpand");
             Object form = args[0];
             while (true) {
-                Object expanded = callFunction(getVar("macroexpand-1"), new Object[]{form});
+                Object expanded = macroexpand1(form);
                 if (expanded == form || expanded.equals(form)) return expanded;
                 form = expanded;
             }
@@ -7129,6 +7170,43 @@ public class ClojureContext {
         return isaCheck(child, parent, globalVars.get("*hierarchy*"));
     }
 
+    public Object macroexpand1(Object form) {
+        if (form instanceof clojure.lang.ISeq seq && seq.first() instanceof clojure.lang.Symbol sym) {
+            Object macro = sym.getNamespace() != null
+                ? getMacroFromNs(sym.getNamespace(), sym.getName())
+                : getMacro(sym.getName());
+            if (macro != null) {
+                java.util.List<Object> macroArgs = new java.util.ArrayList<>();
+                boolean isUserMacro = (macro instanceof clojure.truffle.runtime.ClojureFunction
+                        || macro instanceof clojure.truffle.runtime.MultiArityFunction);
+                if (isUserMacro) {
+                    macroArgs.add(form); // &form
+                    macroArgs.add(clojure.truffle.runtime.ClojureNil.INSTANCE); // &env
+                }
+                int userArgCount = 0;
+                for (clojure.lang.ISeq s = seq.next(); s != null; s = s.next()) {
+                    macroArgs.add(s.first());
+                    userArgCount++;
+                }
+                try {
+                    return callFunction(macro, macroArgs.toArray());
+                } catch (clojure.lang.ArityException ae) {
+                    if (isUserMacro) {
+                        // Check if this ArityException is from the macro itself (not from code inside the macro body)
+                        // by comparing the expected name with the macro's name
+                        String macroName = sym.getName();
+                        if (ae.name != null && ae.name.endsWith("/" + macroName) || macroName.equals(ae.name)) {
+                            // Adjust actual count to exclude implicit &form and &env
+                            throw new clojure.lang.ArityException(ae.actual - 2, ae.name);
+                        }
+                    }
+                    throw ae;
+                }
+            }
+        }
+        return form;
+    }
+
     public Object callFunction(Object fn, Object[] args) {
         // Dereference ClojureVar to its value
         if (fn instanceof clojure.truffle.runtime.ClojureVar cvar) {
@@ -7596,7 +7674,7 @@ public class ClojureContext {
         throw new RuntimeException("cons: not a sequence: " + coll);
     }
 
-    private boolean isaCheck(Object child, Object parent, Object hier) {
+    public boolean isaCheck(Object child, Object parent, Object hier) {
         if (child == null || parent == null) return false;
         if (child.equals(parent)) return true;
         // Vector dispatch values: element-wise

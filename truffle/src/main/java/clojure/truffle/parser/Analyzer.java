@@ -787,8 +787,10 @@ public class Analyzer {
     private ExpressionNode analyzeMacroexpand(ISeq seq) {
         ISeq args = seq.next();
         if (args == null) throw err("macroexpand: missing form");
-        // Return the quoted expanded form (for debugging)
-        return analyze(args.first());
+        // Evaluate the form argument and call the macroexpand builtin at runtime
+        ExpressionNode formNode = analyze(args.first());
+        return new InvokeNode(new SymbolNode(context, "macroexpand"),
+                new ExpressionNode[]{formNode});
     }
 
     private ExpressionNode analyzeMacroexpand1(ISeq seq) {
@@ -1428,13 +1430,29 @@ public class Analyzer {
         }
 
         ExpressionNode dispatchFnNode = analyze(args.first());
+        args = args.next();
 
+        // Parse options: :default val, :hierarchy #'h
+        ExpressionNode hierarchyNode = null;
+        while (args != null) {
+            Object key = args.first();
+            args = args.next();
+            if (args == null) break;
+            if (key instanceof clojure.lang.Keyword kw && kw.getName().equals("hierarchy")) {
+                hierarchyNode = analyze(args.first());
+            }
+            args = args.next();
+        }
+
+        final ExpressionNode finalHierarchyNode = hierarchyNode;
         return new ExpressionNode() {
             @Child ExpressionNode dispatchNode = dispatchFnNode;
+            @Child ExpressionNode hierNode = finalHierarchyNode;
             @Override
             public Object executeGeneric(com.oracle.truffle.api.frame.VirtualFrame frame) {
                 Object dispatchFn = dispatchNode.executeGeneric(frame);
-                return doDefmulti(context, name, dispatchFn);
+                Object hierarchy = hierNode != null ? hierNode.executeGeneric(frame) : null;
+                return doDefmulti(context, name, dispatchFn, hierarchy);
             }
         };
     }
@@ -3103,16 +3121,18 @@ public class Analyzer {
         if (args == null) throw fnSpecError("fn*: missing parameters");
 
         String fnName = null;
-        if (args.first() instanceof Symbol) {
-            fnName = ((Symbol) args.first()).getName();
+        if (args.first() instanceof Symbol sym) {
+            fnName = sym.getNamespace() != null ? sym.getNamespace() + "/" + sym.getName() : sym.getName();
             args = args.next();
             if (args == null) throw fnSpecError("fn*: missing parameters after name");
         }
 
-        // Skip docstring if present
-        if (args.first() instanceof String) {
+        // Skip docstring if present (only valid after a name symbol)
+        if (fnName != null && args.first() instanceof String) {
             args = args.next();
             if (args == null) throw fnSpecError("fn*: missing parameters after docstring");
+        } else if (fnName == null && args.first() instanceof String) {
+            throw fnSpecError("fn*: string in arg position without name");
         }
 
         // Skip metadata map if present (e.g., {:added "1.1"})
@@ -3138,10 +3158,11 @@ public class Analyzer {
         Scope outerScope = currentScope;
         currentScope = new Scope(outerScope);
 
-        // Add self-reference slot for named fns
+        // Add self-reference slot for named fns (use local name for scope lookup)
         int selfSlot = -1;
         if (fnName != null) {
-            selfSlot = currentScope.addLocal(fnName);
+            String localName = fnName.contains("/") ? fnName.substring(fnName.lastIndexOf('/') + 1) : fnName;
+            selfSlot = currentScope.addLocal(localName);
         }
 
         List<Integer> destructSlots = new ArrayList<>();
@@ -3193,10 +3214,11 @@ public class Analyzer {
 
             currentScope = new Scope(outerScope);
 
-            // Add self-reference slot for named fns
+            // Add self-reference slot for named fns (use local name for scope lookup)
             int selfSlot = -1;
             if (fnName != null) {
-                selfSlot = currentScope.addLocal(fnName);
+                String localName = fnName.contains("/") ? fnName.substring(fnName.lastIndexOf('/') + 1) : fnName;
+                selfSlot = currentScope.addLocal(localName);
             }
 
             List<Integer> dSlots = new ArrayList<>();
@@ -3311,7 +3333,14 @@ public class Analyzer {
     private ExpressionNode analyzeQuote(ISeq seq) {
         ISeq args = seq.next();
         if (args == null) throw err("quote: missing form");
-        if (args.next() != null) throw compilerError("quote: too many arguments");
+        if (args.next() != null) {
+            clojure.lang.IPersistentMap data = (clojure.lang.IPersistentMap)
+                    clojure.lang.PersistentArrayMap.EMPTY
+                            .assoc(clojure.lang.Keyword.intern("form"), seq);
+            throw new clojure.lang.Compiler.CompilerException(
+                    (String) null, 0, 0,
+                    new clojure.lang.ExceptionInfo("Wrong number of args passed to quote", data));
+        }
         return new QuoteNode(convertToRuntime(args.first()));
     }
 
@@ -3508,7 +3537,11 @@ public class Analyzer {
             context.setVarMeta(qname, (clojure.lang.IPersistentMap) resolveVarRefsInMeta(varMeta));
         }
 
-        ISeq fnForm = ClojureRT.cons(Symbol.intern("fn*"), args);
+        // Use namespace-qualified name for fn so ArityException messages include namespace
+        String qualifiedName = (context != null ? context.getCurrentNamespace() + "/" : "") + name;
+        // Replace the name symbol in args with the qualified version
+        ISeq qualifiedArgs = ClojureRT.cons(Symbol.intern(qualifiedName), args.next());
+        ISeq fnForm = ClojureRT.cons(Symbol.intern("fn*"), qualifiedArgs);
         ExpressionNode fnNode = analyzeFn(fnForm);
         return new DefNode(context, name, fnNode);
     }
@@ -4771,7 +4804,14 @@ public class Analyzer {
 
     @com.oracle.truffle.api.CompilerDirectives.TruffleBoundary
     static Object doDefmulti(ClojureContext context, String name, Object dispatchFn) {
+        return doDefmulti(context, name, dispatchFn, null);
+    }
+
+    static Object doDefmulti(ClojureContext context, String name, Object dispatchFn, Object hierarchy) {
         ClojureMultiMethod mm = new ClojureMultiMethod(name, dispatchFn, context);
+        if (hierarchy != null) {
+            mm.setHierarchy(hierarchy);
+        }
         context.setVar(name, mm);
         return mm;
     }

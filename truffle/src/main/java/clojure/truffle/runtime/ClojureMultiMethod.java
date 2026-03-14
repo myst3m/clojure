@@ -11,11 +11,16 @@ public class ClojureMultiMethod {
     private final ClojureContext context;
     private final ConcurrentHashMap<Object, Object> methods = new ConcurrentHashMap<>();
     private volatile Object defaultMethod;
+    private volatile Object hierarchy; // ClojureVar or atom holding a hierarchy map
 
     public ClojureMultiMethod(String name, Object dispatchFn, ClojureContext context) {
         this.name = name;
         this.dispatchFn = dispatchFn;
         this.context = context;
+    }
+
+    public void setHierarchy(Object hierarchy) {
+        this.hierarchy = hierarchy;
     }
 
     public void addMethod(Object dispatchVal, Object fn) {
@@ -53,22 +58,34 @@ public class ClojureMultiMethod {
         if (matches.isEmpty()) return null;
         if (matches.size() == 1) return methods.get(matches.get(0));
         // Multiple matches: check preferences
+        java.util.List<Object> candidates = new java.util.ArrayList<>();
         for (int i = 0; i < matches.size(); i++) {
-            boolean preferred = true;
+            boolean dominated = false;
             for (int j = 0; j < matches.size(); j++) {
                 if (i == j) continue;
                 if (isPreferred(matches.get(j), matches.get(i))) {
-                    preferred = false;
+                    dominated = true;
                     break;
                 }
             }
-            if (preferred) return methods.get(matches.get(i));
+            if (!dominated) candidates.add(matches.get(i));
         }
-        // Ambiguous - return first match
-        return methods.get(matches.get(0));
+        if (candidates.size() == 1) return methods.get(candidates.get(0));
+        // Ambiguous - throw
+        throw new IllegalArgumentException("Multiple methods in multimethod '" + name +
+                "' match dispatch value: " + dispatchVal + " -> " + candidates +
+                ", and none is preferred");
     }
 
     private boolean isaCheck(Object child, Object parent) {
+        if (hierarchy != null) {
+            // Dereference the hierarchy var to get the hierarchy map
+            Object h = hierarchy;
+            if (h instanceof ClojureVar cv) {
+                h = cv.deref();
+            }
+            return context.isaCheck(child, parent, h);
+        }
         return context.isaCheckPublic(child, parent);
     }
 

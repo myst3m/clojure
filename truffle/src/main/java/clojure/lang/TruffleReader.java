@@ -144,7 +144,7 @@ final static public Var DATA_READERS = Var.intern(CLOJURE_NS, Symbol.intern("*da
 final static public Var DEFAULT_DATA_READER_FN = Var.intern(CLOJURE_NS, Symbol.intern("*default-data-reader-fn*"), PersistentArrayMap.EMPTY).setDynamic();
 final static public Var DEFAULT_DATA_READERS = Var.intern(CLOJURE_NS, Symbol.intern("default-data-readers"), PersistentArrayMap.EMPTY);
 final static public Var SUPPRESS_READ = Var.intern(CLOJURE_NS, Symbol.intern("*suppress-read*"), null).setDynamic();
-final static Var READER_RESOLVER = Var.intern(CLOJURE_NS, Symbol.intern("*reader-resolver*"), null).setDynamic();
+public final static Var READER_RESOLVER = Var.intern(CLOJURE_NS, Symbol.intern("*reader-resolver*"), null).setDynamic();
 
 /**
  * Hook for evaluating #= read-eval forms via the Truffle runtime.

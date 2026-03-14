@@ -11,14 +11,32 @@ import java.util.function.Supplier;
  * Lazy sequence implementation matching Clojure's LazySeq semantics.
  * The thunk is called at most once, and the result is cached.
  */
-public class LazySeq implements ISeq, Seqable, Sequential, IPending {
+public class LazySeq implements ISeq, Seqable, Sequential, IPending, IObj, IMeta {
 
     private Supplier<Object> thunk;
     private ISeq seq;
     private boolean realized;
+    private IPersistentMap meta;
 
     public LazySeq(Supplier<Object> thunk) {
         this.thunk = thunk;
+    }
+
+    private LazySeq(IPersistentMap meta, ISeq seq) {
+        this.meta = meta;
+        this.seq = seq;
+        this.realized = true;
+    }
+
+    @Override
+    public IObj withMeta(IPersistentMap meta) {
+        // Force realization and wrap with metadata
+        return new LazySeq(meta, seq());
+    }
+
+    @Override
+    public IPersistentMap meta() {
+        return meta;
     }
 
     @TruffleBoundary

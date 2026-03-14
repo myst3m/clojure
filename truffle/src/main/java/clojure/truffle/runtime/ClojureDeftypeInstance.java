@@ -14,7 +14,8 @@ import clojure.truffle.ClojureContext;
 
 @ExportLibrary(InteropLibrary.class)
 public class ClojureDeftypeInstance implements TruffleObject, clojure.lang.ILookup, clojure.lang.Associative,
-        clojure.lang.Seqable, clojure.lang.IPersistentCollection, clojure.lang.Counted {
+        clojure.lang.Seqable, clojure.lang.IPersistentCollection, clojure.lang.Counted,
+        clojure.lang.IObj, clojure.lang.IMeta {
 
     private final String typeName;
     private final Object[] fields;
@@ -25,6 +26,8 @@ public class ClojureDeftypeInstance implements TruffleObject, clojure.lang.ILook
     private Map<String, Object> methods;
     // Whether this instance was created via defrecord (vs deftype)
     private boolean record;
+    // Metadata
+    private clojure.lang.IPersistentMap meta;
 
     public ClojureDeftypeInstance(String typeName, Object[] fields, Map<String, Integer> fieldIndex) {
         this(typeName, fields, fieldIndex, clojure.lang.PersistentArrayMap.EMPTY);
@@ -36,6 +39,20 @@ public class ClojureDeftypeInstance implements TruffleObject, clojure.lang.ILook
         this.fields = fields;
         this.fieldIndex = fieldIndex;
         this.extras = extras;
+    }
+
+    @Override
+    public clojure.lang.IObj withMeta(clojure.lang.IPersistentMap meta) {
+        ClojureDeftypeInstance copy = new ClojureDeftypeInstance(typeName, fields, fieldIndex, extras);
+        copy.methods = this.methods;
+        copy.record = this.record;
+        copy.meta = meta;
+        return copy;
+    }
+
+    @Override
+    public clojure.lang.IPersistentMap meta() {
+        return meta;
     }
 
     public void setMethods(Map<String, Object> methods) { this.methods = methods; }
@@ -94,10 +111,18 @@ public class ClojureDeftypeInstance implements TruffleObject, clojure.lang.ILook
             if (idx != null) {
                 Object[] newFields = fields.clone();
                 newFields[idx] = val;
-                return new ClojureDeftypeInstance(typeName, newFields, fieldIndex, extras);
+                ClojureDeftypeInstance inst = new ClojureDeftypeInstance(typeName, newFields, fieldIndex, extras);
+                inst.methods = this.methods;
+                inst.record = this.record;
+                inst.meta = this.meta;
+                return inst;
             }
         }
-        return new ClojureDeftypeInstance(typeName, fields, fieldIndex, extras.assoc(key, val));
+        ClojureDeftypeInstance inst = new ClojureDeftypeInstance(typeName, fields, fieldIndex, extras.assoc(key, val));
+        inst.methods = this.methods;
+        inst.record = this.record;
+        inst.meta = this.meta;
+        return inst;
     }
 
     @Override
